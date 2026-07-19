@@ -115,7 +115,7 @@ class SackmannDataSource(TennisDataSource):
             result.skipped_files += 1
             return
         rows = self._fetch_csv(repo, fname)
-        batch = []
+        by_id: dict[int, dict] = {}
         for r in rows:
             pid = _int(r.get("player_id"))
             if pid is None:
@@ -125,12 +125,13 @@ class SackmannDataSource(TennisDataSource):
             full_name = f"{first} {last}".strip()
             if not full_name:
                 continue
-            batch.append(dict(
+            by_id[pid] = dict(
                 tour=tour, sackmann_id=pid, first_name=first or None, last_name=last or None,
                 full_name=full_name, normalized_name=normalize_name(full_name),
                 hand=(r.get("hand") or None), dob=_yyyymmdd(r.get("dob")),
                 ioc=(r.get("ioc") or None), height_cm=_int(r.get("height")),
-            ))
+            )
+        batch = list(by_id.values())
         for chunk in _chunks(batch, 2000):
             stmt = pg_insert(Player).values(chunk).on_conflict_do_update(
                 constraint="uq_players_tour_sackmann",
@@ -193,7 +194,9 @@ class SackmannDataSource(TennisDataSource):
                 Tournament.source_key.in_(list(tkeys)))
         ).all())
 
-        match_values: list[dict] = []
+        # keyed by source_key: ITF files occasionally repeat (tourney_id, match_num);
+        # last row wins, and one statement must never touch the same key twice
+        match_values_by_key: dict[str, dict] = {}
         parsed_by_key: dict[str, object] = {}
         for r in rows:
             level = (r.get("tourney_level") or "").strip()
@@ -208,7 +211,7 @@ class SackmannDataSource(TennisDataSource):
             parsed = parse_score(r.get("score"), _int(r.get("best_of")))
             parsed_by_key[skey] = parsed
             stats = {c: _int(r.get(c)) for c in STAT_COLS}
-            match_values.append(dict(
+            match_values_by_key[skey] = dict(
                 tour=tour, source=self.name, source_key=skey,
                 tournament_id=tmap.get(tid),
                 winner_id=self._ensure_player(db, tour, wid, r.get("winner_name") or "", pmap),
@@ -220,8 +223,9 @@ class SackmannDataSource(TennisDataSource):
                 minutes=_int(r.get("minutes")), surface=(r.get("surface") or None),
                 tourney_level=level or None,
                 stats={k: v for k, v in stats.items() if v is not None} or None,
-            ))
+            )
 
+        match_values = list(match_values_by_key.values())
         id_by_key: dict[str, int] = {}
         for chunk in _chunks(match_values, 1000):
             stmt = pg_insert(Match).values(chunk).on_conflict_do_update(
