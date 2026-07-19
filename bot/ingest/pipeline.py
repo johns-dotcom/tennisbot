@@ -42,7 +42,8 @@ def dedup_cross_source(db: Session) -> int:
     return len(dupes)
 
 
-def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False) -> list[SyncResult]:
+def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False,
+               refresh_cache: bool = True) -> list[SyncResult]:
     results = [SackmannDataSource().sync(db, full=full)]
     db.commit()
     if not skip_live:
@@ -51,6 +52,10 @@ def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False) -> l
     n = dedup_cross_source(db)
     db.commit()
     log.info("dedup complete", marked=n)
+    if refresh_cache:
+        from bot.stats.cache import refresh_stats_cache
+
+        refresh_stats_cache(db)
     for r in results:
         log.info("sync result", source=r.source, matches=r.matches_upserted,
                  players=r.players_upserted, tournaments=r.tournaments_upserted,

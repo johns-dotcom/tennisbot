@@ -72,7 +72,8 @@ tennisbot/
 
 ## Phases & DONE checks
 
-### Phase 1 — Data layer  [DONE except live-source verification — needs API_TENNIS_KEY]
+### Phase 1 — Data layer  [DONE — live-source (api-tennis) verification deferred to
+### a new Phase 5.5 by user decision 2026-07-19; adapter is written, needs key + audit]
 Repo scaffold; schema + Alembic migration; score parser; SackmannDataSource
 (atp/wta main draw + qual/chall + futures + wta qual/ITF, 3+ yr backfill,
 incremental upsert); ApiTennisSource (completed results newer than Sackmann,
@@ -81,11 +82,14 @@ Prereq honored: read `matches_data_dictionary.txt` from tennis_atp before ingest
 **DONE when:** `python -m bot ingest` completes; spot-check SELECTs match known real
 results; score parser tests pass incl. RET/W.O./DEF.
 
-### Phase 2 — Stats engine
+### Phase 2 — Stats engine  [DONE 2026-07-19]
 PlayerProfile with as_of everywhere; form / deciding-set / matchup / trajectory
 metrics; config-driven fallback hierarchy; player_stats_cache.
-**DONE when:** `python -m bot profile "<player>"` matches hand-computed values from
-raw CSVs for 3 verification players (one ATP, one WTA, one ITF).
+**DONE check passed:** `python -m bot profile` verified against independent raw-CSV
+computation (scripts/verify_profiles.py) for Jannik Sinner (ATP), Aryna Sabalenka
+(WTA), Katarina Kuzmova (ITF) — career/365d records, career decider records, skunk
+shares all exact matches (12/12). Semantics: as_of strict (match_date < as_of); W.O.
+excluded from all stats; RET/DEF count; round-order sequencing within tourney week.
 
 ### Phase 3 — Probability engine
 WinProbabilityModel interface; surface-adjusted set-level Elo baseline + logistic
@@ -118,6 +122,14 @@ template). Discord embed + advisories audit row. Probation mode default ON;
 **DONE when:** end-to-end dry run on one live market → validated, correctly labeled
 advisory in Discord.
 
+### Phase 5.5 — Live-results source activation (moved from Phase 1 by user decision)
+User signs up for api-tennis.com trial → API_TENNIS_KEY in .env → run live sync →
+coverage audit: sync the May–June 2026 Sackmann-overlap window, measure ITF coverage
+and name-match rate vs known-good rows. Fallback if ITF women's coverage is thin:
+Goalserve adapter behind the same TennisDataSource interface.
+**DONE when:** `python -m bot ingest` (no --skip-live) completes clean; audit report
+acceptable; schedule rows landing for next 48h.
+
 ### Phase 6 — Railway deployment
 GitHub → Railway; worker (`watch` + health endpoint on $PORT) + daily ingest cron;
 Alembic on deploy; secrets via env; restart protocol (SIGTERM flush; boot reload of
@@ -146,4 +158,5 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
   Kadantte/tennis_atp + VictorSquidWei/tennis_wta (config: sackmann_*_repo).
 - BLOCKED on user: API_TENNIS_KEY needed to exercise ApiTennisSource (adapter
   written, untested against live API). Then Phase 1 DONE check fully passes.
-- Next: Phase 2 stats engine once the live-source sync is verified.
+- Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
+- Phase 3 (probability engine) next.

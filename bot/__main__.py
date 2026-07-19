@@ -44,7 +44,25 @@ def main() -> int:
             results = run_ingest(db, full=args.full, skip_live=args.skip_live)
         return 1 if any(r.errors for r in results) else 0
 
-    phase = {"profile": 2, "backtest": 3, "replay": 3.5, "inference-report": 3.5,
+    if args.cmd == "profile":
+        from datetime import date, timedelta
+
+        from bot.db import session
+        from bot.matching.market_matcher import PlayerMatcher
+        from bot.stats.profile import build_profile
+        from bot.stats.render import render_profile
+
+        as_of = date.fromisoformat(args.as_of) if args.as_of else date.today() + timedelta(days=1)
+        with session() as db:
+            matcher = PlayerMatcher(db)
+            res = matcher.match(db, args.name, source="cli", queue_on_miss=False)
+            if res.player_id is None:
+                print(f"No confident match for '{args.name}'.", file=sys.stderr)
+                return 1
+            print(render_profile(build_profile(db, res.player_id, as_of)))
+        return 0
+
+    phase = {"backtest": 3, "replay": 3.5, "inference-report": 3.5,
              "watch": 4, "graduate": 5}.get(args.cmd)
     print(f"'{args.cmd}' is implemented in Phase {phase} — not built yet.", file=sys.stderr)
     return 2
