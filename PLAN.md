@@ -72,7 +72,7 @@ tennisbot/
 
 ## Phases & DONE checks
 
-### Phase 1 — Data layer  [IN PROGRESS]
+### Phase 1 — Data layer  [DONE except live-source verification — needs API_TENNIS_KEY]
 Repo scaffold; schema + Alembic migration; score parser; SackmannDataSource
 (atp/wta main draw + qual/chall + futures + wta qual/ITF, 3+ yr backfill,
 incremental upsert); ApiTennisSource (completed results newer than Sackmann,
@@ -134,5 +134,16 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
 - api-tennis.com key: env `API_TENNIS_KEY` (user to supply before Phase 1 live-sync
   testing).
 
-## Current state
-- Phase 1 in progress: scaffold started 2026-07-19. Nothing committed yet.
+## Current state (2026-07-19)
+- Phase 1 built and committed (354b8a8). Sackmann backfill complete on Neon
+  (project morning-snow-90827624): 284,360 matches (ATP 139,770 / WTA 144,590),
+  ~672k set rows, 2022-01 → 2026-06 (ATP) / 2026-04 (WTA), zero ingest errors,
+  idempotent re-run verified (27 files skipped via blob-SHA watermarks).
+- Spot-checks passed: Sinner–Zverev AO25 F, Alcaraz–Djokovic Wimbledon24 F,
+  Keys–Sabalenka AO25 F, Krejcikova–Paolini Wimbledon24 F, Sabalenka–Pegula USO24 F;
+  set rows + RET/W.O./DEF semantics verified in DB. 19 tests green.
+- NOTE: canonical JeffSackmann repos went private/deleted mid-2026. Using mirrors
+  Kadantte/tennis_atp + VictorSquidWei/tennis_wta (config: sackmann_*_repo).
+- BLOCKED on user: API_TENNIS_KEY needed to exercise ApiTennisSource (adapter
+  written, untested against live API). Then Phase 1 DONE check fully passes.
+- Next: Phase 2 stats engine once the live-source sync is verified.
