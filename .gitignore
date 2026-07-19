@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Secrets & local config — never commit
+.env
+*.pem
+*.key
+
+# Data (Sackmann CSVs are CC BY-NC-SA — never redistribute; keep out of the repo)
+data/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
