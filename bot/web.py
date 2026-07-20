@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import html
 import os
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -223,10 +223,18 @@ function rel(){document.querySelectorAll('.rel').forEach(function(e){
  else if(a<86400)s=(a/3600).toFixed(1).replace('.0','')+'h';
  else s=Math.round(a/86400)+'d';
  e.textContent=d>0?('in '+s):(s+' ago');});}
+function bindWatch(){
+ var w=document.getElementById('watching');
+ if(!w) return;
+ if(localStorage.getItem('watch_open')==='0') w.removeAttribute('open');
+ var cc=document.getElementById('watch-caret');
+ function pc(){if(cc)cc.textContent=w.open?'▾ hide':'▸ show';} pc();
+ w.addEventListener('toggle',function(){localStorage.setItem('watch_open',w.open?'1':'0');pc();});}
 async function refreshMain(){
  try{var r=await fetch(location.pathname+location.search,{headers:{'X-Fragment':'1'}});
   if(r.ok){var h=await r.text(); var m=document.querySelector('main');
-   if(h && h.length>50 && h!==m.innerHTML){var y=window.scrollY; m.innerHTML=h; window.scrollTo(0,y);}
+   if(h && h.length>50 && h!==m.innerHTML){var y=window.scrollY; m.innerHTML=h;
+    window.scrollTo(0,y); bindWatch();}
   }}catch(e){} rel();}
 var seen=null;
 function notify(title, body){
@@ -244,6 +252,7 @@ document.addEventListener('DOMContentLoaded',function(){
  rel(); setInterval(rel,5000);
  setInterval(refreshMain,7000);
  setInterval(pollEvents,10000); pollEvents();
+ bindWatch();
  var bell=document.getElementById('bell');
  function paint(){bell.textContent=Notification.permission==='granted'?'🔔 alerts on':'🔕 enable alerts';}
  if(!('Notification' in window)){bell.style.display='none';return;} paint();
@@ -656,9 +665,15 @@ after a tune are never blended silently.</p></section>"""
 <td class="mono">{price}{'¢' if price != '—' else ''}</td>
 <td>{verdict}</td></tr>"""))
     watch_rows.sort(key=lambda r: (r[0] or now))
-    watching_html = f"""<section class="block"><div class="blockhead">
-<h4>Watching ({len(watch_rows)})</h4><span class="aside">matches the policy is
-evaluating · next 24h · not yet bet</span></div><div class="rule"></div>
+    clears = sum(1 for _, h in watch_rows if "clears —" in h)
+    watching_html = f"""<section class="block"><details id="watching" open>
+<summary style="cursor:pointer;list-style:none;display:flex;align-items:baseline;
+justify-content:space-between;gap:12px">
+<span><span style="font-family:var(--font);font-weight:800;font-size:19px">Watching</span>
+<span class="sub2" style="margin-left:8px">{len(watch_rows)} evaluating ·
+{clears} clearing gates now</span></span>
+<span class="sub2" id="watch-caret">▾ hide</span></summary>
+<div class="rule" style="margin-top:8px"></div>
 <div class="tw"><table class="t"><tr><th>starts</th><th>watch side</th>
 <th>model</th><th>price</th><th>policy verdict</th></tr>
 {''.join(r[1] for r in watch_rows) or
@@ -666,7 +681,7 @@ evaluating · next 24h · not yet bet</span></div><div class="rule"></div>
 </table></div>
 <p class="sub2" style="margin-top:6px">A bet fires only when the price meets the
 model — most of these will pass without one. ✓ = clears every gate now;
-◉ = tracked, gate not yet met.</p></section>"""
+◉ = tracked, gate not yet met.</p></details></section>"""
 
     body = pagehead("Strategy Lab", "Bot Testrun",
                     f'{n} settled · <a href="/track">advisory track record →</a>') + strip + watching_html + timeline_html + f"""
@@ -1234,64 +1249,106 @@ async def players(request: web.Request) -> web.Response:
     from bot.models import Match
 
     q = (request.query.get("q") or "").strip()
+    tour = (request.query.get("tour") or "").strip().lower()  # '', 'atp', 'wta'
+    surface = (request.query.get("surface") or "").strip()    # '', Hard/Clay/Grass
+    hand = (request.query.get("hand") or "").strip().upper()  # '', 'R', 'L'
+    sort = (request.query.get("sort") or "matches").strip()   # matches | recent | name
+    tour = tour if tour in ("atp", "wta") else ""
+    surface = surface if surface in ("Hard", "Clay", "Grass", "Carpet") else ""
+    hand = hand if hand in ("R", "L") else ""
+
+    def base_filters(query):
+        if tour:
+            query = query.where(Player.tour == tour)
+        if hand:
+            query = query.where(Player.hand == hand)
+        return query
+
     with db_session() as db:
+        # candidate players by search or activity, then annotate record
         if q:
-            norm = normalize_name(q)
-            found = db.execute(
-                select(Player).where(Player.normalized_name.ilike(f"%{norm}%"))
-                .limit(60)).scalars().all()
-            ids = [p.id for p in found]
-            counts = dict(db.execute(
-                select(Match.winner_id, func.count()).where(
-                    Match.winner_id.in_(ids)).group_by(Match.winner_id)).all()) \
-                if ids else {}
-            losses = dict(db.execute(
-                select(Match.loser_id, func.count()).where(
-                    Match.loser_id.in_(ids)).group_by(Match.loser_id)).all()) \
-                if ids else {}
-            plist = [(p, counts.get(p.id, 0), losses.get(p.id, 0)) for p in found]
-            plist.sort(key=lambda t: t[1] + t[2], reverse=True)
+            found = db.execute(base_filters(select(Player).where(
+                Player.normalized_name.ilike(f"%{normalize_name(q)}%")))
+                .limit(200)).scalars().all()
             heading = f'results for "{q}"'
         else:
-            # anchor to the newest data, not the calendar — the historical
-            # source can trail today until the live-results feed activates
             latest = db.execute(select(func.max(Match.match_date)).where(
                 Match.is_duplicate.is_(False))).scalar()
-            if latest is None:
-                plist, heading = [], "database is empty"
-            else:
-                cutoff = latest - timedelta(days=45)
-                active = db.execute(
-                    select(Player, func.count(Match.id).label("n"))
-                    .join(Match, ((Match.winner_id == Player.id)
-                                  | (Match.loser_id == Player.id)))
-                    .where(Match.match_date >= cutoff, Match.is_duplicate.is_(False))
-                    .group_by(Player.id).order_by(func.count(Match.id).desc())
-                    .limit(50)).all()
-                plist = [(p, n, None) for p, n in active]
-                heading = f"most active through {latest} (newest results in DB)"
-    rows = []
-    for p, w, l in plist:
-        rec = f"{w}-{l}" if l is not None else f"{w} matches"
-        rows.append(f"""<tr>
+            cutoff = (latest - timedelta(days=90)) if latest else None
+            mq = select(Player).join(
+                Match, ((Match.winner_id == Player.id) | (Match.loser_id == Player.id)))
+            if cutoff is not None:
+                mq = mq.where(Match.match_date >= cutoff)
+            if surface:
+                mq = mq.where(Match.surface == surface)
+            mq = base_filters(mq).where(Match.is_duplicate.is_(False))\
+                .group_by(Player.id).order_by(func.count(Match.id).desc()).limit(200)
+            found = db.execute(mq).scalars().all()
+            heading = f"active players through {latest}" if latest else "database empty"
+
+        ids = [p.id for p in found]
+        wins = dict(db.execute(select(Match.winner_id, func.count()).where(
+            Match.winner_id.in_(ids), Match.is_duplicate.is_(False))
+            .group_by(Match.winner_id)).all()) if ids else {}
+        losses = dict(db.execute(select(Match.loser_id, func.count()).where(
+            Match.loser_id.in_(ids), Match.is_duplicate.is_(False))
+            .group_by(Match.loser_id)).all()) if ids else {}
+        last_seen = dict(db.execute(
+            select(Player.id, func.max(Match.match_date))
+            .join(Match, ((Match.winner_id == Player.id) | (Match.loser_id == Player.id)))
+            .where(Player.id.in_(ids), Match.is_duplicate.is_(False))
+            .group_by(Player.id)).all()) if ids else {}
+
+    plist = [(p, wins.get(p.id, 0), losses.get(p.id, 0), last_seen.get(p.id))
+             for p in found]
+    if sort == "name":
+        plist.sort(key=lambda t: t[0].full_name.lower())
+    elif sort == "recent":
+        plist.sort(key=lambda t: (t[3] or date(1900, 1, 1)), reverse=True)
+    else:  # matches
+        plist.sort(key=lambda t: t[1] + t[2], reverse=True)
+    plist = plist[:80]
+
+    rows = "".join(f"""<tr>
 <td><a href="/player/{p.id}" style="text-decoration:none">
 <span class="pname">{esc(p.full_name)}</span></a></td>
 <td>{tag('neutral', '·', p.tour.upper())}</td>
 <td class="mono sub2">{esc(p.ioc or '—')}</td>
-<td class="mono">{rec}</td>
-<td class="mono sub2">{esc(p.hand or '—')}</td></tr>""")
-    body = pagehead("Database", "Players", heading) + f"""
-<form method="get" action="/players" style="margin:0 0 18px">
-<input name="q" value="{esc(q)}" placeholder="Search any ATP / WTA / ITF player…"
- style="width:100%;max-width:480px;background:var(--surface);border:1px solid var(--divider);
- color:var(--text);font:inherit;padding:10px 14px" autofocus></form>
+<td class="mono">{w}-{l}</td>
+<td class="mono sub2">{esc(ls) if ls else '—'}</td>
+<td class="mono sub2">{esc(p.hand or '—')}</td></tr>"""
+        for p, w, l, ls in plist)
+
+    def opts(name, current, choices):
+        o = "".join(f'<option value="{esc(v)}"{" selected" if v == current else ""}>'
+                    f'{esc(lbl)}</option>' for v, lbl in choices)
+        return (f'<select name="{name}" onchange="this.form.submit()" '
+                f'style="background:var(--surface);border:1px solid var(--divider);'
+                f'color:var(--text);font:inherit;padding:9px 12px">{o}</select>')
+
+    filters = (
+        opts("tour", tour, [("", "All tours"), ("atp", "ATP"), ("wta", "WTA")]) +
+        opts("surface", surface, [("", "All surfaces"), ("Hard", "Hard"),
+              ("Clay", "Clay"), ("Grass", "Grass"), ("Carpet", "Carpet")]) +
+        opts("hand", hand, [("", "Either hand"), ("R", "Right"), ("L", "Left")]) +
+        opts("sort", sort, [("matches", "Sort: most matches"),
+              ("recent", "Sort: most recent"), ("name", "Sort: name")]))
+    body = pagehead("Database", "Players", f"{heading} · {len(plist)} shown") + f"""
+<form method="get" action="/players" style="display:flex;gap:10px;flex-wrap:wrap;
+ align-items:center;margin:0 0 18px">
+<input name="q" value="{esc(q)}" placeholder="Search any player…"
+ style="flex:1;min-width:220px;background:var(--surface);border:1px solid var(--divider);
+ color:var(--text);font:inherit;padding:10px 14px">
+{filters}
+<button class="tag tag-outline" type="submit" style="cursor:pointer;padding:9px 16px">Apply</button>
+</form>
 <div class="tw"><table class="t">
-<tr><th>player</th><th>tour</th><th>country</th><th>record in DB</th><th>hand</th></tr>
-{''.join(rows) or '<tr><td colspan="5" class="empty">No players matched.</td></tr>'}
+<tr><th>player</th><th>tour</th><th>country</th><th>record</th><th>last match</th><th>hand</th></tr>
+{rows or '<tr><td colspan="6" class="empty">No players match these filters.</td></tr>'}
 </table></div>
-<p class="prose" style="margin-top:12px">137,000+ players indexed from 2022 on:
-every ATP and WTA tour match, qualifying, Challengers, and men's + women's ITF.
-Click a player for the full play script.</p>"""
+<p class="prose" style="margin-top:12px">137,000+ players indexed from 2022 on.
+Surface filter applies to the activity listing; search matches names across all
+tours. Click a player for the full play script.</p>"""
     return respond(request, "Players", "players", body)
 
 
