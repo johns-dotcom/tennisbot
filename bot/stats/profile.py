@@ -274,6 +274,86 @@ def compute_clutch(history: list[MatchRow], as_of: date,
 
 
 @dataclass
+class ScheduleBlock:
+    """Strength of schedule — how good were the opponents behind the form.
+    Guards against 'won 7 of 10' meaning nothing against a weak field. Ranks
+    come from Sackmann data; Kalshi-mined/charted matches lack them."""
+    n_ranked: int
+    avg_opp_rank: float | None
+    vs_top100: Stat
+    field: str  # 'elite' | 'strong' | 'mid' | 'weak' | 'unknown'
+
+
+def compute_schedule(history: list[MatchRow], as_of: date, days: int = 365,
+                     min_ranked: int = 8) -> ScheduleBlock:
+    recent = [m for m in _before(history, as_of)
+              if m.opp_rank and m.match_date >= as_of - timedelta(days=days)]
+    ms = recent if len(recent) >= min_ranked else \
+        [m for m in _before(history, as_of) if m.opp_rank]
+    if not ms:
+        return ScheduleBlock(0, None, Stat.omitted("vs_top100"), "unknown")
+    avg = sum(m.opp_rank for m in ms) / len(ms)
+    top = [m for m in ms if m.opp_rank <= 100]
+    field = ("elite" if avg <= 50 else "strong" if avg <= 150
+             else "mid" if avg <= 400 else "weak")
+    return ScheduleBlock(len(ms), round(avg, 0), rate(*_record(top), "vs_top100"),
+                         field)
+
+
+# --- style archetypes from Match Charting shot data ---
+
+def style_profile(ch) -> dict | None:
+    """Characterize a player's game from charting aggregates: aggression
+    (winners vs errors), serve dominance, return strength. None if uncharted."""
+    if ch is None or not ch.n_matches:
+        return None
+    tags = []
+    r = ch.winner_ufe_ratio
+    if r is not None:
+        if r >= 1.1 and (ch.winners_per_match or 0) >= 22:
+            tags.append("aggressor")
+        elif r <= 0.75:
+            tags.append("error-prone")
+        elif (ch.winners_per_match or 0) < 18 and r >= 0.9:
+            tags.append("consistent/grinder")
+    if ch.ace_rate is not None and ch.ace_rate >= 0.10:
+        tags.append("big serve")
+    if ch.first_serve_win is not None and ch.first_serve_win >= 0.75:
+        tags.append("dominant 1st serve")
+    if ch.return_win is not None and ch.return_win >= 0.42:
+        tags.append("strong return")
+    elif ch.return_win is not None and ch.return_win <= 0.33:
+        tags.append("weak return")
+    return {"tags": tags or ["balanced"], "n": ch.n_matches,
+            "ace_rate": ch.ace_rate, "first_serve_win": ch.first_serve_win,
+            "return_win": ch.return_win, "wr": ch.winner_ufe_ratio,
+            "winners": ch.winners_per_match}
+
+
+def style_matchup(a_ch, b_ch, name_a: str, name_b: str) -> list[str]:
+    """Edge notes from two style profiles — the human 'big server vs weak
+    returner' read. Empty if either player is uncharted."""
+    a, b = style_profile(a_ch), style_profile(b_ch)
+    if not a or not b:
+        return []
+    notes = []
+    # serve vs return mismatches, both directions
+    for srv, ret, sname, rname in ((a, b, name_a, name_b), (b, a, name_b, name_a)):
+        if (srv.get("ace_rate") or 0) >= 0.10 and (ret.get("return_win") or 1) <= 0.35:
+            notes.append(f"{sname}'s serve ({srv['ace_rate']:.0%} aces, "
+                         f"{(srv.get('first_serve_win') or 0):.0%} 1st-serve won) meets "
+                         f"{rname}'s weak return ({ret['return_win']:.0%} return points) "
+                         f"— holds should dominate; lean {sname} on serve and tiebreaks.")
+    if "aggressor" in a["tags"] and "consistent/grinder" in b["tags"]:
+        notes.append(f"{name_a} the aggressor vs {name_b} the grinder — higher "
+                     f"variance; {name_a} lives on winners, {name_b} on rallies.")
+    if "aggressor" in b["tags"] and "consistent/grinder" in a["tags"]:
+        notes.append(f"{name_b} the aggressor vs {name_a} the grinder — higher "
+                     f"variance; {name_b} lives on winners, {name_a} on rallies.")
+    return notes
+
+
+@dataclass
 class ChartingBlock:
     """Shot-level aggregates from the Match Charting Project. None when the
     player has no charted matches (coverage is ~5000 matches, not universal)."""
@@ -457,6 +537,7 @@ class PlayerProfile:
     clutch: ClutchBlock | None = None
     set_rates: dict = field(default_factory=dict)
     conditional: ConditionalBlock | None = None
+    schedule: ScheduleBlock | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -568,4 +649,5 @@ def build_profile(db: Session, player_id: int, as_of: date,
         clutch=compute_clutch(history, as_of, deciding.best),
         set_rates=compute_set_rates(history, as_of),
         conditional=compute_conditional(history, as_of),
+        schedule=compute_schedule(history, as_of),
     )

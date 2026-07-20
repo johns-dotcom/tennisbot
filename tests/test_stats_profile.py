@@ -234,3 +234,46 @@ def test_conditional_omits_below_min_sample():
     hist = [mk(10, True, sets=((1, True), (2, True)))]
     c = compute_conditional(hist, AS_OF, min_sample=8)
     assert c.win_given_set1_won.is_omitted
+
+
+def test_schedule_strength():
+    from bot.stats.profile import compute_schedule
+
+    hist = [mk(10 + i, i % 2 == 0) for i in range(10)]
+    for i, m in enumerate(hist):
+        object.__setattr__(m, "opp_rank", 30 + i * 5)  # avg ~52 → strong/elite
+    s = compute_schedule(hist, AS_OF, min_ranked=5)
+    assert s.n_ranked == 10
+    assert s.field in ("elite", "strong")
+    assert s.vs_top100.wins + s.vs_top100.losses == 10  # all ranked <=100
+
+
+def test_schedule_weak_field():
+    from bot.stats.profile import compute_schedule
+
+    hist = [mk(10 + i, True) for i in range(8)]
+    for m in hist:
+        object.__setattr__(m, "opp_rank", 600)
+    s = compute_schedule(hist, AS_OF, min_ranked=5)
+    assert s.field == "weak"
+
+
+def test_style_matchup_big_server_vs_weak_returner():
+    from bot.stats.profile import ChartingBlock, style_matchup
+
+    server = ChartingBlock(n_matches=20, winners_per_match=25, unforced_per_match=18,
+                           winner_ufe_ratio=1.4, fh_winner_share=0.6, bh_winner_share=0.4,
+                           fh_ufe_share=0.5, ace_rate=0.14, first_serve_win=0.78,
+                           second_serve_win=0.55, return_win=0.40)
+    weak_ret = ChartingBlock(n_matches=20, winners_per_match=15, unforced_per_match=20,
+                             winner_ufe_ratio=0.75, fh_winner_share=0.5, bh_winner_share=0.5,
+                             fh_ufe_share=0.5, ace_rate=0.04, first_serve_win=0.65,
+                             second_serve_win=0.45, return_win=0.30)
+    notes = style_matchup(server, weak_ret, "Server", "Weakret")
+    assert any("serve" in n and "weak return" in n for n in notes)
+
+
+def test_style_matchup_empty_when_uncharted():
+    from bot.stats.profile import style_matchup
+
+    assert style_matchup(None, None, "A", "B") == []

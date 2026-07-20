@@ -222,6 +222,27 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                 f"comes if set 2 builds a clear cushion — up three games — "
                 f"otherwise stay away.")
 
+    # 5b. strength-of-schedule caveat — weak-field form is discounted
+    sched = getattr(w_prof, "schedule", None)
+    if sched and sched.field == "weak" and sched.avg_opp_rank:
+        bits.append(f"Temper it: {w_name}'s recent form came against a soft field "
+                    f"(avg opponent rank ~{int(sched.avg_opp_rank)}), so the win "
+                    f"rate flatters.")
+        salience -= 0.1
+    elif sched and sched.field in ("elite", "strong") and sched.avg_opp_rank:
+        bits.append(f"And it's real: {w_name} has been beating a {sched.field} "
+                    f"field (avg rank ~{int(sched.avg_opp_rank)}).")
+        salience += 0.08
+
+    # 5c. style matchup from charting shot data (big-server-vs-weak-returner etc.)
+    from bot.stats.profile import style_matchup
+
+    w_ch = getattr(w_prof, "_charting", None)
+    o_ch = getattr(o_prof, "_charting", None)
+    for note in style_matchup(w_ch, o_ch, w_name, o_name)[:1]:
+        bits.append(note)
+        salience += 0.1
+
     # 6. model read with confidence — always the closing line before support
     conf_note = ""
     if model_confidence < 0.6:
@@ -318,9 +339,19 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
 
     def pdata(pid: int):
         if pid not in cache:
+            from bot.models import ChartingStat
+            from bot.stats.profile import compute_charting
+
             hist = load_history(db, pid)
-            cache[pid] = (build_profile(db, pid, as_of), hist,
-                          compute_set_rates(hist, as_of))
+            prof = build_profile(db, pid, as_of)
+            ch_cols = ("winners", "winners_fh", "winners_bh", "unforced",
+                       "unforced_fh", "unforced_bh", "serve_pts", "aces",
+                       "first_in", "first_won", "second_in", "second_won",
+                       "return_pts", "return_pts_won")
+            ch_rows = [{c: getattr(r, c) for c in ch_cols} for r in db.execute(
+                select(ChartingStat).where(ChartingStat.player_id == pid)).scalars()]
+            prof._charting = compute_charting(ch_rows)  # for style_matchup
+            cache[pid] = (prof, hist, compute_set_rates(hist, as_of))
         return cache[pid]
 
     for ev_ticker, sides in events.items():

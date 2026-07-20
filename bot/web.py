@@ -1625,6 +1625,7 @@ point data · past year, widened to career if thin</span></div>
 <div class="metric"><div class="k">vs top 20</div><div class="v mono">{_rate_cell(c.vs_top20)}</div></div>
 </div>
 {f'<div class="tw" style="margin-top:12px"><table class="t"><tr><th>level</th><th>record</th></tr>{lv_rows}</table></div>' if lv_rows else ''}
+{f'<p class="sub2" style="margin-top:10px">Strength of schedule: {prof.schedule.field} field · avg opponent rank ~{int(prof.schedule.avg_opp_rank)} · vs top-100 {_rate_cell(prof.schedule.vs_top100)}</p>' if prof.schedule and prof.schedule.avg_opp_rank else ''}
 </section>"""
 
     cond = prof.conditional
@@ -1663,10 +1664,14 @@ point data · past year, widened to career if thin</span></div>
         cells = "".join(
             f'<div class="metric"><div class="k">{k}</div>'
             f'<div class="v mono">{v}</div></div>' for k, v in ch_cells)
+        from bot.stats.profile import style_profile
+        sp = style_profile(ch)
+        style_tags = " ".join(tag("neutral", "◆", t) for t in sp["tags"]) if sp else ""
         charting_html = f"""<section class="block"><div class="blockhead">
 <h4>Shot-level (Match Charting Project)</h4>
 <span class="aside">{ch.n_matches} hand-charted matches · winners, errors and
 wing splits no feed sells</span></div><div class="rule"></div>
+{f'<p style="margin:0 0 10px">style: {style_tags}</p>' if style_tags else ''}
 <div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(96px,1fr))">
 {cells}</div>
 <p class="sub2" style="margin-top:8px">Data © Tennis Abstract Match Charting
@@ -1741,6 +1746,19 @@ async def match_detail(request: web.Request) -> web.Response:
         mu = compute_matchup(hist_a, hist_b, pb.id, pa.id, as_of, None)
         sc = db.execute(select(Scenario).where(Scenario.event_ticker == event_ticker)
                         .order_by(Scenario.created_for.desc())).scalars().first()
+        from bot.models import ChartingStat
+        from bot.stats.profile import compute_charting, style_matchup
+
+        _cc = ("winners", "winners_fh", "winners_bh", "unforced", "unforced_fh",
+               "unforced_bh", "serve_pts", "aces", "first_in", "first_won",
+               "second_in", "second_won", "return_pts", "return_pts_won")
+        def charting_for(pid):
+            rows = [{c: getattr(r, c) for c in _cc} for r in db.execute(
+                select(ChartingStat).where(ChartingStat.player_id == pid)).scalars()]
+            return compute_charting(rows)
+        ch_a, ch_b = charting_for(pa.id), charting_for(pb.id)
+        style_notes = style_matchup(ch_a, ch_b, pa.full_name.split()[-1],
+                                    pb.full_name.split()[-1])
         quotes = _latest_quotes(db, [a.ticker, b.ticker])
         est = db.execute(select(LiveMatchState).where(
             LiveMatchState.market_ticker.in_([a.ticker, b.ticker]))).scalars().first()
@@ -1834,6 +1852,13 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
     yes_name = (a.raw or {}).get("yes_sub_title", "side A")
     chart_html = price_chart_svg(chart_points, marks, f"{yes_name} to win")
 
+    style_html = ""
+    if style_notes:
+        style_html = f"""<section class="block"><div class="blockhead">
+<h4>Style matchup</h4><span class="aside">from Match Charting shot data</span></div>
+<div class="rule"></div>""" + "".join(
+            f'<div class="prose">{esc(nt)}</div>' for nt in style_notes) + "</section>"
+
     # live in-match serve stats from the milestone feed (aces, DFs, break pts) —
     # the '13 aces this match' / '4 double faults' signals. Map competitor1/2
     # to our YES(pa)/sibling(pb) via the recorded scoreline; skip if ambiguous
@@ -1898,6 +1923,7 @@ odds-based estimator.</p></section>"""
 <p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
 {f"(sets {mu.h2h_sets[0]}-{mu.h2h_sets[1]})" if mu.h2h.n else ""}.
 {esc(common)}</p></section>
+{style_html}
 {livestats_html}
 {scorelog_html}
 {chart_html}
