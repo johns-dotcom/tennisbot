@@ -56,6 +56,44 @@ def inference_report(db: Session) -> str:
     return "\n".join(lines)
 
 
+def check_mapping(sets_a: int, sets_b: int, result: str | None) -> str:
+    """Does our recorded scoreline agree with how the market settled?
+    'ok' | 'mismatch' (YES↔competitor flip) | 'unverifiable'."""
+    if result not in ("yes", "no") or sets_a == sets_b:
+        return "unverifiable"
+    our_winner = "yes" if sets_a > sets_b else "no"
+    return "ok" if our_winner == result else "mismatch"
+
+
+def mapping_audit(db: Session) -> dict:
+    """Cross-check the YES-side↔competitor mapping against settlements. For each
+    settled market with a decided recorded scoreline, the side our scoreline
+    says won must equal the side that settled YES. Mismatches mean a flipped
+    mapping silently corrupting scorelines / estimator state / bet settlement."""
+    from sqlalchemy import text as sqltext
+
+    rows = db.execute(sqltext("""
+        SELECT DISTINCT ON (s.market_ticker)
+               s.market_ticker, s.sets_a, s.sets_b, k.result, s.scoreline
+        FROM match_score_log s
+        JOIN kalshi_markets k ON k.ticker = s.market_ticker
+        WHERE k.result IN ('yes', 'no')
+        ORDER BY s.market_ticker, s.ts DESC""")).all()
+    ok = unverifiable = 0
+    mismatches = []
+    for tk, sa, sb, res, scoreline in rows:
+        verdict = check_mapping(sa, sb, res)
+        if verdict == "ok":
+            ok += 1
+        elif verdict == "unverifiable":
+            unverifiable += 1
+        else:
+            mismatches.append({"ticker": tk, "scoreline": scoreline,
+                               "sets": f"{sa}-{sb}", "settled": res})
+    return {"checked": ok + len(mismatches), "ok": ok,
+            "mismatches": mismatches, "unverifiable": unverifiable}
+
+
 def graduate_report(db: Session) -> tuple[str, bool]:
     """Check probation graduation thresholds. NEVER flips the flag itself —
     that is a deliberate manual config change (CLAUDE.md rule 5)."""

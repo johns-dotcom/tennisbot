@@ -2000,6 +2000,8 @@ async def flags(request: web.Request) -> web.Response:
             Player.sackmann_id.is_(None))).scalar()
         unmatched = db.execute(select(func.count(MatchReviewQueue.id)).where(
             MatchReviewQueue.resolved.is_(False))).scalar()
+        from bot.reports import mapping_audit
+        audit = mapping_audit(db)
 
     items = []
 
@@ -2011,6 +2013,25 @@ async def flags(request: web.Request) -> web.Response:
 <div class="title" style="font-size:15px">{esc(title)}</div>
 <div class="prose">{detail}</div>
 <div class="sub2">fix: {esc(fix)}</div></div>""")
+
+    # data-integrity check first — a flipped YES↔competitor mapping silently
+    # corrupts scorelines, estimator state, and bet settlement
+    nmis = len(audit["mismatches"])
+    if nmis:
+        detail = ("The side our recorded scoreline says won does NOT match how "
+                  "the market settled, for: " + ", ".join(
+                      f"{esc(m['ticker'])} (we saw {m['sets']}, settled {m['settled']})"
+                      for m in audit["mismatches"][:6]) +
+                  ". These bets, scorelines and estimator states are mirror-flipped.")
+        flag("critical", f"{nmis} match(es) with a flipped player mapping", detail,
+             "correct _yes_is_competitor1 for these tickers and re-derive; "
+             "quarantine affected bets/advisories")
+    else:
+        flag("info", "Player-mapping integrity: clean",
+             f"All {audit['ok']} verifiable settled matches agree — the side our "
+             f"scoreline says won matches the side that settled YES. "
+             f"({audit['unverifiable']} unverifiable: RET/tie/no final score.)",
+             "none needed")
 
     by = {}
     for tour, source, latest, n in frontiers:
