@@ -343,13 +343,22 @@ class WatchService:
                 except Exception as e:
                     log.warning("live_data poll failed", ticker=ticker, error=str(e))
                     continue
+                yes_is_c1 = self._yes_is_competitor1(ticker, info, payload)
+                # own game-by-game scoring record — every game, not just sets
+                try:
+                    from bot.market.scoreboard import record_snapshot
+
+                    with db_session() as db:
+                        record_snapshot(db, ticker, info.get("event_ticker"),
+                                        payload.get("details") or {}, yes_is_c1)
+                except Exception as e:
+                    log.warning("score snapshot failed", ticker=ticker, error=str(e))
                 sets = self.client.sets_from_live_data(payload)
                 if sets is None:
                     continue
                 scored += 1
                 c1, c2 = sets
-                sa, sb = (c1, c2) if self._yes_is_competitor1(ticker, info, payload) \
-                    else (c2, c1)
+                sa, sb = (c1, c2) if yes_is_c1 else (c2, c1)
                 now = utcnow()
                 if self.recorder:
                     self.recorder.score(ticker, now, sa, sb)

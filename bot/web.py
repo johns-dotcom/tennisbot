@@ -943,6 +943,15 @@ async def live(request: web.Request) -> web.Response:
                 Advisory.market_ticker.in_(all_tickers),
                 Advisory.status.in_(["sent", "pending"]))).scalars().all()) \
             if all_tickers else set()
+        from sqlalchemy import text as sqltext
+
+        scorelines = {}
+        if all_tickers:
+            for r in db.execute(sqltext("""
+                SELECT DISTINCT ON (market_ticker) market_ticker, scoreline, sets_a, sets_b
+                FROM match_score_log WHERE market_ticker = ANY(:t)
+                ORDER BY market_ticker, ts DESC"""), {"t": all_tickers}).all():
+                scorelines[r[0]] = (r[1], r[2], r[3])
         from bot.models import Scenario
 
         plans = {}
@@ -978,6 +987,12 @@ async def live(request: web.Request) -> web.Response:
             st = tag("accent" if is_live else "neutral", "●" if is_live else "○",
                      "LIVE" if is_live else "PRE")
         play = tag("outline", "▲", "play") if any(m.ticker in advised for m in sides) else ""
+        score_row = ""
+        sl = next((scorelines.get(m.ticker) for m in sides if scorelines.get(m.ticker)),
+                  None)
+        if sl and sl[0]:
+            score_row = (f'<div class="mono" style="font-size:15px;font-weight:800">'
+                         f'{esc(sl[0])} <span class="sub2">· {sl[1]}-{sl[2]} sets</span></div>')
         plan_row = ""
         sc = plans.get(ev_ticker)
         if sc is not None:
@@ -991,6 +1006,7 @@ async def live(request: web.Request) -> web.Response:
 <span>{st} {play}</span></div>
 <a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
 <div>{''.join(rows_html)}</div></a>
+{score_row}
 {plan_row}
 <div class="sub2 mono">{'started' if is_live else 'starts'} {pt(ev['occ'])}
 · <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a>
@@ -1462,6 +1478,11 @@ async def match_detail(request: web.Request) -> web.Response:
                           "price": bet.price_cents,
                           "title": f"paper bet {bet.units}u @ {bet.price_cents}¢ "
                                    f"({bet.basis})"})
+        from bot.models import MatchScoreLog
+
+        score_rows = db.execute(select(MatchScoreLog).where(
+            MatchScoreLog.market_ticker.in_([a.ticker, b.ticker]))
+            .order_by(MatchScoreLog.ts.desc()).limit(40)).scalars().all()
 
     def px(m):
         q = quotes.get(m.ticker)
@@ -1506,6 +1527,27 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
 <div class="prose">{esc(sc.narrative)}</div></section>"""
     yes_name = (a.raw or {}).get("yes_sub_title", "side A")
     chart_html = price_chart_svg(chart_points, marks, f"{yes_name} to win")
+
+    # the bot's own game-by-game record
+    scorelog_html = ""
+    if score_rows:
+        a_only = [r for r in score_rows if r.market_ticker == a.ticker] or score_rows
+        latest = a_only[0]
+        lead = ("current" if not latest.is_final else "final")
+        srows = "".join(
+            f"<tr><td class='mono sub2'>{pt(r.ts)}</td>"
+            f"<td class='mono'>{r.sets_a}-{r.sets_b} sets</td>"
+            f"<td class='mono pname'>{esc(r.scoreline)}</td>"
+            f"<td class='sub2'>set {r.set_number}</td></tr>"
+            for r in a_only[:25])
+        scorelog_html = f"""<section class="block"><div class="blockhead">
+<h4>Game-by-game score</h4><span class="aside">the bot's own record ·
+{lead} {esc(latest.scoreline)}</span></div><div class="rule"></div>
+<div class="tw"><table class="t"><tr><th>recorded</th><th>sets</th>
+<th>games ({esc(yes_name)} first)</th><th></th></tr>{srows}</table></div>
+<p class="sub2" style="margin-top:6px">Every game the bot observed via Kalshi's
+score feed, newest first — its own scoring database, independent of the
+odds-based estimator.</p></section>"""
     body = pagehead("Match", (a.title or "").split(":")[0].replace("Will ", "")
                     or event_ticker,
                     f"{px(a)} / {px(b)}{state_txt}") + f"""
@@ -1518,6 +1560,7 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
 <p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
 {f"(sets {mu.h2h_sets[0]}-{mu.h2h_sets[1]})" if mu.h2h.n else ""}.
 {esc(common)}</p></section>
+{scorelog_html}
 {chart_html}
 {scenario_html}
 <p class="sub2 mono">{esc(a.ticker)} · {esc(b.ticker)}</p>"""

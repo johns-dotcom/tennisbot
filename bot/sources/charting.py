@@ -42,6 +42,16 @@ def _int(v) -> int | None:
         return None
 
 
+VALID_SURFACES = {"hard": "Hard", "clay": "Clay", "grass": "Grass",
+                  "carpet": "Carpet"}
+
+
+def _surface(v: str) -> str | None:
+    """MCP has occasional column-misaligned rows (an umpire name in the
+    Surface field); keep only known surfaces, else NULL."""
+    return VALID_SURFACES.get((v or "").strip().lower())
+
+
 def _mdate(v: str) -> date | None:
     v = (v or "").strip()
     if len(v) == 8 and v.isdigit():
@@ -84,6 +94,7 @@ class ChartingSource(TennisDataSource):
             try:
                 self._sync_gender(db, gender, tour, ov_file, result)
             except Exception as e:
+                db.rollback()  # so the next gender starts on a clean transaction
                 result.errors.append(f"{gender}: {e}")
                 log.error("charting sync failed", gender=gender, error=str(e))
                 continue
@@ -103,8 +114,11 @@ class ChartingSource(TennisDataSource):
             mid = r.get("match_id")
             if mid:
                 meta[mid] = {"date": _mdate(r.get("Date")),
-                             "tournament": (r.get("Tournament") or "").strip() or None,
-                             "surface": (r.get("Surface") or "").strip() or None}
+                             "tournament": ((r.get("Tournament") or "").strip()
+                                            or None),
+                             "surface": _surface(r.get("Surface"))}
+                if meta[mid]["tournament"]:
+                    meta[mid]["tournament"] = meta[mid]["tournament"][:128]
 
         matcher = PlayerMatcher(db, tour)
         name_cache: dict[str, int | None] = {}
@@ -117,7 +131,9 @@ class ChartingSource(TennisDataSource):
             return name_cache[name]
 
         rows = self._csv(ov_file)
-        batch: list[dict] = []
+        # a handful of matches are charted twice — key on (match_id, player),
+        # last row wins, so no single insert touches a key twice
+        by_key: dict[tuple, dict] = {}
         for r in rows:
             if (r.get("set") or "").strip() != "Total":  # aggregate rows only
                 continue
@@ -130,7 +146,8 @@ class ChartingSource(TennisDataSource):
                    "tournament": m.get("tournament"), "surface": m.get("surface")}
             for c in STAT_COLS:
                 rec[c] = _int(r.get(c))
-            batch.append(rec)
+            by_key[(mid, name)] = rec
+        batch = list(by_key.values())
 
         for i in range(0, len(batch), 1000):
             chunk = batch[i:i + 1000]

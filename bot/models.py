@@ -336,6 +336,31 @@ class ChartingStat(Base):
     )
 
 
+class MatchScoreLog(Base):
+    """The bot's own game-by-game scoring record, built live from Kalshi's
+    milestone feed. One row per observed game change (and set change) per
+    match — a complete scoreline history, independent of the set-level
+    estimator and richer than it. Recording only; never touches trading."""
+
+    __tablename__ = "match_score_log"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    market_ticker: Mapped[str] = mapped_column(String(96))
+    event_ticker: Mapped[str | None] = mapped_column(String(96))
+    match_id: Mapped[int | None] = mapped_column(ForeignKey("matches.id"))
+    ts: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    # a = YES-side player of market_ticker, b = opponent
+    sets_a: Mapped[int] = mapped_column(Integer)
+    sets_b: Mapped[int] = mapped_column(Integer)
+    set_number: Mapped[int] = mapped_column(Integer)  # current set (1-indexed)
+    games_a: Mapped[int] = mapped_column(Integer)
+    games_b: Mapped[int] = mapped_column(Integer)
+    scoreline: Mapped[str] = mapped_column(String(96))  # "6-3 4-6 2-1", a-perspective
+    total_games: Mapped[int] = mapped_column(Integer)  # change detector
+    is_final: Mapped[bool] = mapped_column(Boolean, default=False)
+    detail: Mapped[dict | None] = mapped_column(JSONB)  # running stats snapshot
+    __table_args__ = (Index("ix_scorelog_market_ts", "market_ticker", "ts"),)
+
+
 class IngestState(Base):
     """Key-value watermarks for incremental ingest (repo commit SHAs, sync dates)."""
 
