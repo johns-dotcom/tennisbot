@@ -475,10 +475,42 @@ engine still applies every gate before any advisory fires.</p>
     return respond(request, "Scenarios", "scenarios", body)
 
 
+TP_LIMIT = 90  # take-profit limit price (cents) for the TP variant
+
+
+def _tp_effective(b, result, touched90):
+    """Take-profit-at-90 outcome for a paper bet, derived from the same pick.
+    A limit sell at 90¢ fills whenever our side's bid reaches 90 — which any
+    eventual winner does en route to 100, and a was-winning-then-lost match
+    does mid-play. Returns (status, pnl_cents)."""
+    from bot.track import advisory_outcome
+
+    u = b.units or 1
+    if b.price_cents >= TP_LIMIT:  # TP below entry is nonsensical → behave as hold
+        return b.status, b.pnl_cents
+    o = advisory_outcome(b.side, result)  # won | lost | void | None
+    if o == "void":
+        return "void", 0
+    if touched90 or o == "won":
+        return "took_profit", (TP_LIMIT - b.price_cents) * u
+    if o == "lost":
+        return "lost", -b.price_cents * u
+    return "open", None
+
+
 async def testrun(request: web.Request) -> web.Response:
-    from bot.models import PaperBet, Scenario
+    return await _testrun_view(request, "hold")
+
+
+async def testrun_tp(request: web.Request) -> web.Response:
+    return await _testrun_view(request, "tp")
+
+
+async def _testrun_view(request: web.Request, mode: str) -> web.Response:
+    from bot.models import KalshiMarket, PaperBet, Scenario
     from bot.paper import PAPER_MIN_EDGE, PAPER_MIN_PROB
 
+    is_tp = mode == "tp"
     with db_session() as db:
         bets = db.execute(
             select(PaperBet, Player.full_name)
@@ -492,33 +524,63 @@ async def testrun(request: web.Request) -> web.Response:
                     Scenario.event_ticker.in_(evs))
                     .order_by(Scenario.created_for)).scalars():
                 plans[sc.event_ticker] = sc  # latest generation wins
+        # for the TP variant: match result + whether our side's bid touched 90
+        results, touched = {}, {}
+        if is_tp and bets:
+            tks = [b.market_ticker for b, _ in bets]
+            results = dict(db.execute(select(
+                KalshiMarket.ticker, KalshiMarket.result).where(
+                KalshiMarket.ticker.in_(tks))).all())
+            since = min(b.created_at for b, _ in bets)
+            from sqlalchemy import text as sqltext
+            for r in db.execute(sqltext("""
+                SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb
+                FROM market_ticks WHERE market_ticker = ANY(:t)
+                  AND kind='quote' AND ts >= :since GROUP BY market_ticker"""),
+                    {"t": tks, "since": since}).all():
+                touched[r[0]] = (r[1], r[2])
 
-    settled = [(b, p) for b, p in bets if b.status in ("won", "lost")]
-    open_bets = [(b, p) for b, p in bets if b.status == "open"]
-    wins = sum(1 for b, _ in settled if b.status == "won")
+    def eff(b):
+        """(status, pnl_cents) under the active mode."""
+        if not is_tp:
+            return b.status, b.pnl_cents
+        yb, nb = touched.get(b.market_ticker, (None, None))
+        hit = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
+              (b.side == "no" and (nb or 0) >= TP_LIMIT)
+        return _tp_effective(b, results.get(b.market_ticker), hit)
+
+    effs = {b.id: eff(b) for b, _ in bets}
+    WON = ("won", "took_profit")
+    settled = [(b, p) for b, p in bets if effs[b.id][0] in ("won", "lost", "took_profit")]
+    open_bets = [(b, p) for b, p in bets if effs[b.id][0] == "open"]
+    wins = sum(1 for b, _ in settled if effs[b.id][0] in WON)
     n = len(settled)
     win_rate = wins / n if n else None
-    pnl = sum(b.pnl_cents or 0 for b, _ in settled)
+    pnl = sum(effs[b.id][1] or 0 for b, _ in settled)          # cents
     staked = sum(b.price_cents * (b.units or 1) for b, _ in settled)
+    profit_units = sum((effs[b.id][1] or 0) / b.price_cents
+                       for b, _ in settled if b.price_cents)   # units won
     first = min((b.created_at for b, _ in bets), default=None)
     days = (datetime.now(timezone.utc) - first).days if first else 0
 
     def bucket(pred) -> str:
         s = [b for b, _ in settled if pred(b)]
-        w = sum(1 for b in s if b.status == "won")
+        w = sum(1 for b in s if effs[b.id][0] in WON)
         return f"{w}-{len(s) - w}" if s else "0-0"
 
     target_txt = f"{win_rate:.0%}" if win_rate is not None else "—"
     target_color = "var(--good)" if (win_rate or 0) >= 0.70 else \
         ("var(--warning)" if (win_rate or 0) >= 0.60 else "var(--text)")
+    pcolor = "var(--good)" if pnl > 0 else ("var(--accent)" if pnl < 0 else "var(--text)")
     strip = statstrip([
         ("Record", f"{wins}-{n - wins}" if n else "0-0", f"{len(open_bets)} open"),
         ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
          "target 70% by month 1"),
-        ("Days running", str(days), f"since {first.date()}" if first else "no bets yet"),
-        ("Unit P&L", f"{pnl:+d}¢" if n else "—",
-         "1 unit = 1 contract · max 3u, sparse"),
-        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", "unit-weighted"),
+        ("Profit ($)", f'<span style="color:{pcolor}">{pnl / 100:+.2f}</span>' if n else "—",
+         "1 contract per unit"),
+        ("Profit (units)", f'<span style="color:{pcolor}">{profit_units:+.2f}u</span>' if n else "—",
+         "profit ÷ stake, unit-weighted"),
+        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", f"{days}d running"),
         ("Policy", f"≥{PAPER_MIN_PROB:.0%} prob",
          f"+ ≥{PAPER_MIN_EDGE * 100:.0f}% edge · selective"),
     ])
@@ -563,10 +625,13 @@ async def testrun(request: web.Request) -> web.Response:
     def rows_html(pairs) -> str:
         out = []
         for b, player in pairs:
-            oc = {"won": tag("good", "✓", "won"), "lost": tag("accent", "✕", "lost"),
+            st, pc = effs[b.id]
+            oc = {"won": tag("good", "✓", "won"),
+                  "took_profit": tag("good", "✓", "TP @90¢"),
+                  "lost": tag("accent", "✕", "lost"),
                   "void": tag("neutral", "·", "void"),
-                  "open": tag("warn", "…", "open")}[b.status]
-            pnl_txt = f"{b.pnl_cents:+d}¢" if b.pnl_cents is not None else "—"
+                  "open": tag("warn", "…", "open")}[st]
+            pnl_txt = f"{pc:+d}¢" if pc is not None else "—"
             match = (b.reasoning or {}).get("match", b.event_ticker)
             out.append(f"""<tr>
 <td class="mono sub2">{pt(b.created_at)}</td>
@@ -599,7 +664,7 @@ async def testrun(request: web.Request) -> web.Response:
     cum, pts = 0, []
     vmarks, last_ver = [], None
     for b in chron:
-        cum += (b.pnl_cents or 0)
+        cum += (effs[b.id][1] or 0)
         pts.append((b.settled_at, cum / 100))
         ver = (b.reasoning or {}).get("policy_version", "v1")
         if ver != last_ver:
@@ -683,24 +748,37 @@ justify-content:space-between;gap:12px">
 model — most of these will pass without one. ✓ = clears every gate now;
 ◉ = tracked, gate not yet met.</p></details></section>"""
 
-    body = pagehead("Strategy Lab", "Bot Testrun",
-                    f'{n} settled · <a href="/track">advisory track record →</a>') + strip + watching_html + timeline_html + f"""
-<p class="prose" style="margin:0 0 18px">The bot places <strong>imaginary</strong>
-one-contract bets for itself — selectively; most matches get no bet. Settled
-results are the tuning data: the policy (probability floor, edge floor,
-confidence gate) iterates until the record holds above 70%. Nothing here is,
-or ever becomes, a real order.</p>
+    title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
+    active = "testrun"  # TP is a sibling variant under the same nav tab
+    other = ('<a href="/testrun">← hold-to-settlement variant</a>' if is_tp
+             else '<a href="/testrun-tp">90¢ take-profit variant →</a>')
+    exit_note = (f"""<p class="prose" style="margin:0 0 18px">Same picks and
+sizing as the base testrun — the <strong>only</strong> difference is the exit: a
+limit sell at <strong>{TP_LIMIT}¢</strong> takes profit early. A winner banks
+{TP_LIMIT}¢ instead of riding to 100¢; crucially, a match that leads then
+collapses still fills the limit on the spike, turning a would-be full loss into
+a locked-in gain. Compare against the {other}.</p>"""
+                 if is_tp else
+                 f"""<p class="prose" style="margin:0 0 18px">The bot places
+<strong>imaginary</strong> one-contract bets for itself — selectively; most
+matches get no bet. Held to settlement (100¢/0¢). Settled results are the tuning
+data: the policy iterates until the record holds above 70%. Nothing here is, or
+ever becomes, a real order. See the {other}.</p>""")
+    status_th = "exit" if is_tp else "status"
+    body = pagehead("Strategy Lab", title,
+                    f'{n} settled · <a href="/track">advisory track record →</a>') \
+        + strip + exit_note + watching_html + timeline_html + f"""
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
 <span class="aside">where the record comes from — the improvement signal</span></div>
 <div class="rule"></div>{breakdown}</section>
 <section class="block"><div class="blockhead"><h4>Bets</h4></div>
 <div class="rule"></div><div class="tw">
 <table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
-<th>edge</th><th>basis</th><th>status</th><th style="text-align:right">P&amp;L</th></tr>
+<th>edge</th><th>basis</th><th>{status_th}</th><th style="text-align:right">P&amp;L</th></tr>
 {rows_html(open_bets) + rows_html(settled) or
  '<tr><td colspan="9" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
 </table></div></section>"""
-    return respond(request, "Bot Testrun", "testrun", body)
+    return respond(request, title, active, body)
 
 
 async def track(request: web.Request) -> web.Response:
@@ -1840,6 +1918,7 @@ def make_app() -> web.Application:
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/testrun", testrun)
+    app.router.add_get("/testrun-tp", testrun_tp)
     app.router.add_get("/players", players)
     app.router.add_get("/player/{pid:\\d+}", player_detail)
     app.router.add_get("/match/{event}", match_detail)
