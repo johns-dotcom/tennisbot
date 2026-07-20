@@ -397,6 +397,30 @@ class WatchService:
             except asyncio.TimeoutError:
                 pass
 
+    # ---------- scenario refresh (always-on; cron also runs it daily) ----------
+
+    async def scenario_loop(self) -> None:
+        """Regenerate gameflow scenarios every 6h so matches added to Kalshi
+        during the day get plans without waiting for the daily cron."""
+        from bot.scenarios import generate_scenarios
+
+        # first run shortly after boot (discovery + model fit already done)
+        try:
+            await asyncio.wait_for(self.stop.wait(), timeout=120)
+        except asyncio.TimeoutError:
+            pass
+        while not self.stop.is_set():
+            try:
+                with db_session() as db:
+                    n = await asyncio.to_thread(generate_scenarios, db)
+                log.info("scenario refresh complete", kept=n)
+            except Exception as e:
+                log.error("scenario refresh failed", error=str(e))
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=6 * 3600)
+            except asyncio.TimeoutError:
+                pass
+
     # ---------- settlement resolution (track record) ----------
 
     async def settlement_loop(self) -> None:
@@ -532,7 +556,7 @@ class WatchService:
             (self.discovery_loop, "discovery"), (self.ws_loop, "websocket"),
             (self.rest_fallback_loop, "rest_fallback"), (self.score_loop, "score"),
             (self.settlement_loop, "settlement"), (self.paper_loop, "paper"),
-            (self.health_server, "health"))]
+            (self.scenario_loop, "scenarios"), (self.health_server, "health"))]
 
         async def shutdown_watchdog():
             await self.stop.wait()
