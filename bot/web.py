@@ -605,8 +605,71 @@ async def testrun(request: web.Request) -> web.Response:
 <p class="sub2">Dashed markers = policy version changes; records before and
 after a tune are never blended silently.</p></section>"""
 
+    # --- Watching: matches the policy is currently evaluating ---
+    from bot.models import Scenario
+    from bot.paper import decide_bet
+
+    now = datetime.now(timezone.utc)
+    with db_session() as db:
+        bet_events = set(db.execute(select(PaperBet.event_ticker)).scalars().all())
+        cand = db.execute(
+            select(Scenario, Player.full_name)
+            .join(Player, Player.id == Scenario.player_id, isouter=True)
+            .where(Scenario.scheduled_start > now - timedelta(hours=6),
+                   Scenario.scheduled_start < now + timedelta(hours=24))
+            .order_by(Scenario.scheduled_start)).all()
+        cand = [(sc, nm) for sc, nm in cand if sc.event_ticker not in bet_events]
+        tickers = [sc.market_ticker for sc, _ in cand]
+        quotes = _latest_quotes(db, tickers) if tickers else {}
+        sl = {}
+        if tickers:
+            from sqlalchemy import text as sqltext
+            for r in db.execute(sqltext("""
+                SELECT DISTINCT ON (market_ticker) market_ticker, scoreline
+                FROM match_score_log WHERE market_ticker = ANY(:t)
+                ORDER BY market_ticker, ts DESC"""), {"t": tickers}).all():
+                sl[r[0]] = r[1]
+
+    watch_rows, seen_ev = [], set()
+    for sc, nm in cand:
+        if sc.event_ticker in seen_ev:
+            continue
+        seen_ev.add(sc.event_ticker)
+        q = quotes.get(sc.market_ticker)
+        yb, ya = (q[0], q[1]) if q else (None, None)
+        conf = (sc.facts or {}).get("model_confidence", 0.7)
+        dec = decide_bet(sc.prematch_prob, conf, ya, yb)
+        price = ya if ya is not None else "—"
+        if dec.place:
+            verdict = tag("good", "✓", f"clears — {dec.units}u candidate")
+        elif ya is None:
+            verdict = tag("neutral", "○", "awaiting live price")
+        else:
+            verdict = tag("warn", "◉", "watching · " + dec.reason.split(",")[0])
+        live_sl = sl.get(sc.market_ticker)
+        watch_rows.append((sc.scheduled_start, f"""<tr>
+<td class="mono sub2">{pt(sc.scheduled_start)}</td>
+<td><a href="/match/{esc(sc.event_ticker)}" style="text-decoration:none">
+<span class="pname">{esc(nm)}</span></a>
+{f'<br><span class="mono sub2">{esc(live_sl)}</span>' if live_sl else ''}</td>
+<td class="mono">{sc.prematch_prob:.0%}</td>
+<td class="mono">{price}{'¢' if price != '—' else ''}</td>
+<td>{verdict}</td></tr>"""))
+    watch_rows.sort(key=lambda r: (r[0] or now))
+    watching_html = f"""<section class="block"><div class="blockhead">
+<h4>Watching ({len(watch_rows)})</h4><span class="aside">matches the policy is
+evaluating · next 24h · not yet bet</span></div><div class="rule"></div>
+<div class="tw"><table class="t"><tr><th>starts</th><th>watch side</th>
+<th>model</th><th>price</th><th>policy verdict</th></tr>
+{''.join(r[1] for r in watch_rows) or
+ '<tr><td colspan="5" class="empty">Nothing in the evaluation window right now.</td></tr>'}
+</table></div>
+<p class="sub2" style="margin-top:6px">A bet fires only when the price meets the
+model — most of these will pass without one. ✓ = clears every gate now;
+◉ = tracked, gate not yet met.</p></section>"""
+
     body = pagehead("Strategy Lab", "Bot Testrun",
-                    f'{n} settled · <a href="/track">advisory track record →</a>') + strip + timeline_html + f"""
+                    f'{n} settled · <a href="/track">advisory track record →</a>') + strip + watching_html + timeline_html + f"""
 <p class="prose" style="margin:0 0 18px">The bot places <strong>imaginary</strong>
 one-contract bets for itself — selectively; most matches get no bet. Settled
 results are the tuning data: the policy (probability floor, edge floor,
