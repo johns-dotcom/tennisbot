@@ -115,12 +115,21 @@ implemented (reports thresholds; never flips the flag). Known v1 limits: anchor
 from first trade (pre-match trading weakens set-1 gate), minutes/sets duration
 approximation.
 
-### Phase 4 — Kalshi integration (READ ONLY)
+### Phase 4 — Kalshi integration (READ ONLY)  [DONE 2026-07-19]
 Fetch docs.kalshi.com first; RSA env-var auth verified with one GET; scheduled market
 discovery → market_matcher; WS subscriptions; REST fallback flagged `degraded`
 (never sole trigger for boundary detection); top-of-book both sides + volume;
 edge vs executable price.
-**DONE when:** live markets discovered, matched, streaming into market_ticks.
+**DONE check passed:** docs read first (RSA-PSS SHA256 headers; prices are dollar
+strings now → cents; tennis series KXATPMATCH/KXWTAMATCH/KXITFMATCH/KXITFWMATCH/
+KXATPCHALLENGERMATCH/KXWTAGAME — "GAME"=match; two markets per event, YES=player;
+delayed score via milestones type=tennis_tournament_singles →
+GET /live_data/milestone/{id} competitor{1,2}_overall_score). Auth verified with one
+authenticated GET. Discovery: 398 live markets, 367 matched+watched, review queue
+holds the rest. WS streamed 174 quotes + 169 trades (non-degraded) into market_ticks;
+survived reconnect; SIGTERM watchdog exits cleanly. Score polling gated to matches
+near occurrence_datetime; verified against live + postponed milestones. Watch loops
+supervised (crash → log + restart).
 
 ### Phase 5 — Edge detection + advisories
 Gates (ALL): edge ≥ 6% default, model confidence ≥ min, volume ≥ floor, state
