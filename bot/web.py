@@ -466,14 +466,33 @@ async def live(request: web.Request) -> web.Response:
                 "occ": occ, "sides": [], "series": (m.raw or {}).get("_series", "")})
             ev["sides"].append(m)
 
-        live_evs, soon_evs = [], []
+        # Kalshi's occurrence_datetime is the SCHEDULED time and never updates;
+        # tennis runs early/late constantly. A match is treated as over when any
+        # side has a settlement result, or when discovery stopped seeing the
+        # market as open (it left the open set → closed/settled on Kalshi).
+        seen_cutoff = now - timedelta(minutes=45)
+        # only trust "disappeared from discovery" while discovery is provably
+        # alive — otherwise a worker outage would empty the whole board
+        global_last_seen = max((m.last_seen_at for m in markets
+                                if m.last_seen_at), default=None)
+        discovery_alive = global_last_seen is not None and global_last_seen >= seen_cutoff
+        live_evs, soon_evs, done_evs = [], [], []
         for ev_ticker, ev in events.items():
+            settled = any(m.result for m in ev["sides"])
+            last_seen = max((m.last_seen_at for m in ev["sides"]
+                             if m.last_seen_at), default=None)
+            gone = discovery_alive and last_seen is not None and last_seen < seen_cutoff
+            if settled or gone:
+                if now - ev["occ"] <= timedelta(hours=18):
+                    done_evs.append((ev_ticker, ev))
+                continue
             if ev["occ"] - LIVE_WINDOW_BEFORE <= now <= ev["occ"] + LIVE_WINDOW_AFTER:
                 live_evs.append((ev_ticker, ev))
             elif now < ev["occ"] <= now + UPCOMING_HORIZON:
                 soon_evs.append((ev_ticker, ev))
         live_evs.sort(key=lambda e: e[1]["occ"])
         soon_evs.sort(key=lambda e: e[1]["occ"])
+        done_evs.sort(key=lambda e: e[1]["occ"], reverse=True)
 
         all_tickers = [m.ticker for _, ev in live_evs for m in ev["sides"]]
         quotes = _latest_quotes(db, all_tickers)
@@ -521,8 +540,28 @@ async def live(request: web.Request) -> web.Response:
 · {esc(ev_ticker)}</div>
 </div>"""
 
+    def done_card(ev_ticker: str, ev: dict) -> str:
+        sides = sorted(ev["sides"], key=lambda m: m.ticker)
+        rows_html = []
+        for m in sides[:2]:
+            name = (m.raw or {}).get("yes_sub_title") or m.ticker.rsplit("-", 1)[-1]
+            won = m.result == "yes"
+            mark = tag("good", "✓", "won") if won else ""
+            style = "" if won or not any(x.result for x in sides) \
+                else "color:var(--muted)"
+            rows_html.append(f'<div class="playerrow"><span class="nm" '
+                             f'style="{style}">{esc(name)}</span><span>{mark}</span></div>')
+        return f"""<div class="card" style="opacity:.75">
+<div style="display:flex;align-items:center;justify-content:space-between">
+<span class="kicker" style="margin:0">{series_label.get(ev['series'], '?')}</span>
+{tag('neutral', '·', 'finished')}</div>
+<div>{''.join(rows_html)}</div>
+<div class="sub2 mono">was scheduled {pt(ev['occ'])} · {esc(ev_ticker)}</div>
+</div>"""
+
     live_cards = "".join(match_card(t, e, True) for t, e in live_evs)
     soon_cards = "".join(match_card(t, e, False) for t, e in soon_evs)
+    done_cards = "".join(done_card(t, e) for t, e in done_evs[:12])
     body = pagehead("Match Board", "Live Now",
                     f"{len(live_evs)} live · {len(soon_evs)} next 12h") + f"""
 <section class="block">
@@ -530,13 +569,16 @@ async def live(request: web.Request) -> web.Response:
     '<div class="card"><div class="empty">No tennis in the playing window right now.</div></div>'}
 </div></section>
 <section class="block"><div class="blockhead"><h4>Starting soon</h4>
-<span class="aside">next 12 hours</span></div><div class="rule"></div>
+<span class="aside">next 12 hours · scheduled times — tennis runs early and late</span></div>
+<div class="rule"></div>
 <div class="cards">{soon_cards or
     '<div class="card"><div class="empty">Nothing scheduled.</div></div>'}
 </div></section>
+{f'<section class="block"><div class="blockhead"><h4>Recently finished</h4></div><div class="rule"></div><div class="cards">{done_cards}</div></section>' if done_cards else ''}
 <p class="prose">Every match the bot watches appears here whether or not a play
 fired. Prices are the latest streamed mids; set states come from the estimator
-(≈ inferred from odds movement, ✓ confirmed by the delayed score).</p>"""
+(≈ inferred from odds movement, ✓ confirmed by the delayed score). Matches leave
+the board as soon as their market settles or closes on Kalshi.</p>"""
     return web.Response(text=page("Live", "live", body), content_type="text/html")
 
 
