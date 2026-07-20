@@ -357,7 +357,7 @@ engine still applies every gate before any advisory fires.</p>
 
 
 async def testrun(request: web.Request) -> web.Response:
-    from bot.models import PaperBet
+    from bot.models import PaperBet, Scenario
     from bot.paper import PAPER_MIN_EDGE, PAPER_MIN_PROB
 
     with db_session() as db:
@@ -366,6 +366,13 @@ async def testrun(request: web.Request) -> web.Response:
             .join(Player, Player.id == PaperBet.player_id, isouter=True)
             .order_by(PaperBet.created_at.desc()).limit(300)
         ).all()
+        evs = [b.event_ticker for b, _ in bets]
+        plans = {}
+        if evs:
+            for sc in db.execute(select(Scenario).where(
+                    Scenario.event_ticker.in_(evs))
+                    .order_by(Scenario.created_for)).scalars():
+                plans[sc.event_ticker] = sc  # latest generation wins
 
     settled = [(b, p) for b, p in bets if b.status in ("won", "lost")]
     open_bets = [(b, p) for b, p in bets if b.status == "open"]
@@ -406,6 +413,34 @@ async def testrun(request: web.Request) -> web.Response:
 <div class="metric"><div class="k">2u+ bets</div><div class="v mono">{bucket(lambda b: (b.units or 1) >= 2)}</div></div>
 </div>"""
 
+    def why(b, player) -> str:
+        """Every bet explains itself: sizing logic + the match's gameflow read."""
+        r = b.reasoning or {}
+        basis_txt = ("placed pre-match, evaluated against the opening quote"
+                     if b.basis == "prematch"
+                     else f"triggered by an in-play advisory at {esc(b.state_at_placement)} sets")
+        parts = [
+            f"Model made {esc((player or 'the pick').split()[-1])} "
+            f"{b.model_prob:.0%} against a {b.price_cents}¢ ask — a "
+            f"{b.edge * 100:.1f}% edge at {b.model_confidence:.0%} model "
+            f"confidence; {basis_txt}.",
+            f"Sized {b.units or 1}u: " + (
+                "baseline unit — cleared the entry gates without 2u conviction."
+                if (b.units or 1) == 1 else
+                "probability, edge and confidence all cleared the 2u conviction bar."
+                if b.units == 2 else
+                "extreme reading on all three axes — the rare 3u."),
+        ]
+        pr = r.get("policy_reason")
+        if pr:
+            parts.append(f"Policy check: {esc(pr)}.")
+        sc = plans.get(b.event_ticker)
+        if sc:
+            first_two = ". ".join(sc.narrative.split(". ")[:2])
+            parts.append(f"Gameflow read: {esc(first_two)}… "
+                         f"<a href='/match/{esc(b.event_ticker)}'>full match data →</a>")
+        return f'<div class="prose" style="margin-top:6px">{" ".join(parts)}</div>'
+
     def rows_html(pairs) -> str:
         out = []
         for b, player in pairs:
@@ -416,7 +451,8 @@ async def testrun(request: web.Request) -> web.Response:
             match = (b.reasoning or {}).get("match", b.event_ticker)
             out.append(f"""<tr>
 <td class="mono sub2">{pt(b.created_at)}</td>
-<td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span></td>
+<td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span>
+{why(b, player)}</td>
 <td class="mono">{b.price_cents}¢</td>
 <td class="mono" style="font-weight:800">{b.units or 1}u</td>
 <td class="mono">{b.model_prob:.0%}</td>
