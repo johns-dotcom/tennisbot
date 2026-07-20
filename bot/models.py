@@ -127,6 +127,8 @@ class KalshiMarket(Base):
     raw: Mapped[dict | None] = mapped_column(JSONB)
     first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    result: Mapped[str | None] = mapped_column(String(8))  # 'yes' | 'no' | 'void'
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class Advisory(Base):

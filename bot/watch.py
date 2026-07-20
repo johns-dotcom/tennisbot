@@ -336,6 +336,49 @@ class WatchService:
         suffix = ticker.rsplit("-", 1)[-1].upper()
         return bool(first_surname) and first_surname.upper().startswith(suffix[:3])
 
+    # ---------- settlement resolution (track record) ----------
+
+    async def settlement_loop(self) -> None:
+        """Resolve results for markets that carry sent advisories, so the
+        track-record page can score them. Runs every 30 min."""
+        from sqlalchemy import select
+
+        from bot.models import Advisory, KalshiMarket
+
+        while not self.stop.is_set():
+            try:
+                with db_session() as db:
+                    tickers = db.execute(
+                        select(Advisory.market_ticker).where(
+                            Advisory.status == "sent").distinct()).scalars().all()
+                    rows = db.execute(select(KalshiMarket).where(
+                        KalshiMarket.ticker.in_(tickers),
+                        KalshiMarket.result.is_(None))).scalars().all() if tickers else []
+                    pending = [r.ticker for r in rows]
+                for ticker in pending:
+                    if self.stop.is_set():
+                        break
+                    try:
+                        m = await asyncio.to_thread(self.client.market, ticker)
+                    except Exception:
+                        continue
+                    result = (m.get("result") or "").strip().lower()
+                    if result in ("yes", "no", "void"):
+                        with db_session() as db:
+                            row = db.execute(select(KalshiMarket).where(
+                                KalshiMarket.ticker == ticker)).scalar()
+                            if row is not None:
+                                row.result = result
+                                row.settled_at = utcnow()
+                                row.status = m.get("status") or row.status
+                        log.info("market settled", ticker=ticker, result=result)
+            except Exception as e:
+                log.error("settlement loop error", error=str(e))
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=1800)
+            except asyncio.TimeoutError:
+                pass
+
     # ---------- health + lifecycle ----------
 
     async def health_server(self) -> None:
@@ -397,7 +440,7 @@ class WatchService:
         tasks = [asyncio.create_task(supervised(fn, name)) for fn, name in (
             (self.discovery_loop, "discovery"), (self.ws_loop, "websocket"),
             (self.rest_fallback_loop, "rest_fallback"), (self.score_loop, "score"),
-            (self.health_server, "health"))]
+            (self.settlement_loop, "settlement"), (self.health_server, "health"))]
 
         async def shutdown_watchdog():
             await self.stop.wait()

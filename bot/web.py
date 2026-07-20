@@ -111,7 +111,9 @@ def state_chip(adv_or_state, confirmed: bool, probation: bool) -> str:
 def page(title: str, active: str, body: str) -> str:
     navs = "".join(
         f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
-        for href, key, label in (("/", "home", "Advisories"), ("/live", "live", "Live"),
+        for href, key, label in (("/", "home", "Advisories"),
+                                 ("/track", "track", "Track record"),
+                                 ("/live", "live", "Live"),
                                  ("/report", "report", "Estimator"),
                                  ("/queue", "queue", "Review queue")))
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -271,6 +273,73 @@ async def queue(request: web.Request) -> web.Response:
     return web.Response(text=page("Review queue", "queue", body), content_type="text/html")
 
 
+async def track(request: web.Request) -> web.Response:
+    from bot.track import advisory_outcome, advisory_pnl_cents
+
+    with db_session() as db:
+        rows = db.execute(
+            select(Advisory, Player.full_name, KalshiMarket.result)
+            .join(Player, Player.id == Advisory.recommended_player_id, isouter=True)
+            .join(KalshiMarket, KalshiMarket.ticker == Advisory.market_ticker,
+                  isouter=True)
+            .where(Advisory.status == "sent")
+            .order_by(Advisory.created_at.desc()).limit(200)
+        ).all()
+
+    settled, pnl_total, stake_total = [], 0, 0
+    buckets = {"all": [0, 0], "probation": [0, 0], "confirmed": [0, 0]}
+    items = []
+    for adv, player, result in rows:
+        side = adv.fact_block.get("side", "yes") if adv.fact_block else "yes"
+        outcome = advisory_outcome(side, result)
+        pnl = advisory_pnl_cents(side, adv.executable_price_cents, result)
+        if outcome in ("won", "lost"):
+            settled.append(outcome)
+            pnl_total += pnl
+            stake_total += adv.executable_price_cents
+            key = "probation" if adv.probation else "confirmed"
+            for k in ("all", key):
+                buckets[k][0] += (outcome == "won")
+                buckets[k][1] += (outcome == "lost")
+        oc = {"won": chip("good", "✓", "WON"), "lost": chip("critical", "✕", "LOST"),
+              "void": chip("muted", "·", "void"), None: chip("warning", "…", "open")}[outcome]
+        pnl_txt = f"{pnl:+d}¢" if pnl is not None else "—"
+        items.append(f"""<tr>
+<td class="mono">{pt(adv.created_at)}</td>
+<td><strong>{esc(player)}</strong><br><span class="mono">{esc(adv.market_ticker)}</span></td>
+<td>{adv.executable_price_cents}¢</td>
+<td>{adv.model_prob:.0%}</td>
+<td class="edge-pos">+{adv.edge * 100:.1f}%</td>
+<td>{esc(adv.inferred_state)} {state_chip(adv, adv.state_confirmed, adv.probation)}</td>
+<td>{oc}</td><td>{pnl_txt}</td></tr>""")
+
+    n = len(settled)
+    wins = sum(1 for o in settled if o == "won")
+    win_rate = f"{wins / n:.0%}" if n else "—"
+    roi = f"{pnl_total / stake_total:+.1%}" if stake_total else "—"
+    rec = lambda b: f"{b[0]}-{b[1]}" if (b[0] or b[1]) else "0-0"
+    tiles = f"""<div class="tiles">
+<div class="tile"><div class="v">{len(rows)}</div><div class="l">advisories sent</div></div>
+<div class="tile"><div class="v">{rec(buckets['all'])}</div><div class="l">settled record</div></div>
+<div class="tile"><div class="v">{win_rate}</div><div class="l">win rate</div></div>
+<div class="tile"><div class="v">{pnl_total:+d}¢</div><div class="l">flat-stake P&amp;L</div>
+  <div class="s">1 contract per advisory</div></div>
+<div class="tile"><div class="v">{roi}</div><div class="l">ROI on stakes</div></div>
+<div class="tile"><div class="v">{rec(buckets['probation'])}</div><div class="l">probation record</div>
+  <div class="s">confirmed: {rec(buckets['confirmed'])}</div></div>
+</div>"""
+    body = tiles + f"""<div class="card"><h2>Advisory track record</h2>
+<table><tr><th>time</th><th>recommendation</th><th>price</th><th>model</th>
+<th>edge</th><th>state at fire</th><th>outcome</th><th>P&amp;L</th></tr>
+{''.join(items) or '<tr><td colspan="8" class="empty">No sent advisories yet.</td></tr>'}
+</table>
+<p class="prose">Outcomes settle from Kalshi market results (checked every 30
+minutes). P&amp;L convention: one contract bought at the quoted executable price
+per advisory — an accounting yardstick, not betting advice.</p></div>"""
+    return web.Response(text=page("Track record", "track", body),
+                        content_type="text/html")
+
+
 async def healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -296,6 +365,7 @@ async def token_guard(request: web.Request, handler):
 def make_app() -> web.Application:
     app = web.Application(middlewares=[token_guard])
     app.router.add_get("/", home)
+    app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/report", report)
     app.router.add_get("/queue", queue)
