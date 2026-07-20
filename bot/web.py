@@ -143,11 +143,14 @@ def esc(v) -> str:
 
 
 def pt(ts: datetime | None) -> str:
+    """Relative time that self-updates client-side; absolute PT on hover."""
     if ts is None:
         return "—"
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=timezone.utc)
-    return ts.astimezone(PACIFIC).strftime("%b %d %I:%M %p PT")
+    abs_txt = ts.astimezone(PACIFIC).strftime("%b %d %I:%M %p PT")
+    return (f'<span class="rel" data-ts="{int(ts.timestamp())}" '
+            f'title="{abs_txt}">{abs_txt}</span>')
 
 
 def tag(kind: str, icon: str, label: str) -> str:
@@ -184,7 +187,47 @@ def _feed_status() -> tuple[str, str]:
     return "var(--critical)", "FEED STALE"
 
 
-def page(title: str, active: str, body: str) -> str:
+JS = """
+function rel(){document.querySelectorAll('.rel').forEach(function(e){
+ var t=+e.dataset.ts*1000, d=(t-Date.now())/1e3, a=Math.abs(d), s;
+ if(a<60)s=Math.round(a)+'s'; else if(a<5400)s=Math.round(a/60)+'m';
+ else if(a<86400)s=(a/3600).toFixed(1).replace('.0','')+'h';
+ else s=Math.round(a/86400)+'d';
+ e.textContent=d>0?('in '+s):(s+' ago');});}
+async function refreshMain(){
+ try{var r=await fetch(location.pathname+location.search,{headers:{'X-Fragment':'1'}});
+  if(r.ok){var h=await r.text(); var m=document.querySelector('main');
+   if(h && h.length>50 && h!==m.innerHTML){var y=window.scrollY; m.innerHTML=h; window.scrollTo(0,y);}
+  }}catch(e){} rel();}
+var seen=null;
+function notify(title, body){
+ if(Notification.permission==='granted') new Notification(title,{body:body,silent:false});}
+async function pollEvents(){
+ try{var r=await fetch('/api/events'); var d=await r.json();
+  var prev=seen; seen={adv:d.max_advisory_id||0, bet:d.max_bet_id||0};
+  localStorage.setItem('deuce_seen',JSON.stringify(seen));
+  if(!prev) return;
+  (d.advisories||[]).forEach(function(a){if(a.id>prev.adv) notify('DEUCE · ADVISORY',a.text);});
+  (d.bets||[]).forEach(function(b){if(b.id>prev.bet) notify('DEUCE · PAPER BET',b.text);});
+ }catch(e){}}
+document.addEventListener('DOMContentLoaded',function(){
+ try{seen=JSON.parse(localStorage.getItem('deuce_seen'))||null;}catch(e){}
+ rel(); setInterval(rel,5000);
+ setInterval(refreshMain,7000);
+ setInterval(pollEvents,10000); pollEvents();
+ var bell=document.getElementById('bell');
+ function paint(){bell.textContent=Notification.permission==='granted'?'🔔 alerts on':'🔕 enable alerts';}
+ if(!('Notification' in window)){bell.style.display='none';return;} paint();
+ bell.addEventListener('click',function(){Notification.requestPermission().then(paint);});});
+"""
+
+
+def page(title: str, active: str, body: str, fragment: bool = False) -> str:
+    footer = """<footer>All times relative · updates in place every 7s ·
+historical data © Jeff Sackmann / Tennis Abstract (CC BY-NC-SA 4.0), personal
+research use · advisory only, nothing here is an order.</footer>"""
+    if fragment:
+        return body + footer
     navs = "".join(
         f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
         for href, key, label in (("/", "home", "Advisories"),
@@ -198,21 +241,25 @@ def page(title: str, active: str, body: str) -> str:
     dot, conn = _feed_status()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="30">
 <title>{esc(title)} · DEUCE</title><style>{CSS}</style></head>
 <body>
 <header class="nav">
   <span class="brand">DEUCE<small>Kalshi Terminal · advisory only — never trades</small></span>
   <nav class="links">{navs}</nav>
+  <button id="bell" class="conn mono" style="background:none;border:1px solid var(--divider);
+   color:var(--muted);cursor:pointer;padding:4px 10px;font:inherit;font-size:11px"></button>
   <span class="conn mono"><span class="dot" style="background:{dot}"></span>{conn}</span>
 </header>
 <main>
-{body}
-<footer>All times US/Pacific · auto-refreshes every 30s · historical data ©
-Jeff Sackmann / Tennis Abstract (CC BY-NC-SA 4.0), personal research use ·
-advisory only, nothing here is an order.</footer>
-</main></body></html>"""
+{page(title, active, body, fragment=True)}
+</main><script>{JS}</script></body></html>"""
 
+
+
+def respond(request: web.Request, title: str, active: str, body: str) -> web.Response:
+    frag = request.headers.get("X-Fragment") == "1"
+    return web.Response(text=page(title, active, body, fragment=frag),
+                        content_type="text/html")
 
 def pagehead(kicker: str, title: str, sub: str = "") -> str:
     return f"""<div class="pagehead"><div>
@@ -307,7 +354,7 @@ async def home(request: web.Request) -> web.Response:
 <th>edge</th><th>state</th><th>status</th></tr>
 {''.join(items) or '<tr><td colspan="6" class="empty">No advisories yet — the engine only fires when edge, volume, model confidence and state confidence all clear.</td></tr>'}
 </table></div></section>"""
-    return web.Response(text=page("Advisories", "home", body), content_type="text/html")
+    return respond(request, "Advisories", "home", body)
 
 
 async def scenarios(request: web.Request) -> web.Response:
@@ -352,8 +399,7 @@ engine still applies every gate before any advisory fires.</p>
 <div class="cards">{''.join(cards) or
     '<div class="card"><div class="empty">No scenarios yet — they generate with the daily ingest run.</div></div>'}
 </div>"""
-    return web.Response(text=page("Scenarios", "scenarios", body),
-                        content_type="text/html")
+    return respond(request, "Scenarios", "scenarios", body)
 
 
 async def testrun(request: web.Request) -> web.Response:
@@ -479,8 +525,7 @@ or ever becomes, a real order.</p>
 {rows_html(open_bets) + rows_html(settled) or
  '<tr><td colspan="9" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
 </table></div></section>"""
-    return web.Response(text=page("Bot Testrun", "testrun", body),
-                        content_type="text/html")
+    return respond(request, "Bot Testrun", "testrun", body)
 
 
 async def track(request: web.Request) -> web.Response:
@@ -554,8 +599,104 @@ async def track(request: web.Request) -> web.Response:
 <p class="prose" style="margin-top:10px">P&amp;L convention: one contract at the
 quoted executable price per advisory — an accounting yardstick, not betting advice.</p>
 </section>"""
-    return web.Response(text=page("Track record", "track", body),
-                        content_type="text/html")
+    return respond(request, "Track record", "track", body)
+
+
+def price_chart_svg(points: list[tuple[datetime, float]], marks: list[dict],
+                    label: str) -> str:
+    """Price line (side-A mid, 0-100¢) with the bot's actions annotated.
+
+    Marker shapes carry identity (not color alone): ◆ boundary inferred,
+    ✓ score confirmed, ▲ advisory, ● paper bet. Single series → no legend box
+    needed for the line itself; the marker legend renders below in HTML.
+    """
+    if len(points) < 5:
+        return ""
+    W, H, PL, PR, PT_, PB = 860, 220, 46, 10, 12, 26
+    t0, t1 = points[0][0].timestamp(), points[-1][0].timestamp()
+    if t1 - t0 < 60:
+        return ""
+
+    def x(ts: float) -> float:
+        return PL + (ts - t0) / (t1 - t0) * (W - PL - PR)
+
+    def y(price: float) -> float:
+        return PT_ + (100 - price) / 100 * (H - PT_ - PB)
+
+    path = "M" + " L".join(f"{x(p[0].timestamp()):.1f},{y(p[1]):.1f}" for p in points)
+    grid = "".join(
+        f'<line x1="{PL}" y1="{y(g):.0f}" x2="{W - PR}" y2="{y(g):.0f}" '
+        f'stroke="rgba(243,242,242,.10)" stroke-width="1"/>'
+        f'<text x="{PL - 8}" y="{y(g) + 4:.0f}" text-anchor="end" '
+        f'font-size="10" fill="rgba(243,242,242,.45)">{g}¢</text>'
+        for g in (25, 50, 75))
+    marks_svg = []
+    for m in marks:
+        ts = m["ts"].timestamp()
+        if not (t0 <= ts <= t1):
+            continue
+        mx, my = x(ts), y(m.get("price", 50))
+        title = esc(m["title"])
+        if m["kind"] == "boundary":
+            col = "var(--good)" if m.get("hit") else (
+                "var(--critical)" if m.get("hit") is False else "var(--warning)")
+            marks_svg.append(
+                f'<g><title>{title}</title><rect x="{mx - 5:.0f}" y="{my - 5:.0f}" '
+                f'width="10" height="10" transform="rotate(45 {mx:.0f} {my:.0f})" '
+                f'fill="{col}"/></g>')
+        elif m["kind"] == "score":
+            marks_svg.append(
+                f'<g><title>{title}</title><text x="{mx:.0f}" y="{my - 8:.0f}" '
+                f'text-anchor="middle" font-size="13" fill="var(--good)">✓</text></g>')
+        elif m["kind"] == "advisory":
+            marks_svg.append(
+                f'<g><title>{title}</title><path d="M{mx:.0f},{my - 7:.0f} '
+                f'l6,11 l-12,0 z" fill="var(--accent)"/></g>')
+        elif m["kind"] == "bet":
+            marks_svg.append(
+                f'<g><title>{title}</title><circle cx="{mx:.0f}" cy="{my:.0f}" r="5" '
+                f'fill="none" stroke="var(--accent)" stroke-width="2"/></g>')
+    start_lbl = points[0][0].astimezone(PACIFIC).strftime("%H:%M")
+    end_lbl = points[-1][0].astimezone(PACIFIC).strftime("%H:%M PT")
+    legend = ('<div class="sub2" style="display:flex;gap:16px;flex-wrap:wrap;margin-top:6px">'
+              '<span><span style="color:var(--warning)">◆</span> boundary inferred '
+              '(green=confirmed, red=miss)</span>'
+              '<span><span style="color:var(--good)">✓</span> score update</span>'
+              '<span><span style="color:var(--accent)">▲</span> advisory</span>'
+              '<span><span style="color:var(--accent)">●</span> paper bet</span></div>')
+    return f"""<section class="block"><div class="blockhead">
+<h4>Price · {esc(label)}</h4><span class="aside">{start_lbl} → {end_lbl}</span></div>
+<div class="rule"></div>
+<div class="tw"><svg viewBox="0 0 {W} {H}" role="img"
+ aria-label="market price over time with bot actions annotated"
+ style="width:100%;min-width:640px;display:block">
+{grid}
+<path d="{path}" fill="none" stroke="var(--accent)" stroke-width="2"
+ stroke-linejoin="round"/>
+{''.join(marks_svg)}
+</svg></div>{legend}</section>"""
+
+
+def trigger_html(sc, est_state: str | None, is_live: bool,
+                 watch_mid: float | None) -> str:
+    """Plan-vs-reality for a gameflow scenario: armed → hit → done, with the
+    model-vs-market read once the trigger state arrives. v1 targets the Bo3
+    decider (1-1)."""
+    target = "1-1"
+    if est_state == target:
+        badge = tag("accent", "◎", f"trigger HIT · {target}")
+        if watch_mid is not None:
+            gap = sc.model_prob_at_state * 100 - watch_mid
+            verdict = ("value" if gap >= 3 else "no value")
+            badge += " " + tag("good" if gap >= 3 else "neutral", "±",
+                               f"model {sc.model_prob_at_state:.0%} vs {watch_mid:.0f}¢ "
+                               f"→ {verdict}")
+        return badge
+    if est_state == "final":
+        return tag("neutral", "·", "plan done")
+    if is_live:
+        return tag("warn", "◉", f"trigger armed · watching for {target}")
+    return tag("neutral", "○", f"plan set · trigger {target}")
 
 
 LIVE_WINDOW_BEFORE = timedelta(minutes=10)
@@ -641,6 +782,15 @@ async def live(request: web.Request) -> web.Response:
                 Advisory.market_ticker.in_(all_tickers),
                 Advisory.status.in_(["sent", "pending"]))).scalars().all()) \
             if all_tickers else set()
+        from bot.models import Scenario
+
+        plans = {}
+        live_ev_tickers = [t for t, _ in live_evs]
+        if live_ev_tickers:
+            for sc in db.execute(select(Scenario).where(
+                    Scenario.event_ticker.in_(live_ev_tickers))
+                    .order_by(Scenario.created_for)).scalars():
+                plans[sc.event_ticker] = sc
 
     series_label = {"KXATPMATCH": "ATP", "KXWTAMATCH": "WTA", "KXWTAGAME": "WTA",
                     "KXATPCHALLENGERMATCH": "CHALLENGER", "KXITFMATCH": "ITF M",
@@ -667,12 +817,20 @@ async def live(request: web.Request) -> web.Response:
             st = tag("accent" if is_live else "neutral", "●" if is_live else "○",
                      "LIVE" if is_live else "PRE")
         play = tag("outline", "▲", "play") if any(m.ticker in advised for m in sides) else ""
+        plan_row = ""
+        sc = plans.get(ev_ticker)
+        if sc is not None:
+            wq = quotes.get(sc.market_ticker)
+            wmid = (wq[0] + wq[1]) / 2 if wq and wq[0] is not None else None
+            plan_row = (f'<div class="sub2">plan: '
+                        f'{trigger_html(sc, est.state if est else None, is_live, wmid)}</div>')
         return f"""<div class="card">
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{series_label.get(ev['series'], '?')}</span>
 <span>{st} {play}</span></div>
 <a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
 <div>{''.join(rows_html)}</div></a>
+{plan_row}
 <div class="sub2 mono">{'started' if is_live else 'starts'} {pt(ev['occ'])}
 · <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a></div>
 </div>"""
@@ -716,7 +874,7 @@ async def live(request: web.Request) -> web.Response:
 fired. Prices are the latest streamed mids; set states come from the estimator
 (≈ inferred from odds movement, ✓ confirmed by the delayed score). Matches leave
 the board as soon as their market settles or closes on Kalshi.</p>"""
-    return web.Response(text=page("Live", "live", body), content_type="text/html")
+    return respond(request, "Live", "live", body)
 
 
 async def report(request: web.Request) -> web.Response:
@@ -741,7 +899,7 @@ async def report(request: web.Request) -> web.Response:
 <tr><th>market</th><th>start</th><th>duration</th></tr>
 {gap_rows or '<tr><td colspan="3" class="empty">None recorded.</td></tr>'}
 </table></div></section>"""
-    return web.Response(text=page("Estimator", "report", body), content_type="text/html")
+    return respond(request, "Estimator", "report", body)
 
 
 async def queue(request: web.Request) -> web.Response:
@@ -763,7 +921,7 @@ async def queue(request: web.Request) -> web.Response:
 <span class="mono">player_aliases</span> (alias_normalized → player_id) and
 marking the queue row resolved. Unmatched names are never silently dropped.</p>
 </section>"""
-    return web.Response(text=page("Review queue", "queue", body), content_type="text/html")
+    return respond(request, "Review queue", "queue", body)
 
 
 def _rate_cell(stat) -> str:
@@ -838,7 +996,7 @@ async def players(request: web.Request) -> web.Response:
 <p class="prose" style="margin-top:12px">137,000+ players indexed from 2022 on:
 every ATP and WTA tour match, qualifying, Challengers, and men's + women's ITF.
 Click a player for the full play script.</p>"""
-    return web.Response(text=page("Players", "players", body), content_type="text/html")
+    return respond(request, "Players", "players", body)
 
 
 async def player_detail(request: web.Request) -> web.Response:
@@ -936,8 +1094,7 @@ days since last decider win:
 <tr><th>date</th><th></th><th>opponent</th><th>score</th><th>context</th></tr>
 {''.join(m_rows) or '<tr><td colspan="5" class="empty">No matches.</td></tr>'}
 </table></div></section>"""
-    return web.Response(text=page(p.full_name, "players", body),
-                        content_type="text/html")
+    return respond(request, p.full_name, "players", body)
 
 
 async def match_detail(request: web.Request) -> web.Response:
@@ -968,6 +1125,45 @@ async def match_detail(request: web.Request) -> web.Response:
         quotes = _latest_quotes(db, [a.ticker, b.ticker])
         est = db.execute(select(LiveMatchState).where(
             LiveMatchState.market_ticker.in_([a.ticker, b.ticker]))).scalars().first()
+
+        # price series + bot-action annotations for the chart (side A mid)
+        from sqlalchemy import text as sqltext
+
+        from bot.models import PaperBet
+
+        tick_rows = db.execute(sqltext("""
+            SELECT date_trunc('minute', ts) AS m, avg((yes_bid + yes_ask) / 2.0)
+            FROM market_ticks
+            WHERE market_ticker = :t AND kind = 'quote'
+              AND yes_bid IS NOT NULL AND yes_ask IS NOT NULL
+              AND ts > now() - interval '12 hours'
+            GROUP BY 1 ORDER BY 1"""), {"t": a.ticker}).all()
+        chart_points = [(r[0].replace(tzinfo=timezone.utc) if r[0].tzinfo is None
+                         else r[0], float(r[1])) for r in tick_rows]
+        marks: list[dict] = []
+        for r in db.execute(select(StateInferenceLog).where(
+                StateInferenceLog.market_ticker.in_([a.ticker, b.ticker]))
+                .order_by(StateInferenceLog.inferred_at.desc()).limit(30)).scalars():
+            marks.append({"kind": "boundary", "ts": r.inferred_at, "price": 50,
+                          "hit": r.hit,
+                          "title": f"boundary inferred → {r.inferred_state} "
+                                   f"({'confirmed' if r.hit else 'miss' if r.hit is False else 'pending'})"})
+            if r.confirmed_at:
+                marks.append({"kind": "score", "ts": r.confirmed_at, "price": 58,
+                              "title": f"score confirmed {r.confirmed_state}"})
+        for adv in db.execute(select(Advisory).where(
+                Advisory.market_ticker.in_([a.ticker, b.ticker]),
+                Advisory.status == "sent")).scalars():
+            marks.append({"kind": "advisory", "ts": adv.created_at,
+                          "price": adv.executable_price_cents,
+                          "title": f"advisory @ {adv.executable_price_cents}¢ "
+                                   f"edge +{adv.edge * 100:.1f}%"})
+        for bet in db.execute(select(PaperBet).where(
+                PaperBet.event_ticker == event_ticker)).scalars():
+            marks.append({"kind": "bet", "ts": bet.created_at,
+                          "price": bet.price_cents,
+                          "title": f"paper bet {bet.units}u @ {bet.price_cents}¢ "
+                                   f"({bet.basis})"})
 
     def px(m):
         q = quotes.get(m.ticker)
@@ -1000,10 +1196,18 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
     state_txt = ""
     if est:
         state_txt = f" · estimator {est.state} ({est.confidence:.0%})"
-    scenario_html = f"""<section class="block"><div class="blockhead">
+    scenario_html = ""
+    if sc:
+        wq = quotes.get(sc.market_ticker)
+        wmid = (wq[0] + wq[1]) / 2 if wq and wq[0] is not None else None
+        trig = trigger_html(sc, est.state if est else None, est is not None, wmid)
+        scenario_html = f"""<section class="block"><div class="blockhead">
 <h4>Gameflow plan</h4><span class="aside">generated {sc.created_for}</span></div>
-<div class="rule"></div><div class="prose">{esc(sc.narrative)}</div></section>""" \
-        if sc else ""
+<div class="rule"></div>
+<p style="margin:0 0 10px">{trig}</p>
+<div class="prose">{esc(sc.narrative)}</div></section>"""
+    yes_name = (a.raw or {}).get("yes_sub_title", "side A")
+    chart_html = price_chart_svg(chart_points, marks, f"{yes_name} to win")
     body = pagehead("Match", (a.title or "").split(":")[0].replace("Will ", "")
                     or event_ticker,
                     f"{px(a)} / {px(b)}{state_txt}") + f"""
@@ -1016,9 +1220,41 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
 <p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
 {f"(sets {mu.h2h_sets[0]}-{mu.h2h_sets[1]})" if mu.h2h.n else ""}.
 {esc(common)}</p></section>
+{chart_html}
 {scenario_html}
 <p class="sub2 mono">{esc(a.ticker)} · {esc(b.ticker)}</p>"""
-    return web.Response(text=page("Match", "scenarios", body), content_type="text/html")
+    return respond(request, "Match", "scenarios", body)
+
+
+async def api_events(request: web.Request) -> web.Response:
+    """Lightweight poll target for local browser notifications."""
+    from bot.models import PaperBet
+
+    with db_session() as db:
+        advs = db.execute(
+            select(Advisory, Player.full_name)
+            .join(Player, Player.id == Advisory.recommended_player_id, isouter=True)
+            .where(Advisory.status == "sent")
+            .order_by(Advisory.id.desc()).limit(5)).all()
+        bets = db.execute(
+            select(PaperBet, Player.full_name)
+            .join(Player, Player.id == PaperBet.player_id, isouter=True)
+            .order_by(PaperBet.id.desc()).limit(5)).all()
+    return web.json_response({
+        "max_advisory_id": max((a.id for a, _ in advs), default=0),
+        "max_bet_id": max((b.id for b, _ in bets), default=0),
+        "advisories": [
+            {"id": a.id,
+             "text": f"{p or '?'} @ {a.executable_price_cents}¢ · edge "
+                     f"+{a.edge * 100:.1f}% · state {a.inferred_state}"
+                     f"{' · PROBATION' if a.probation else ''}"}
+            for a, p in advs],
+        "bets": [
+            {"id": b.id,
+             "text": f"{p or b.event_ticker} · {b.units}u @ {b.price_cents}¢ · "
+                     f"model {b.model_prob:.0%} ({b.basis})"}
+            for b, p in bets],
+    })
 
 
 async def healthz(request: web.Request) -> web.Response:
@@ -1051,6 +1287,7 @@ def make_app() -> web.Application:
     app.router.add_get("/players", players)
     app.router.add_get("/player/{pid:\\d+}", player_detail)
     app.router.add_get("/match/{event}", match_detail)
+    app.router.add_get("/api/events", api_events)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/report", report)

@@ -190,3 +190,13 @@ production [PROBATION] advisory — both monitored, fire on the next live window
 - Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
 - Phase 3 (probability engine) DONE 2026-07-19.
 - Phase 3.5 DONE. Phase 4 DONE 2026-07-19 (Kalshi creds in .env; WS streaming verified live). Phase 5 built (Discord removed by user decision 2026-07-19; delivery = DB + logs); dry run needs ANTHROPIC_API_KEY (else template fallback) + a live match. GitHub remote configured (github.com-tennisbot alias); push pending user adding deploy key.
+
+## UI TODO (deferred by user 2026-07-20 — items 4-6 of the UI review)
+- Accountability curves: testrun cumulative record/P&L timeline with
+  policy-version markers; 70% pace line; Estimator tab -> tiles + lead-time
+  distribution + graduation progress bar (charts via dataviz validation).
+- Act-on-it: Kalshi deep links from advisory/bet rows (verify URL scheme
+  first); expandable fact-block "why" panel on advisories.
+- IA cleanup: System tab (Estimator + Review Queue + gaps); fold Track Record
+  into Testrun; homepage as true overview (live strip, next plays, latest
+  advisories).
