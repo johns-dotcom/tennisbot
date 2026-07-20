@@ -748,6 +748,20 @@ justify-content:space-between;gap:12px">
 model — most of these will pass without one. ✓ = clears every gate now;
 ◉ = tracked, gate not yet met.</p></details></section>"""
 
+    def bets_section(label, aside, basis) -> str:
+        opens = [x for x in open_bets if x[0].basis == basis]
+        setts = [x for x in settled if x[0].basis == basis]
+        w = sum(1 for b, _ in setts if effs[b.id][0] in WON)
+        rec = f"{w}-{len(setts) - w}" if setts else "0-0"
+        rowsel = rows_html(opens) + rows_html(setts)
+        return f"""<section class="block"><div class="blockhead">
+<h4>{label}</h4><span class="aside">{esc(aside)} · {rec} settled · {len(opens)} open</span></div>
+<div class="rule"></div><div class="tw">
+<table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
+<th>edge</th><th>tier</th><th>{status_th}</th><th style="text-align:right">P&amp;L</th></tr>
+{rowsel or f'<tr><td colspan="9" class="empty">No {esc(label.lower())} yet — the policy waits for matches that clear every gate.</td></tr>'}
+</table></div></section>"""
+
     title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
     active = "testrun"  # TP is a sibling variant under the same nav tab
     other = ('<a href="/testrun">← hold-to-settlement variant</a>' if is_tp
@@ -771,13 +785,10 @@ ever becomes, a real order. See the {other}.</p>""")
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
 <span class="aside">where the record comes from — the improvement signal</span></div>
 <div class="rule"></div>{breakdown}</section>
-<section class="block"><div class="blockhead"><h4>Bets</h4></div>
-<div class="rule"></div><div class="tw">
-<table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
-<th>edge</th><th>basis</th><th>{status_th}</th><th style="text-align:right">P&amp;L</th></tr>
-{rows_html(open_bets) + rows_html(settled) or
- '<tr><td colspan="9" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
-</table></div></section>"""
+{bets_section("Pre-game bets", "placed before the match, off the model's "
+              "opening read", "prematch")}
+{bets_section("Live-game bets", "fired in-play when an advisory cleared the "
+              "policy mid-match", "advisory")}"""
     return respond(request, title, active, body)
 
 
