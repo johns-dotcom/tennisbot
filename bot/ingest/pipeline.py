@@ -17,35 +17,45 @@ log = get_logger("ingest")
 
 
 def dedup_cross_source(db: Session) -> int:
-    """Mark api_tennis matches duplicated by a Sackmann match (same pair, ±10 days).
-
-    Sackmann is canonical: richer stats, verified scores.
-    """
-    sack = aliased(Match)
-    apit = aliased(Match)
-    dupes = db.execute(
-        select(apit.id).where(
-            apit.source == "api_tennis",
-            apit.is_duplicate.is_(False),
-            apit.outcome != "scheduled",
-        ).join(sack, and_(
-            sack.source == "sackmann",
-            sack.tour == apit.tour,
-            sack.winner_id.in_([apit.winner_id, apit.loser_id]),
-            sack.loser_id.in_([apit.winner_id, apit.loser_id]),
-            sack.match_date.between(apit.match_date - timedelta(days=10),
-                                    apit.match_date + timedelta(days=10)),
-        ))
-    ).scalars().all()
-    if dupes:
-        db.execute(update(Match).where(Match.id.in_(dupes)).values(is_duplicate=True))
-    return len(dupes)
+    """Mark non-canonical rows duplicated by a Sackmann match (same pair,
+    ±10 days). Sackmann is canonical: richer stats, verified scores. Applies
+    to api_tennis and kalshi-mined results alike."""
+    n_total = 0
+    for other_source in ("api_tennis", "kalshi"):
+        sack = aliased(Match)
+        other = aliased(Match)
+        dupes = db.execute(
+            select(other.id).where(
+                other.source == other_source,
+                other.is_duplicate.is_(False),
+                other.outcome != "scheduled",
+            ).join(sack, and_(
+                sack.source == "sackmann",
+                sack.tour == other.tour,
+                sack.winner_id.in_([other.winner_id, other.loser_id]),
+                sack.loser_id.in_([other.winner_id, other.loser_id]),
+                sack.match_date.between(other.match_date - timedelta(days=10),
+                                        other.match_date + timedelta(days=10)),
+            ))
+        ).scalars().all()
+        if dupes:
+            db.execute(update(Match).where(Match.id.in_(dupes))
+                       .values(is_duplicate=True))
+        n_total += len(dupes)
+    return n_total
 
 
 def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False,
                refresh_cache: bool = True) -> list[SyncResult]:
     results = [SackmannDataSource().sync(db, full=full)]
     db.commit()
+    try:
+        from bot.sources.kalshi_results import KalshiResultsSource
+
+        results.append(KalshiResultsSource().sync(db, full=full))
+        db.commit()
+    except Exception as e:
+        log.error("kalshi results sync failed", error=str(e))
     if not skip_live:
         results.append(ApiTennisSource().sync(db, full=full))
         db.commit()

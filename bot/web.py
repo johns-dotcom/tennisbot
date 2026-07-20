@@ -264,6 +264,7 @@ research use · advisory only, nothing here is an order.</footer>"""
                                  ("/scenarios", "scenarios", "Scenarios"),
                                  ("/testrun", "testrun", "Bot Testrun"),
                                  ("/players", "players", "Database"),
+                                 ("/flags", "flags", "Flags"),
                                  ("/system", "system", "System")))
     dot, conn = _feed_status()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
@@ -1442,6 +1443,101 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
     return respond(request, "Match", "scenarios", body)
 
 
+async def flags(request: web.Request) -> web.Response:
+    """Data-completeness audit: everything the database is still missing,
+    honestly flagged with severity and what would fix it."""
+    from bot.config import settings as cfg_fn
+    from bot.models import Match
+
+    cfg = cfg_fn()
+    today = datetime.now(timezone.utc).date()
+    with db_session() as db:
+        frontiers = db.execute(
+            select(Match.tour, Match.source, func.max(Match.match_date),
+                   func.count(Match.id))
+            .where(Match.outcome != "scheduled", Match.is_duplicate.is_(False))
+            .group_by(Match.tour, Match.source)).all()
+        k_no_sets = db.execute(select(func.count(Match.id)).where(
+            Match.source == "kalshi", Match.sets_won_winner.is_(None),
+            Match.is_duplicate.is_(False))).scalar()
+        k_total = db.execute(select(func.count(Match.id)).where(
+            Match.source == "kalshi", Match.is_duplicate.is_(False))).scalar()
+        no_surface = db.execute(select(func.count(Match.id)).where(
+            Match.surface.is_(None), Match.is_duplicate.is_(False),
+            Match.outcome != "scheduled")).scalar()
+        provisional = db.execute(select(func.count(Player.id)).where(
+            Player.sackmann_id.is_(None))).scalar()
+        unmatched = db.execute(select(func.count(MatchReviewQueue.id)).where(
+            MatchReviewQueue.resolved.is_(False))).scalar()
+
+    items = []
+
+    def flag(sev: str, title: str, detail: str, fix: str):
+        icon = {"critical": "⛔", "warn": "⚠", "info": "·"}[sev]
+        kind = {"critical": "accent", "warn": "warn", "info": "neutral"}[sev]
+        items.append(f"""<div class="card">
+<div>{tag(kind, icon, sev)}</div>
+<div class="title" style="font-size:15px">{esc(title)}</div>
+<div class="prose">{detail}</div>
+<div class="sub2">fix: {esc(fix)}</div></div>""")
+
+    by = {}
+    for tour, source, latest, n in frontiers:
+        by.setdefault(tour, {})[source] = (latest, n)
+    for tour in ("atp", "wta"):
+        srcs = by.get(tour, {})
+        newest = max((v[0] for v in srcs.values()), default=None)
+        if newest is None:
+            flag("critical", f"{tour.upper()}: no results at all",
+                 "The database has no completed matches for this tour.", "run ingest")
+            continue
+        age = (today - newest).days
+        parts = " · ".join(f"{s}: through {v[0]} ({v[1]:,} matches)"
+                           for s, v in sorted(srcs.items()))
+        if age > 3:
+            flag("critical" if age > 14 else "warn",
+                 f"{tour.upper()} results are {age} days stale",
+                 f"Newest completed match: {newest}. {parts}",
+                 "activate api-tennis (Phase 5.5) or verify the kalshi-results "
+                 "sync in the daily ingest")
+        else:
+            flag("info", f"{tour.upper()} results current through {newest}", parts,
+                 "none needed")
+    if k_total:
+        pct = k_no_sets / k_total
+        if k_no_sets:
+            flag("warn" if pct > 0.15 else "info",
+                 f"{k_no_sets:,} of {k_total:,} Kalshi-mined results lack set detail",
+                 "Winner is known from settlement, but per-set scores were "
+                 "unavailable or ambiguous — these matches count for W/L form "
+                 "but not for deciding-set or set-rate stats.",
+                 "api-tennis activation will supply full scorelines")
+    flag("warn" if not cfg.api_tennis_key else "info",
+         "Live results feed (api-tennis) " +
+         ("INACTIVE" if not cfg.api_tennis_key else "active"),
+         "The permanent recency source is deferred (Phase 5.5). Until it runs, "
+         "recent results come only from Kalshi-listed matches: tour-level is "
+         "near-complete, ITF partial, and surface is unknown for all of them.",
+         "sign up for the api-tennis trial and set API_TENNIS_KEY")
+    flag("info", f"{no_surface:,} matches have no surface recorded",
+         "All Kalshi-mined rows lack surface (Kalshi doesn't expose it), so "
+         "they're excluded from surface-split stats.",
+         "api-tennis backfill will fill surfaces going forward")
+    flag("info", f"{provisional:,} provisional players",
+         "Players created from live sources without a historical profile — "
+         "typically new ITF entrants after the mirror freeze; stats thin until "
+         "they accumulate matches.", "expected; resolves as data accrues")
+    if unmatched:
+        flag("warn", f"{unmatched} unmatched names in the review queue",
+             "Names that couldn't be confidently matched to a player — their "
+             "matches are NOT ingested until resolved.",
+             "resolve via player_aliases (System → review queue)")
+    body = pagehead("Data Audit", "Flags",
+                    f"{sum(1 for _ in items)} checks · refreshed live") + \
+        f'<div class="cards">{"".join(items)}</div>'
+    return respond(request, "Flags", "flags", body)
+
+
 async def api_events(request: web.Request) -> web.Response:
     """Lightweight poll target for local browser notifications."""
     from bot.models import PaperBet
@@ -1504,6 +1600,7 @@ def make_app() -> web.Application:
     app.router.add_get("/player/{pid:\\d+}", player_detail)
     app.router.add_get("/match/{event}", match_detail)
     app.router.add_get("/api/events", api_events)
+    app.router.add_get("/flags", flags)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/system", system)
