@@ -145,3 +145,15 @@ def test_edge_band_boundaries():
     assert edge_band(0.06) == 0
     assert edge_band(0.10) == 1
     assert edge_band(0.16) == 2
+
+
+def test_trade_volume_unblocks_when_quote_carries_none():
+    # WS ticker gives no volume; trades accumulate liquidity for the gate
+    eng, calls = make_engine(p=0.70)
+    e = est()
+    eng.on_quote("MKT", e, 58, 60, None)      # no volume on the quote
+    assert not calls["fired"]                  # volume gate blocks (0 < 100)
+    eng.note_trade("MKT", 60)
+    eng.note_trade("MKT", 50)                  # 110 contracts traded
+    eng.on_quote("MKT", e, 58, 60, None)
+    assert len(calls["fired"]) == 1            # now clears the volume floor

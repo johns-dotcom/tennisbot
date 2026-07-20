@@ -51,6 +51,7 @@ class AdvisoryEngine:
         self.model = model
         self.ctx: dict[str, dict] = {}  # ticker -> market context
         self.last_quote: dict[str, tuple[int | None, int | None, int | None]] = {}
+        self.session_volume: dict[str, int] = {}  # ticker -> contracts traded (live liquidity)
         self.last_advised: dict[str, tuple[str, int]] = {}  # ticker -> (state, band)
         self.pending: dict[str, dict] = {}  # ticker -> {advisory_id, state, block}
         self._profiles: dict[int, tuple] = {}  # player_id -> (profile, history)
@@ -109,6 +110,11 @@ class AdvisoryEngine:
         self.last_quote[ticker] = (yes_bid, yes_ask, volume)
         self._evaluate(ticker, est)
 
+    def note_trade(self, ticker: str, count: int) -> None:
+        """Accumulate live traded volume — the WS ticker feed carries no volume,
+        so the trade stream is the liquidity signal the volume gate relies on."""
+        self.session_volume[ticker] = self.session_volume.get(ticker, 0) + max(0, count)
+
     def on_confirmed_state(self, ticker: str, est) -> None:
         """Score arrived. Release or kill any pending advisory, then re-evaluate."""
         pend = self.pending.pop(ticker, None)
@@ -132,9 +138,12 @@ class AdvisoryEngine:
         ctx = self._context(ticker)
         if ctx is None:
             return
-        yes_bid, yes_ask, volume = self.last_quote.get(ticker, (None, None, None))
+        yes_bid, yes_ask, quote_vol = self.last_quote.get(ticker, (None, None, None))
         if yes_bid is None or yes_ask is None:
             return
+        # WS ticker carries no volume; the trade-stream accumulator is the real
+        # liquidity measure. Take the larger of the two.
+        volume = max(quote_vol or 0, self.session_volume.get(ticker, 0))
         sa, sb = (int(x) for x in est.state_key.split("-"))
         try:
             state = MatchState(sa, sb, ctx["best_of"])

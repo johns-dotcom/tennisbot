@@ -225,6 +225,8 @@ class WatchService:
             count = int(float(body.get("count", 1) or 1))
             self.recorder.trade(ticker, now, price or 0, count)
             est.on_trade(now, price or 0, count)
+            if self.advisory_hook:
+                self.advisory_hook.note_trade(ticker, count)
         elif mtype == "market_lifecycle_v2":
             event = body.get("event_type", "unknown")
             self.recorder.lifecycle(ticker, now, event, raw=body)
