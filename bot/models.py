@@ -129,6 +129,9 @@ class KalshiMarket(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     result: Mapped[str | None] = mapped_column(String(8))  # 'yes' | 'no' | 'void'
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # closing line: YES-side mid (cents) of the last quote at/before match start —
+    # the reference for closing-line value (CLV) on our picks
+    close_yes_cents: Mapped[int | None] = mapped_column(Integer)
 
 
 class Advisory(Base):

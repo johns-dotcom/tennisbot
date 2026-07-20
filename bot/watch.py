@@ -42,6 +42,26 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _closing_line(db, ticker: str, occurrence_iso: str | None) -> int | None:
+    """YES-side mid of the last quote at/before match start (the closing line)."""
+    from sqlalchemy import text as sqltext
+
+    if not occurrence_iso:
+        return None
+    try:
+        occ = datetime.fromisoformat(occurrence_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    row = db.execute(sqltext("""
+        SELECT yes_bid, yes_ask FROM market_ticks
+        WHERE market_ticker = :t AND kind = 'quote'
+          AND yes_bid IS NOT NULL AND yes_ask IS NOT NULL AND ts <= :occ
+        ORDER BY ts DESC LIMIT 1"""), {"t": ticker, "occ": occ}).first()
+    if not row:
+        return None
+    return int(round((row[0] + row[1]) / 2))
+
+
 class WatchService:
     def __init__(self) -> None:
         self.cfg = settings()
@@ -532,6 +552,9 @@ class WatchService:
                                 raw = dict(row.raw or {})
                                 raw["_final_sets"] = final_sets
                                 row.raw = raw
+                            if row.close_yes_cents is None:
+                                row.close_yes_cents = _closing_line(
+                                    db, ticker, (row.raw or {}).get("occurrence_datetime"))
                     log.info("market settled", ticker=ticker, result=result,
                              final_sets=final_sets)
                 from bot.paper import settle_open_bets

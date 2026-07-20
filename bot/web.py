@@ -529,12 +529,15 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                 plans[sc.event_ticker] = sc  # latest generation wins
         # match result + whether our side's bid touched 90 — needed for the TP
         # variant AND the hold-vs-TP comparison shown on both pages
-        results, touched = {}, {}
+        results, touched, closes = {}, {}, {}
         if bets:
             tks = [b.market_ticker for b, _ in bets]
-            results = dict(db.execute(select(
-                KalshiMarket.ticker, KalshiMarket.result).where(
-                KalshiMarket.ticker.in_(tks))).all())
+            for tk, res, cl in db.execute(select(
+                    KalshiMarket.ticker, KalshiMarket.result,
+                    KalshiMarket.close_yes_cents).where(
+                    KalshiMarket.ticker.in_(tks))).all():
+                results[tk] = res
+                closes[tk] = cl
             since = min(b.created_at for b, _ in bets)
             from sqlalchemy import text as sqltext
             for r in db.execute(sqltext("""
@@ -578,6 +581,16 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
     target_color = "var(--good)" if (win_rate or 0) >= 0.70 else \
         ("var(--warning)" if (win_rate or 0) >= 0.60 else "var(--text)")
     pcolor = "var(--good)" if pnl > 0 else ("var(--accent)" if pnl < 0 else "var(--text)")
+    # closing-line value: did our entry beat the match-start line?
+    from bot.track import clv_cents
+    clvs = [(b, clv_cents(b.side, b.price_cents, closes.get(b.market_ticker)))
+            for b, _ in bets]
+    clv_by_id = {b.id: c for b, c in clvs}
+    clv_vals = [c for _, c in clvs if c is not None]
+    beat = sum(1 for c in clv_vals if c > 0)
+    avg_clv = sum(clv_vals) / len(clv_vals) if clv_vals else None
+    clv_color = ("var(--good)" if avg_clv and avg_clv > 0 else
+                 "var(--accent)" if avg_clv and avg_clv < 0 else "var(--text)")
     strip = statstrip([
         ("Record", f"{wins}-{n - wins}" if n else "0-0", f"{len(open_bets)} open"),
         ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
@@ -587,8 +600,9 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         ("Profit (units)", f'<span style="color:{pcolor}">{profit_units:+.2f}u</span>' if n else "—",
          "profit ÷ stake, unit-weighted"),
         ("ROI", f"{pnl / staked:+.1%}" if staked else "—", f"{days}d running"),
-        ("Policy", f"≥{PAPER_MIN_PROB:.0%} prob",
-         f"+ ≥{PAPER_MIN_EDGE * 100:.0f}% edge · selective"),
+        ("CLV", f'<span style="color:{clv_color}">{avg_clv:+.1f}¢</span>'
+         if avg_clv is not None else "—",
+         f"beat close {beat}/{len(clv_vals)}" if clv_vals else "vs match-start line"),
     ])
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
 <div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
@@ -650,6 +664,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
 <td class="mono">+{b.edge * 100:.1f}%</td>
 <td>{tag('neutral', '·', b.basis)} {tag('neutral', '·', b.tier or '?')}</td>
 <td>{oc}</td>
+<td class="mono" style="text-align:right">{f'{clv_by_id[b.id]:+d}¢' if clv_by_id.get(b.id) is not None else '—'}</td>
 <td class="mono" style="text-align:right;font-weight:800">{pnl_txt}</td></tr>""")
         return "".join(out)
 
@@ -766,13 +781,14 @@ model — most of these will pass without one. ✓ = clears every gate now;
         w = sum(1 for b, _ in setts if effs[b.id][0] in WON)
         rec = f"{w}-{len(setts) - w}" if setts else "0-0"
         rowsel = rows_html(opens) + rows_html(setts)
-        empty = (f'<tr><td colspan="9" class="empty">No {esc(label.lower())} '
+        empty = (f'<tr><td colspan="10" class="empty">No {esc(label.lower())} '
                  f'settled yet. {empty_note if basis == "prematch" else "In-play bets fire only when a live advisory clears the policy mid-match."}</td></tr>')
         return f"""<section class="block"><div class="blockhead">
 <h4>{label}</h4><span class="aside">{esc(aside)} · {rec} settled · {len(opens)} open</span></div>
 <div class="rule"></div><div class="tw">
 <table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
-<th>edge</th><th>tier</th><th>{status_th}</th><th style="text-align:right">P&amp;L</th></tr>
+<th>edge</th><th>tier</th><th>{status_th}</th><th style="text-align:right">CLV</th>
+<th style="text-align:right">P&amp;L</th></tr>
 {rowsel or empty}
 </table></div></section>"""
 

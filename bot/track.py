@@ -18,6 +18,16 @@ def advisory_outcome(side: str, market_result: str | None) -> str | None:
     return "won" if market_result == side else "lost"
 
 
+def clv_cents(side: str, entry_cents: int, close_yes_cents: int | None) -> int | None:
+    """Closing-line value in cents: our side's closing price minus our entry.
+    Positive = we beat the close (got a better price than the sharp line).
+    None when the closing line is unknown."""
+    if close_yes_cents is None:
+        return None
+    our_close = close_yes_cents if side == "yes" else 100 - close_yes_cents
+    return our_close - entry_cents
+
+
 def advisory_pnl_cents(side: str, price_cents: int, market_result: str | None) -> int | None:
     """Flat one-contract P&L in cents; None while unsettled, 0 on void."""
     outcome = advisory_outcome(side, market_result)
