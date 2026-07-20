@@ -215,9 +215,9 @@ class ApiTennisSource(TennisDataSource):
     def sync(self, db: Session, *, full: bool = False) -> SyncResult:
         result = SyncResult(source=self.name)
         if not self.key:
-            msg = "API_TENNIS_KEY not set — skipping live-results sync"
-            log.warning(msg)
-            result.errors.append(msg)
+            # Not an error until the live source is activated (Phase 5.5):
+            # the daily cron must exit 0 on a Sackmann-only sync.
+            log.warning("API_TENNIS_KEY not set — skipping live-results sync")
             return result
 
         frontier = min(self._sackmann_frontier(db, "atp"), self._sackmann_frontier(db, "wta"))
