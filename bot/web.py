@@ -793,16 +793,23 @@ async def players(request: web.Request) -> web.Response:
             plist.sort(key=lambda t: t[1] + t[2], reverse=True)
             heading = f'results for "{q}"'
         else:
-            cutoff = datetime.now(timezone.utc).date() - timedelta(days=45)
-            active = db.execute(
-                select(Player, func.count(Match.id).label("n"))
-                .join(Match, ((Match.winner_id == Player.id)
-                              | (Match.loser_id == Player.id)))
-                .where(Match.match_date >= cutoff, Match.is_duplicate.is_(False))
-                .group_by(Player.id).order_by(func.count(Match.id).desc())
-                .limit(50)).all()
-            plist = [(p, n, None) for p, n in active]
-            heading = "most active, last 45 days"
+            # anchor to the newest data, not the calendar — the historical
+            # source can trail today until the live-results feed activates
+            latest = db.execute(select(func.max(Match.match_date)).where(
+                Match.is_duplicate.is_(False))).scalar()
+            if latest is None:
+                plist, heading = [], "database is empty"
+            else:
+                cutoff = latest - timedelta(days=45)
+                active = db.execute(
+                    select(Player, func.count(Match.id).label("n"))
+                    .join(Match, ((Match.winner_id == Player.id)
+                                  | (Match.loser_id == Player.id)))
+                    .where(Match.match_date >= cutoff, Match.is_duplicate.is_(False))
+                    .group_by(Player.id).order_by(func.count(Match.id).desc())
+                    .limit(50)).all()
+                plist = [(p, n, None) for p, n in active]
+                heading = f"most active through {latest} (newest results in DB)"
     rows = []
     for p, w, l in plist:
         rec = f"{w}-{l}" if l is not None else f"{w} matches"
