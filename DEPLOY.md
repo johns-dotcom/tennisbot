@@ -1,7 +1,15 @@
 # DEPLOY — Railway runbook
 
 The repo deploys from GitHub (`johns-dotcom/tennisbot`, branch `main`) to Railway
-as three pieces sharing one Postgres:
+as three pieces sharing one Postgres.
+
+**Production actuals (2026-07-19):** project `tennisbot` (400a8a62), dashboard at
+https://tennisbot-production-1d98.up.railway.app (WEB_TOKEN gate; token in local
+`.env.railway.notes`). The web service is named `tennisbot` (created via GitHub
+connect) with SERVICE_ROLE=web; `worker` and `ingest` deploy via `railway up`
+until their GitHub sources are attached in the dashboard. Ingest cron:
+`30 9 * * *`. Advisory delivery = dashboard + DB + logs (Discord removed;
+ANTHROPIC_API_KEY unset → template prose by user decision).
 
 | Service | Start command | Purpose |
 |---|---|---|
