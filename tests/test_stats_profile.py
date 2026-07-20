@@ -209,3 +209,28 @@ def test_stat_never_fabricates_on_empty():
     assert d.career.value is None and d.career.method == "omitted"
     assert d.days_since_decider_win is None
     assert d.last_n_results == []
+
+
+def test_conditional_set1_win_rates():
+    from bot.stats.profile import compute_conditional
+
+    # won set 1 in 8, went on to win 7 of those; lost set 1 in 6, won 2,
+    # forced a decider in 5 of the 6
+    hist = ([mk(10 + i, i < 7, sets=((1, True), (2, i < 7)) if i < 7
+             else ((1, True), (2, False), (3, False)),
+             reached_decider=(i >= 7)) for i in range(8)] +
+            [mk(50 + i, i < 2, reached_decider=(i < 5),
+                sets=((1, False), (2, True), (3, i < 2)) if i < 5
+                else ((1, False), (2, False))) for i in range(6)])
+    c = compute_conditional(hist, AS_OF, min_sample=5)
+    assert c.win_given_set1_won.wins == 7 and c.win_given_set1_won.losses == 1
+    assert c.win_given_set1_lost.wins == 2 and c.win_given_set1_lost.losses == 4
+    assert c.decider_given_set1_lost.wins == 5  # forced decider 5 of 6
+
+
+def test_conditional_omits_below_min_sample():
+    from bot.stats.profile import compute_conditional
+
+    hist = [mk(10, True, sets=((1, True), (2, True)))]
+    c = compute_conditional(hist, AS_OF, min_sample=8)
+    assert c.win_given_set1_won.is_omitted

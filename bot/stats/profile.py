@@ -322,6 +322,41 @@ def compute_charting(rows: list[dict]) -> ChartingBlock:
 
 
 @dataclass
+class ConditionalBlock:
+    """Gameflow conditionals — win probability given how set 1 goes. The core
+    of 'if he takes set 1 it's over' / 'don't panic if he drops set 1'."""
+    win_given_set1_won: Stat      # P(win match | won set 1)
+    win_given_set1_lost: Stat     # P(win match | lost set 1)
+    decider_given_set1_lost: Stat  # P(reached a deciding set | lost set 1)
+
+
+def compute_conditional(history: list[MatchRow], as_of: date,
+                        min_sample: int = 8) -> ConditionalBlock:
+    ms = _before(history, as_of)
+    won1 = [m for m in ms if any(n == 1 and w for n, w in m.set_results)]
+    lost1 = [m for m in ms if any(n == 1 and not w for n, w in m.set_results)]
+    cutoff = as_of - timedelta(days=365)
+
+    def winrate(pool, window):
+        w = sum(1 for m in pool if m.won)
+        return rate(w, len(pool) - w, window)
+
+    def decider_rate(pool, window):
+        r = sum(1 for m in pool if m.reached_decider)
+        return rate(r, len(pool) - r, window)
+
+    def best(pool, fn):
+        recent = [m for m in pool if m.match_date >= cutoff]
+        return pick(min_sample, fn(recent, "last365"), fn(pool, "career"))
+
+    return ConditionalBlock(
+        win_given_set1_won=best(won1, winrate),
+        win_given_set1_lost=best(lost1, winrate),
+        decider_given_set1_lost=best(lost1, decider_rate),
+    )
+
+
+@dataclass
 class TrajectoryBlock:
     last60: Stat
     last180: Stat
@@ -421,6 +456,7 @@ class PlayerProfile:
     serve_return: ServeReturnBlock | None = None
     clutch: ClutchBlock | None = None
     set_rates: dict = field(default_factory=dict)
+    conditional: ConditionalBlock | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -531,4 +567,5 @@ def build_profile(db: Session, player_id: int, as_of: date,
         serve_return=compute_serve_return(history, as_of),
         clutch=compute_clutch(history, as_of, deciding.best),
         set_rates=compute_set_rates(history, as_of),
+        conditional=compute_conditional(history, as_of),
     )

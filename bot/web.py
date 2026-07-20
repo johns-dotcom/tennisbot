@@ -1627,6 +1627,24 @@ point data · past year, widened to career if thin</span></div>
 {f'<div class="tw" style="margin-top:12px"><table class="t"><tr><th>level</th><th>record</th></tr>{lv_rows}</table></div>' if lv_rows else ''}
 </section>"""
 
+    cond = prof.conditional
+    cond_html = ""
+    if cond:
+        cells = []
+        for lbl, st in (("win % · won set 1", cond.win_given_set1_won),
+                        ("win % · lost set 1", cond.win_given_set1_lost),
+                        ("forces set 3 · lost set 1", cond.decider_given_set1_lost),
+                        ("tiebreaks", prof.clutch.tiebreak if prof.clutch else None)):
+            if st is not None and not st.is_omitted:
+                cells.append(f'<div class="metric"><div class="k">{lbl}</div>'
+                             f'<div class="v mono">{_rate_cell(st)}</div></div>')
+        if cells:
+            cond_html = f"""<section class="block"><div class="blockhead">
+<h4>Gameflow conditionals</h4><span class="aside">how set 1 shapes the match</span>
+</div><div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+{''.join(cells)}</div></section>"""
+
     ch = charting
     charting_html = ""
     if ch and ch.n_matches:
@@ -1681,6 +1699,7 @@ sequence {dec_seq} ·
 days since last decider win:
 {d.days_since_decider_win if d.days_since_decider_win is not None else "—"}</p>
 </section>
+{cond_html}
 {serve_html}
 {clutch_html}
 {charting_html}
@@ -1769,6 +1788,7 @@ async def match_detail(request: web.Request) -> web.Response:
         score_rows = db.execute(select(MatchScoreLog).where(
             MatchScoreLog.market_ticker.in_([a.ticker, b.ticker]))
             .order_by(MatchScoreLog.ts.desc()).limit(40)).scalars().all()
+        live_row = next((r for r in score_rows if r.detail), None)
 
     def px(m):
         q = quotes.get(m.ticker)
@@ -1814,6 +1834,38 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
     yes_name = (a.raw or {}).get("yes_sub_title", "side A")
     chart_html = price_chart_svg(chart_points, marks, f"{yes_name} to win")
 
+    # live in-match serve stats from the milestone feed (aces, DFs, break pts) —
+    # the '13 aces this match' / '4 double faults' signals. Map competitor1/2
+    # to our YES(pa)/sibling(pb) via the recorded scoreline; skip if ambiguous
+    # (avoid mirror-flipped labels).
+    livestats_html = ""
+    if live_row and live_row.detail:
+        det = live_row.detail
+        s1 = det.get("competitor1_statistics") or {}
+        s2 = det.get("competitor2_statistics") or {}
+        c1s, c2s = det.get("competitor1_overall_score"), det.get("competitor2_overall_score")
+        yes_is_c1 = None
+        if c1s is not None and c2s is not None and c1s != c2s:
+            yes_is_c1 = (live_row.sets_a == c1s)
+        if (s1 or s2) and yes_is_c1 is not None:
+            sa, sb = (s1, s2) if yes_is_c1 else (s2, s1)
+            keys = [("aces", "aces"), ("double_faults", "double faults"),
+                    ("breakpoints_won", "break pts won"),
+                    ("first_serve_points_won", "1st-serve pts won"),
+                    ("games_won", "games won"), ("points_won", "points won")]
+            rows = "".join(
+                f"<tr><td class='sub2'>{lbl}</td>"
+                f"<td class='mono' style='text-align:right'>{esc(sa.get(k, '—'))}</td>"
+                f"<td class='mono' style='text-align:right'>{esc(sb.get(k, '—'))}</td></tr>"
+                for k, lbl in keys if k in sa or k in sb)
+            livestats_html = f"""<section class="block"><div class="blockhead">
+<h4>Live match stats</h4><span class="aside">this match, from the score feed</span>
+</div><div class="rule"></div><div class="tw"><table class="t">
+<tr><th>stat</th><th style="text-align:right">{esc(pa.full_name.split()[-1])}</th>
+<th style="text-align:right">{esc(pb.full_name.split()[-1])}</th></tr>{rows}</table></div>
+<p class="sub2" style="margin-top:6px">Serve dominance (aces) points to tiebreak
+strength; double faults are a live wobble signal.</p></section>"""
+
     # the bot's own game-by-game record
     scorelog_html = ""
     if score_rows:
@@ -1846,6 +1898,7 @@ odds-based estimator.</p></section>"""
 <p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
 {f"(sets {mu.h2h_sets[0]}-{mu.h2h_sets[1]})" if mu.h2h.n else ""}.
 {esc(common)}</p></section>
+{livestats_html}
 {scorelog_html}
 {chart_html}
 {scenario_html}

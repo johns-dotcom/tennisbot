@@ -162,6 +162,27 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
             bits.append(f"{w_name} closes well — {_rate_n(w_rates.get(2))} in set 2s.")
             salience += 0.05
 
+    # 2b. conditional-on-set-1 gameflow ("takes set 1 → over" / "drops it → don't panic")
+    cond = getattr(w_prof, "conditional", None)
+    if cond:
+        g1 = cond.win_given_set1_won
+        if not g1.is_omitted and g1.value is not None and g1.value >= 0.80:
+            bits.append(f"If {w_name} takes set 1, it's usually over: "
+                        f"{g1.wins}-{g1.losses} ({int(round(g1.value * 100))}%) in "
+                        f"matches after winning the opener — expect the price to run.")
+            salience += (g1.value - 0.80) * 0.6
+        dl = cond.decider_given_set1_lost
+        gl = cond.win_given_set1_lost
+        if not dl.is_omitted and dl.value is not None and dl.value >= 0.55:
+            recover = ""
+            if not gl.is_omitted and gl.value is not None:
+                recover = (f", and still wins {int(round(gl.value * 100))}% "
+                           f"of the time from a set down")
+            bits.append(f"Don't panic if {w_name} drops set 1 — they force a {lab} "
+                        f"{int(round(dl.value * 100))}% of the time after losing the "
+                        f"opener{recover}.")
+            salience += 0.1
+
     # 3. decider branch
     dw = do = None
     if da.value is not None and db_.value is not None:
