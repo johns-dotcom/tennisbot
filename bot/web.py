@@ -230,11 +230,14 @@ function bindWatch(){
  var cc=document.getElementById('watch-caret');
  function pc(){if(cc)cc.textContent=w.open?'▾ hide':'▸ show';} pc();
  w.addEventListener('toggle',function(){localStorage.setItem('watch_open',w.open?'1':'0');pc();});}
+function typing(){var a=document.activeElement;
+ return a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName);}
 async function refreshMain(){
+ if(typing()) return;  // don't clobber a field mid-keystroke
  try{var r=await fetch(location.pathname+location.search,{headers:{'X-Fragment':'1'}});
   if(r.ok){var h=await r.text(); var m=document.querySelector('main');
-   if(h && h.length>50 && h!==m.innerHTML){var y=window.scrollY; m.innerHTML=h;
-    window.scrollTo(0,y); bindWatch();}
+   if(!typing() && h && h.length>50 && h!==m.innerHTML){var y=window.scrollY;
+    m.innerHTML=h; window.scrollTo(0,y); bindWatch();}
   }}catch(e){} rel();}
 var seen=null;
 function notify(title, body){
@@ -425,7 +428,7 @@ async def home(request: web.Request) -> web.Response:
 <div class="rule"></div><div class="tw">
 <table class="t"><tr><th>time</th><th>recommendation</th><th>price</th>
 <th>edge</th><th>state</th><th>status</th></tr>
-{''.join(items) or '<tr><td colspan="6" class="empty">No advisories yet — the engine only fires when edge, volume, model confidence and state confidence all clear.</td></tr>'}
+{''.join(items) or f'<tr><td colspan="6" class="empty">No advisories yet — the engine is scanning {s["watched"]} open markets ({s["live"]} live now) and has held fire: nothing cleared edge ≥6% with sufficient model + state confidence. Disciplined silence, not downtime.</td></tr>'}
 </table></div></section>"""
     return respond(request, "Advisories", "home", body)
 
@@ -524,9 +527,10 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                     Scenario.event_ticker.in_(evs))
                     .order_by(Scenario.created_for)).scalars():
                 plans[sc.event_ticker] = sc  # latest generation wins
-        # for the TP variant: match result + whether our side's bid touched 90
+        # match result + whether our side's bid touched 90 — needed for the TP
+        # variant AND the hold-vs-TP comparison shown on both pages
         results, touched = {}, {}
-        if is_tp and bets:
+        if bets:
             tks = [b.market_ticker for b, _ in bets]
             results = dict(db.execute(select(
                 KalshiMarket.ticker, KalshiMarket.result).where(
@@ -540,16 +544,18 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                     {"t": tks, "since": since}).all():
                 touched[r[0]] = (r[1], r[2])
 
-    def eff(b):
-        """(status, pnl_cents) under the active mode."""
-        if not is_tp:
-            return b.status, b.pnl_cents
+    def hold_eff(b):
+        return b.status, b.pnl_cents
+
+    def tp_eff(b):
         yb, nb = touched.get(b.market_ticker, (None, None))
         hit = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
               (b.side == "no" and (nb or 0) >= TP_LIMIT)
         return _tp_effective(b, results.get(b.market_ticker), hit)
 
-    effs = {b.id: eff(b) for b, _ in bets}
+    hold_effs = {b.id: hold_eff(b) for b, _ in bets}
+    tp_effs = {b.id: tp_eff(b) for b, _ in bets}
+    effs = tp_effs if is_tp else hold_effs
     WON = ("won", "took_profit")
     settled = [(b, p) for b, p in bets if effs[b.id][0] in ("won", "lost", "took_profit")]
     open_bets = [(b, p) for b, p in bets if effs[b.id][0] == "open"]
@@ -748,19 +754,74 @@ justify-content:space-between;gap:12px">
 model — most of these will pass without one. ✓ = clears every gate now;
 ◉ = tracked, gate not yet met.</p></details></section>"""
 
+    pregame_watch = sum(1 for _, h in watch_rows)
+    empty_note = (f"No settled bets yet — the policy evaluated {pregame_watch} "
+                  f"upcoming matches in the last 24h and {clears} currently clear "
+                  f"every gate. Disciplined silence: it stays flat until price "
+                  f"meets model, not because nothing is happening.")
+
     def bets_section(label, aside, basis) -> str:
         opens = [x for x in open_bets if x[0].basis == basis]
         setts = [x for x in settled if x[0].basis == basis]
         w = sum(1 for b, _ in setts if effs[b.id][0] in WON)
         rec = f"{w}-{len(setts) - w}" if setts else "0-0"
         rowsel = rows_html(opens) + rows_html(setts)
+        empty = (f'<tr><td colspan="9" class="empty">No {esc(label.lower())} '
+                 f'settled yet. {empty_note if basis == "prematch" else "In-play bets fire only when a live advisory clears the policy mid-match."}</td></tr>')
         return f"""<section class="block"><div class="blockhead">
 <h4>{label}</h4><span class="aside">{esc(aside)} · {rec} settled · {len(opens)} open</span></div>
 <div class="rule"></div><div class="tw">
 <table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
 <th>edge</th><th>tier</th><th>{status_th}</th><th style="text-align:right">P&amp;L</th></tr>
-{rowsel or f'<tr><td colspan="9" class="empty">No {esc(label.lower())} yet — the policy waits for matches that clear every gate.</td></tr>'}
+{rowsel or empty}
 </table></div></section>"""
+
+    # --- Hold vs Take-Profit comparison (same picks, two exits) ---
+    def variant_stats(emap):
+        st = [(b, p) for b, p in bets if emap[b.id][0] in ("won", "lost", "took_profit")]
+        w = sum(1 for b, _ in st if emap[b.id][0] in WON)
+        pc = sum(emap[b.id][1] or 0 for b, _ in st)
+        stk = sum(b.price_cents * (b.units or 1) for b, _ in st)
+        un = sum((emap[b.id][1] or 0) / b.price_cents for b, _ in st if b.price_cents)
+        return len(st), w, pc, un, (pc / stk if stk else None)
+
+    def cum_series(emap):
+        chron = sorted([b for b, _ in bets if b.settled_at
+                        and emap[b.id][0] in ("won", "lost", "took_profit")],
+                       key=lambda b: b.settled_at)
+        cum, series = 0, []
+        for b in chron:
+            cum += (emap[b.id][1] or 0)
+            series.append((b.settled_at, cum / 100))
+        return series
+
+    hn, hw, hpc, hun, hroi = variant_stats(hold_effs)
+    tn, tw, tpc, tun, troi = variant_stats(tp_effs)
+
+    def cmp_cell(v):
+        return v if v else "—"
+    comparison_html = ""
+    if hn or tn:
+        overlay = timeline_svg(cum_series(hold_effs), "$", [],
+                               points2=cum_series(tp_effs),
+                               label="hold to settlement", label2="90¢ take-profit")
+        comparison_html = f"""<section class="block"><div class="blockhead">
+<h4>Hold vs Take-Profit</h4><span class="aside">same picks · two exit rules</span></div>
+<div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
+<div class="metric"><div class="k">hold · record</div><div class="v mono">{hw}-{hn - hw}</div></div>
+<div class="metric"><div class="k">hold · $</div><div class="v mono">{hpc / 100:+.2f}</div></div>
+<div class="metric"><div class="k">hold · units</div><div class="v mono">{hun:+.2f}u</div></div>
+<div class="metric"><div class="k">hold · ROI</div><div class="v mono">{cmp_cell(f'{hroi:+.1%}' if hroi is not None else '')}</div></div>
+<div class="metric"><div class="k">TP · record</div><div class="v mono">{tw}-{tn - tw}</div></div>
+<div class="metric"><div class="k">TP · $</div><div class="v mono">{tpc / 100:+.2f}</div></div>
+<div class="metric"><div class="k">TP · units</div><div class="v mono">{tun:+.2f}u</div></div>
+<div class="metric"><div class="k">TP · ROI</div><div class="v mono">{cmp_cell(f'{troi:+.1%}' if troi is not None else '')}</div></div>
+</div>
+<div style="margin-top:12px">{overlay}</div>
+<p class="sub2" style="margin-top:6px">Does taking profit at 90¢ beat riding to
+settlement? Take-profit gives up 10¢ per winner but salvages leads that
+reverse. This is the answer, on identical picks.</p></section>"""
 
     title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
     active = "testrun"  # TP is a sibling variant under the same nav tab
@@ -782,6 +843,7 @@ ever becomes, a real order. See the {other}.</p>""")
     body = pagehead("Strategy Lab", title,
                     f'{n} settled · <a href="/track">advisory track record →</a>') \
         + strip + exit_note + watching_html + timeline_html + f"""
+{comparison_html}
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
 <span class="aside">where the record comes from — the improvement signal</span></div>
 <div class="rule"></div>{breakdown}</section>
@@ -942,14 +1004,19 @@ def price_chart_svg(points: list[tuple[datetime, float]], marks: list[dict],
 
 
 def timeline_svg(points: list[tuple[datetime, float]], unit: str,
-                 vmarks: list[tuple[datetime, str]] = ()) -> str:
+                 vmarks: list[tuple[datetime, str]] = (),
+                 points2: list[tuple[datetime, float]] | None = None,
+                 label: str = "", label2: str = "") -> str:
     """Cumulative-value line with vertical annotation markers (policy versions).
-    Auto y-domain; zero line emphasized when the range crosses it."""
+    Auto y-domain; zero line emphasized when the range crosses it. An optional
+    second series (points2) overlays in a muted stroke for A/B comparison."""
     if len(points) < 2:
         return ""
     W, H, PL, PR, PT_, PB = 860, 200, 54, 10, 12, 26
-    t0, t1 = points[0][0].timestamp(), points[-1][0].timestamp()
-    vals = [v for _, v in points]
+    allpts = list(points) + list(points2 or [])
+    t0 = min(p[0].timestamp() for p in allpts)
+    t1 = max(p[0].timestamp() for p in allpts)
+    vals = [v for _, v in allpts]
     lo, hi = min(min(vals), 0), max(max(vals), 0)
     if hi == lo:
         hi = lo + 1
@@ -957,7 +1024,12 @@ def timeline_svg(points: list[tuple[datetime, float]], unit: str,
     def x(ts): return PL + (ts - t0) / max(t1 - t0, 1) * (W - PL - PR)
     def y(v): return PT_ + (hi - v) / (hi - lo) * (H - PT_ - PB)
 
-    path = "M" + " L".join(f"{x(p[0].timestamp()):.1f},{y(p[1]):.1f}" for p in points)
+    def draw(pts, color, width):
+        return (f'<path d="M' + " L".join(
+            f"{x(p[0].timestamp()):.1f},{y(p[1]):.1f}" for p in pts) +
+            f'" fill="none" stroke="{color}" stroke-width="{width}" '
+            f'stroke-linejoin="round"/>')
+
     zero = (f'<line x1="{PL}" y1="{y(0):.0f}" x2="{W - PR}" y2="{y(0):.0f}" '
             f'stroke="rgba(243,242,242,.25)" stroke-width="1.5"/>'
             f'<text x="{PL - 8}" y="{y(0) + 4:.0f}" text-anchor="end" font-size="10" '
@@ -971,13 +1043,18 @@ def timeline_svg(points: list[tuple[datetime, float]], unit: str,
         f'<text x="{x(ts.timestamp()) + 4:.0f}" y="{PT_ + 10}" font-size="10" '
         f'fill="var(--warning)">{esc(lbl)}</text></g>'
         for ts, lbl in vmarks)
+    second = draw(points2, "var(--muted)", 2) if points2 and len(points2) >= 2 else ""
+    legend = ""
+    if points2 and label and label2:
+        legend = (f'<div class="sub2" style="display:flex;gap:16px;margin-top:6px">'
+                  f'<span><span style="color:var(--accent)">▬</span> {esc(label)}</span>'
+                  f'<span><span style="color:var(--muted)">▬</span> {esc(label2)}</span></div>')
     return f"""<div class="tw"><svg viewBox="0 0 {W} {H}" role="img"
  aria-label="cumulative {esc(unit)} over time"
  style="width:100%;min-width:640px;display:block">
-{zero}{ymax_lbl}{vlines}
-<path d="{path}" fill="none" stroke="var(--accent)" stroke-width="2"
- stroke-linejoin="round"/>
-</svg></div>"""
+{zero}{ymax_lbl}{vlines}{second}
+{draw(points, "var(--accent)", 2)}
+</svg></div>{legend}"""
 
 
 def histogram_svg(buckets: list[tuple[str, int]], accent_note: str = "") -> str:
