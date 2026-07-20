@@ -137,6 +137,57 @@ def test_fallback_pick_widens():
     assert picked.method == "widened" and picked.window == "career"
 
 
+def _serve(ace, df, svpt, firstin, firstwon, secondwon, svgms, bpsaved, bpfaced):
+    return dict(ace=ace, df=df, svpt=svpt, firstin=firstin, firstwon=firstwon,
+                secondwon=secondwon, svgms=svgms, bpsaved=bpsaved, bpfaced=bpfaced)
+
+
+def test_serve_return_aggregation():
+    from bot.stats.profile import compute_serve_return
+
+    hist = [mk(10 + i, i % 2 == 0,
+               sets=((1, i % 2 == 0), (2, i % 2 == 0))) for i in range(10)]
+    for m in hist:
+        object.__setattr__(m, "serve",
+                           _serve(5, 2, 80, 50, 38, 18, 12, 4, 6))
+        object.__setattr__(m, "opp_serve",
+                           _serve(3, 3, 78, 45, 30, 15, 12, 6, 10))
+    sr = compute_serve_return(hist, AS_OF)
+    assert sr.n_matches == 10
+    assert abs(sr.ace_pct - 5 / 80) < 1e-9
+    assert abs(sr.first_in_pct - 50 / 80) < 1e-9
+    assert abs(sr.first_win_pct - 38 / 50) < 1e-9
+    assert abs(sr.bp_saved_pct - 4 / 6) < 1e-9
+    assert sr.return_pts_win_pct is not None
+
+
+def test_serve_return_omits_without_stats():
+    from bot.stats.profile import compute_serve_return
+
+    hist = [mk(10 + i, True) for i in range(10)]  # no serve dicts
+    sr = compute_serve_return(hist, AS_OF)
+    assert sr.n_matches == 0 and sr.ace_pct is None
+
+
+def test_clutch_tiebreaks_and_rank_quality():
+    from bot.stats.profile import compute_clutch, compute_deciding_sets
+
+    hist = [
+        mk(5, True, opp=1, sets=((1, True), (2, True))),
+        mk(10, False, opp=2, sets=((1, False), (2, False))),
+        mk(15, True, opp=3, sets=((1, True), (2, True))),
+    ]
+    object.__setattr__(hist[0], "tiebreaks", ((1, True),))
+    object.__setattr__(hist[1], "tiebreaks", ((2, False),))
+    object.__setattr__(hist[0], "opp_rank", 12)
+    object.__setattr__(hist[1], "opp_rank", 40)
+    object.__setattr__(hist[2], "opp_rank", 200)
+    c = compute_clutch(hist, AS_OF, compute_deciding_sets(hist, AS_OF).best)
+    assert (c.tiebreak.wins, c.tiebreak.losses) == (1, 1)
+    assert (c.vs_top50.wins, c.vs_top50.losses) == (1, 1)  # ranks 12 and 40
+    assert (c.vs_top20.wins, c.vs_top20.losses) == (1, 0)  # only rank 12
+
+
 def test_set_number_rates():
     from bot.stats.profile import compute_set_rates
 

@@ -33,6 +33,14 @@ class MatchRow:
     round: str | None = None
     # per completed set from this player's perspective: ((set_number, won), ...)
     set_results: tuple = ()
+    # tiebreaks played, player perspective: ((set_number, won), ...)
+    tiebreaks: tuple = ()
+    # serve stats for this player / their opponent (Sackmann matches only):
+    # {ace, df, svpt, firstin, firstwon, secondwon, svgms, bpsaved, bpfaced}
+    serve: dict | None = None
+    opp_serve: dict | None = None
+    opp_rank: int | None = None
+    player_rank: int | None = None
 
 
 PLAYED_OUTCOMES = ("completed", "ret", "def")

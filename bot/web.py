@@ -1273,6 +1273,47 @@ async def player_detail(request: web.Request) -> web.Response:
     dec_seq = " ".join(("<span style='color:var(--good)'>W</span>"
                         if r["won"] else "<span style='color:var(--accent)'>L</span>")
                        for r in d.last_n_results) or "—"
+
+    # deeper analytics: serve/return, clutch, level splits
+    sr = prof.serve_return
+    def pctf(v, digits=0):
+        return f"{v:.{digits}%}" if v is not None else "—"
+    serve_html = ""
+    if sr and sr.n_matches:
+        serve_cells = [
+            ("hold %", pctf(sr.hold_pct)), ("1st in", pctf(sr.first_in_pct)),
+            ("1st win", pctf(sr.first_win_pct)), ("2nd win", pctf(sr.second_win_pct)),
+            ("ace %", pctf(sr.ace_pct, 1)), ("df %", pctf(sr.df_pct, 1)),
+            ("bp saved", pctf(sr.bp_saved_pct)), ("break %", pctf(sr.break_pct)),
+            ("return win", pctf(sr.return_pts_win_pct)),
+        ]
+        cells = "".join(
+            f'<div class="metric"><div class="k">{k}</div>'
+            f'<div class="v mono">{v}</div></div>' for k, v in serve_cells)
+        serve_html = f"""<section class="block"><div class="blockhead">
+<h4>Serve &amp; return</h4><span class="aside">{sr.n_matches} matches with
+point data · past year, widened to career if thin</span></div>
+<div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(90px,1fr))">
+{cells}</div></section>"""
+    c = prof.clutch
+    clutch_html = ""
+    if c:
+        level_names = {"G": "Grand Slam", "M": "Masters", "A": "Tour", "C": "Challenger",
+                       "15": "ITF 15k", "25": "ITF 25k"}
+        lv_rows = "".join(
+            f"<tr><td>{esc(level_names.get(lv, lv))}</td><td class='mono'>{_rate_cell(st)}</td></tr>"
+            for lv, st in c.by_level.items() if st.n >= 3)
+        clutch_html = f"""<section class="block"><div class="blockhead">
+<h4>Clutch &amp; quality of competition</h4></div><div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(4,1fr)">
+<div class="metric"><div class="k">tiebreaks</div><div class="v mono">{_rate_cell(c.tiebreak)}</div></div>
+<div class="metric"><div class="k">deciding sets</div><div class="v mono">{_rate_cell(c.deciding_set)}</div></div>
+<div class="metric"><div class="k">vs top 50</div><div class="v mono">{_rate_cell(c.vs_top50)}</div></div>
+<div class="metric"><div class="k">vs top 20</div><div class="v mono">{_rate_cell(c.vs_top20)}</div></div>
+</div>
+{f'<div class="tw" style="margin-top:12px"><table class="t"><tr><th>level</th><th>record</th></tr>{lv_rows}</table></div>' if lv_rows else ''}
+</section>"""
     m_rows = []
     for m, opp_name, opp_id in recent:
         won = m.winner_id == pid
@@ -1301,6 +1342,8 @@ sequence {dec_seq} ·
 days since last decider win:
 {d.days_since_decider_win if d.days_since_decider_win is not None else "—"}</p>
 </section>
+{serve_html}
+{clutch_html}
 <section class="block"><div class="blockhead"><h4>Surfaces</h4></div>
 <div class="rule"></div><div class="tw"><table class="t">
 <tr><th>surface</th><th>past year</th><th>career</th></tr>

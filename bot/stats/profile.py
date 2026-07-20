@@ -183,6 +183,97 @@ def compute_set_rates(history: list[MatchRow], as_of: date,
 
 
 @dataclass
+class ServeReturnBlock:
+    """Aggregated serve/return rates from matches carrying Sackmann stats.
+    None-valued fields mean insufficient stat coverage (never fabricated)."""
+    n_matches: int
+    ace_pct: float | None            # aces / service points
+    df_pct: float | None             # double faults / service points
+    first_in_pct: float | None       # first serves in / service points
+    first_win_pct: float | None      # first-serve points won / first in
+    second_win_pct: float | None     # second-serve points won / second serves
+    hold_pct: float | None           # 1 - break_points_converted_against
+    bp_saved_pct: float | None       # break points saved / faced
+    return_pts_win_pct: float | None # points won on opponent's serve
+    break_pct: float | None          # opponent service games broken
+
+
+def compute_serve_return(history: list[MatchRow], as_of: date,
+                         days: int = 365, min_matches: int = 8) -> ServeReturnBlock:
+    ms = [m for m in _before(history, as_of) if m.serve]
+    ms = [m for m in ms if m.match_date >= as_of - timedelta(days=days)] or \
+        [m for m in _before(history, as_of) if m.serve]  # widen to career if thin
+    if len(ms) < min_matches:
+        return ServeReturnBlock(len(ms), *([None] * 9))
+
+    def agg(key, over, src="serve"):
+        num = sum((m.serve if src == "serve" else m.opp_serve)[key] for m in ms)
+        den = sum((m.serve if src == "serve" else m.opp_serve)[over] for m in ms)
+        return (num / den) if den else None
+
+    ace = agg("ace", "svpt")
+    df = agg("df", "svpt")
+    first_in = agg("firstin", "svpt")
+    first_win = (sum(m.serve["firstwon"] for m in ms) /
+                 s if (s := sum(m.serve["firstin"] for m in ms)) else None)
+    second_srv = sum(m.serve["svpt"] - m.serve["firstin"] for m in ms)
+    second_win = (sum(m.serve["secondwon"] for m in ms) / second_srv
+                  if second_srv else None)
+    bp_faced = sum(m.serve["bpfaced"] for m in ms)
+    bp_saved = sum(m.serve["bpsaved"] for m in ms)
+    bp_saved_pct = (bp_saved / bp_faced) if bp_faced else None
+    svgms = sum(m.serve["svgms"] for m in ms)
+    # games held ≈ service games minus games where a break point was converted
+    holds = svgms - (bp_faced - bp_saved)  # approx: each faced-and-lost bp = a break
+    hold_pct = (holds / svgms) if svgms else None
+    # return side (opponent serve)
+    opp_svpt = sum(m.opp_serve["svpt"] for m in ms)
+    opp_first_won = sum(m.opp_serve["firstwon"] for m in ms)
+    opp_second_won = sum(m.opp_serve["secondwon"] for m in ms)
+    ret_win = (1 - (opp_first_won + opp_second_won) / opp_svpt) if opp_svpt else None
+    opp_bp_faced = sum(m.opp_serve["bpfaced"] for m in ms)
+    opp_bp_saved = sum(m.opp_serve["bpsaved"] for m in ms)
+    break_pct = ((opp_bp_faced - opp_bp_saved) / sum(m.opp_serve["svgms"] for m in ms)
+                 if sum(m.opp_serve["svgms"] for m in ms) else None)
+    return ServeReturnBlock(
+        len(ms), ace, df, first_in, first_win, second_win, hold_pct,
+        bp_saved_pct, ret_win, break_pct)
+
+
+@dataclass
+class ClutchBlock:
+    tiebreak: Stat            # tiebreak win record
+    deciding_set: Stat        # reuse of decider best
+    vs_top50: Stat            # record vs opponents ranked ≤ 50
+    vs_top20: Stat
+    by_level: dict            # tourney_level -> Stat
+
+
+def compute_clutch(history: list[MatchRow], as_of: date,
+                   decider_best: Stat) -> ClutchBlock:
+    ms = _before(history, as_of)
+    tb_w = tb_l = 0
+    for m in ms:
+        for _n, won in m.tiebreaks:
+            tb_w += won
+            tb_l += not won
+    top50 = [m for m in ms if m.opp_rank and m.opp_rank <= 50]
+    top20 = [m for m in ms if m.opp_rank and m.opp_rank <= 20]
+    levels: dict[str, list] = {}
+    for m in ms:
+        if m.tourney_level:
+            levels.setdefault(m.tourney_level, []).append(m)
+    return ClutchBlock(
+        tiebreak=rate(tb_w, tb_l, "tiebreaks"),
+        deciding_set=decider_best,
+        vs_top50=rate(*_record(top50), window="vs_top50"),
+        vs_top20=rate(*_record(top20), window="vs_top20"),
+        by_level={lv: rate(*_record(mm), window=f"level_{lv}")
+                  for lv, mm in sorted(levels.items())},
+    )
+
+
+@dataclass
 class TrajectoryBlock:
     last60: Stat
     last180: Stat
@@ -279,6 +370,9 @@ class PlayerProfile:
     trajectory: TrajectoryBlock
     surfaces: list[SurfaceBlock] = field(default_factory=list)
     matches_in_db: int = 0
+    serve_return: ServeReturnBlock | None = None
+    clutch: ClutchBlock | None = None
+    set_rates: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -293,7 +387,7 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
     q = (
         select(Match.id, Match.match_date, Match.winner_id, Match.loser_id, Match.surface,
                Match.best_of, Match.outcome, Match.sets_won_winner, Match.sets_won_loser,
-               Match.tourney_level, Match.round)
+               Match.tourney_level, Match.round, Match.stats)
         .where(
             ((Match.winner_id == player_id) | (Match.loser_id == player_id)),
             Match.outcome.in_(PLAYED_OUTCOMES),
@@ -310,22 +404,46 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
     best_of_by_id = {r[0]: (r[5] or 3) for r in rows}
     deciders: dict[int, bool] = {}
     sets_by_match: dict[int, list[tuple[int, bool]]] = {}
+    tbs_by_match: dict[int, list[tuple[int, bool]]] = {}
     for chunk_start in range(0, len(match_ids), 10000):
         chunk = match_ids[chunk_start:chunk_start + 10000]
-        for mid, set_no, won_by_winner in db.execute(
-            select(MatchSet.match_id, MatchSet.set_number, MatchSet.set_won_by_match_winner)
+        for mid, set_no, won_by_winner, tb in db.execute(
+            select(MatchSet.match_id, MatchSet.set_number,
+                   MatchSet.set_won_by_match_winner, MatchSet.tiebreak)
             .where(MatchSet.match_id.in_(chunk), MatchSet.completed.is_(True))
         ):
             sets_by_match.setdefault(mid, []).append((set_no, won_by_winner))
+            if tb:
+                tbs_by_match.setdefault(mid, []).append((set_no, won_by_winner))
             if set_no == best_of_by_id[mid]:
                 deciders[mid] = won_by_winner
 
+    SERVE_KEYS = (("ace", "ace"), ("df", "df"), ("svpt", "svpt"),
+                  ("1stIn", "firstin"), ("1stWon", "firstwon"),
+                  ("2ndWon", "secondwon"), ("SvGms", "svgms"),
+                  ("bpSaved", "bpsaved"), ("bpFaced", "bpfaced"))
+
+    def side_stats(stats: dict | None, prefix: str) -> dict | None:
+        if not stats:
+            return None
+        out = {}
+        for src, dst in SERVE_KEYS:
+            v = stats.get(f"{prefix}_{src}")
+            if v is None:
+                return None  # partial rows are worse than absent ones
+            out[dst] = v
+        return out
+
     history = []
-    for (mid, mdate, wid, lid, surface, best_of, outcome, sww, swl, level, rnd) in rows:
+    for (mid, mdate, wid, lid, surface, best_of, outcome, sww, swl, level, rnd,
+         mstats) in rows:
         won = wid == player_id
         bo = best_of or 3
         dec_won_by_match_winner = deciders.get(mid)
         reached = dec_won_by_match_winner is not None
+        me, opp = ("w", "l") if won else ("l", "w")
+        rank_key, opp_rank_key = (("winner_rank", "loser_rank") if won
+                                  else ("loser_rank", "winner_rank"))
         history.append(MatchRow(
             match_date=mdate, won=won,
             opponent_id=lid if won else wid,
@@ -337,6 +455,12 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
             tourney_level=level, round=rnd,
             set_results=tuple((n, wbw == won) for n, wbw in
                               sorted(sets_by_match.get(mid, ()))),
+            tiebreaks=tuple((n, wbw == won) for n, wbw in
+                            sorted(tbs_by_match.get(mid, ()))),
+            serve=side_stats(mstats, me),
+            opp_serve=side_stats(mstats, opp),
+            opp_rank=(mstats or {}).get(opp_rank_key),
+            player_rank=(mstats or {}).get(rank_key),
         ))
     return history
 
@@ -348,11 +472,15 @@ def build_profile(db: Session, player_id: int, as_of: date,
     player = db.get(Player, player_id)
     history = load_history(db, player_id)
     surfaces_present = sorted({m.surface for m in history if m.surface})
+    deciding = compute_deciding_sets(history, as_of)
     return PlayerProfile(
         player_id=player_id, player_name=player.full_name, as_of=as_of,
         form=compute_form(history, as_of, surface),
-        deciding=compute_deciding_sets(history, as_of),
+        deciding=deciding,
         trajectory=compute_trajectory(history, as_of),
         surfaces=[compute_surface(history, as_of, s) for s in surfaces_present],
         matches_in_db=len([m for m in history if m.match_date < as_of]),
+        serve_return=compute_serve_return(history, as_of),
+        clutch=compute_clutch(history, as_of, deciding.best),
+        set_rates=compute_set_rates(history, as_of),
     )
