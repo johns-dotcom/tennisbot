@@ -83,6 +83,7 @@ class AdvisoryEngine:
                 "player_a_id": row.player_a_id, "player_b_id": sib.player_a_id,
                 "name_a": pa.full_name, "name_b": pb.full_name,
                 "best_of": int(raw.get("_best_of", 3)),
+                "event_ticker": row.event_ticker,
                 "tier": {"KXATPMATCH": "A", "KXWTAMATCH": "A", "KXWTAGAME": "A",
                          "KXATPCHALLENGERMATCH": "C"}.get(series, "15"),
             }
@@ -246,10 +247,41 @@ class AdvisoryEngine:
                                if pushed else None))
         self.last_advised[ticker] = (est.state_key, band if band is not None
                                      else edge_band(block.edge))
+        self._paper_from_advisory(ticker, ctx, block)
         log.info("ADVISORY SENT", ticker=ticker, player=block.recommended_name,
                  price=block.executable_price_cents, edge=round(block.edge, 3),
                  state=block.state_key, confirmed=confirmed,
                  probation=block.probation and not confirmed, pushed=pushed)
+
+    def _paper_from_advisory(self, ticker: str, ctx: dict, block) -> None:
+        """Bot testrun: an advisory that also clears the paper policy becomes
+        an imaginary bet (basis 'advisory'). Never an order — CLAUDE.md rule 1."""
+        from bot.paper import (
+            PAPER_MAX_PRICE,
+            PAPER_MIN_EDGE,
+            PAPER_MIN_PRICE,
+            PAPER_MIN_PROB,
+            BetDecision,
+            place_bet,
+        )
+
+        prob, price = block.model_prob, block.executable_price_cents
+        edge = block.edge
+        if not (prob >= PAPER_MIN_PROB and edge >= PAPER_MIN_EDGE
+                and PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE
+                and ctx.get("event_ticker")):
+            return
+        decision = BetDecision(True, side=block.recommended_side, prob=prob,
+                               edge=edge, price_cents=price,
+                               reason="advisory cleared paper policy")
+        with self.db_session() as db:
+            place_bet(db, event_ticker=ctx["event_ticker"], market_ticker=ticker,
+                      player_id=ctx["player_a_id"] if block.recommended_side == "yes"
+                      else ctx["player_b_id"],
+                      decision=decision, confidence=block.model_confidence,
+                      basis="advisory", tier=ctx["tier"], state=block.state_key,
+                      reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
+                                 "state_confirmed": block.state_confirmed})
 
     def _kill(self, advisory_id: int, reason: str) -> None:
         with self.db_session() as db:

@@ -336,6 +336,67 @@ class WatchService:
         suffix = ticker.rsplit("-", 1)[-1].upper()
         return bool(first_surname) and first_surname.upper().startswith(suffix[:3])
 
+    # ---------- paper betting (bot testrun) ----------
+
+    async def paper_loop(self) -> None:
+        """Every 5 min: evaluate matches starting within the next 40 min and
+        selectively place imaginary one-contract bets (bot testrun). Most
+        matches get none — the policy in bot/paper.py decides."""
+        from bot.paper import decide_bet, place_bet
+        from bot.prob.model import MatchState
+
+        while not self.stop.is_set():
+            if self.advisory_hook is None or not self.watched:
+                await asyncio.sleep(10)
+                continue
+            now = utcnow()
+            candidates: dict[str, dict] = {}
+            for ticker, info in self.watched.items():
+                occ_raw = info.get("occurrence") or ""
+                try:
+                    start = datetime.fromisoformat(occ_raw.replace("Z", "+00:00"))
+                except ValueError:
+                    continue
+                if now <= start <= now + timedelta(minutes=40):
+                    candidates.setdefault(info["event_ticker"], info)
+            for event_ticker, info in candidates.items():
+                if self.stop.is_set():
+                    break
+                try:
+                    ctx = self.advisory_hook._context(
+                        next(t for t, i in self.watched.items()
+                             if i["event_ticker"] == event_ticker))
+                except StopIteration:
+                    continue
+                if ctx is None:
+                    continue
+                ticker = next(t for t, i in self.watched.items()
+                              if i["event_ticker"] == event_ticker)
+                try:
+                    m = await asyncio.to_thread(self.client.market, ticker)
+                except Exception:
+                    continue
+                yb = dollars_to_cents(m.get("yes_bid_dollars"))
+                ya = dollars_to_cents(m.get("yes_ask_dollars"))
+                pred = self.advisory_hook.model.predict(
+                    ctx["player_a_id"], ctx["player_b_id"], None, ctx["tier"],
+                    MatchState(0, 0, ctx["best_of"]))
+                decision = decide_bet(pred.p_a, pred.confidence, ya, yb)
+                if not decision.place:
+                    continue
+                with db_session() as db:
+                    place_bet(db, event_ticker=event_ticker, market_ticker=ticker,
+                              player_id=ctx["player_a_id"] if decision.side == "yes"
+                              else ctx["player_b_id"],
+                              decision=decision, confidence=pred.confidence,
+                              basis="prematch", tier=ctx["tier"],
+                              reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
+                                         "prematch_prob": round(pred.p_a, 3)})
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                pass
+
     # ---------- settlement resolution (track record) ----------
 
     async def settlement_loop(self) -> None:
@@ -398,6 +459,10 @@ class WatchService:
                                 row.raw = raw
                     log.info("market settled", ticker=ticker, result=result,
                              final_sets=final_sets)
+                from bot.paper import settle_open_bets
+
+                with db_session() as db:
+                    settle_open_bets(db)
             except Exception as e:
                 log.error("settlement loop error", error=str(e))
             try:
@@ -466,7 +531,8 @@ class WatchService:
         tasks = [asyncio.create_task(supervised(fn, name)) for fn, name in (
             (self.discovery_loop, "discovery"), (self.ws_loop, "websocket"),
             (self.rest_fallback_loop, "rest_fallback"), (self.score_loop, "score"),
-            (self.settlement_loop, "settlement"), (self.health_server, "health"))]
+            (self.settlement_loop, "settlement"), (self.paper_loop, "paper"),
+            (self.health_server, "health"))]
 
         async def shutdown_watchdog():
             await self.stop.wait()

@@ -266,6 +266,33 @@ class Scenario(Base):
     )
 
 
+class PaperBet(Base):
+    """Bot testrun: imaginary one-contract bets the bot places for itself.
+
+    NOT trading — no order ever exists. This is the strategy lab: selective
+    self-picks whose record (target: ≥70% after month 1) drives tuning of the
+    decision policy. One bet per event, ever."""
+
+    __tablename__ = "paper_bets"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    event_ticker: Mapped[str] = mapped_column(String(96), unique=True)
+    market_ticker: Mapped[str] = mapped_column(String(96))
+    player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"))
+    side: Mapped[str] = mapped_column(String(4))  # 'yes' | 'no' (vs market_ticker)
+    price_cents: Mapped[int] = mapped_column(Integer)  # executable ask at placement
+    model_prob: Mapped[float] = mapped_column(Float)
+    model_confidence: Mapped[float] = mapped_column(Float)
+    edge: Mapped[float] = mapped_column(Float)
+    basis: Mapped[str] = mapped_column(String(16))  # 'prematch' | 'advisory'
+    tier: Mapped[str | None] = mapped_column(String(8))
+    state_at_placement: Mapped[str | None] = mapped_column(String(16))
+    reasoning: Mapped[dict | None] = mapped_column(JSONB)  # snapshot for tuning
+    status: Mapped[str] = mapped_column(String(8), default="open")  # open/won/lost/void
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    pnl_cents: Mapped[int | None] = mapped_column(Integer)
+
+
 class IngestState(Base):
     """Key-value watermarks for incremental ingest (repo commit SHAs, sync dates)."""
 

@@ -189,6 +189,7 @@ def page(title: str, active: str, body: str) -> str:
         f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
         for href, key, label in (("/", "home", "Advisories"),
                                  ("/scenarios", "scenarios", "Scenarios"),
+                                 ("/testrun", "testrun", "Bot Testrun"),
                                  ("/track", "track", "Track record"),
                                  ("/live", "live", "Live"),
                                  ("/report", "report", "Estimator"),
@@ -350,6 +351,94 @@ engine still applies every gate before any advisory fires.</p>
     '<div class="card"><div class="empty">No scenarios yet — they generate with the daily ingest run.</div></div>'}
 </div>"""
     return web.Response(text=page("Scenarios", "scenarios", body),
+                        content_type="text/html")
+
+
+async def testrun(request: web.Request) -> web.Response:
+    from bot.models import PaperBet
+    from bot.paper import PAPER_MIN_EDGE, PAPER_MIN_PROB
+
+    with db_session() as db:
+        bets = db.execute(
+            select(PaperBet, Player.full_name)
+            .join(Player, Player.id == PaperBet.player_id, isouter=True)
+            .order_by(PaperBet.created_at.desc()).limit(300)
+        ).all()
+
+    settled = [(b, p) for b, p in bets if b.status in ("won", "lost")]
+    open_bets = [(b, p) for b, p in bets if b.status == "open"]
+    wins = sum(1 for b, _ in settled if b.status == "won")
+    n = len(settled)
+    win_rate = wins / n if n else None
+    pnl = sum(b.pnl_cents or 0 for b, _ in settled)
+    staked = sum(b.price_cents for b, _ in settled)
+    first = min((b.created_at for b, _ in bets), default=None)
+    days = (datetime.now(timezone.utc) - first).days if first else 0
+
+    def bucket(pred) -> str:
+        s = [b for b, _ in settled if pred(b)]
+        w = sum(1 for b in s if b.status == "won")
+        return f"{w}-{len(s) - w}" if s else "0-0"
+
+    target_txt = f"{win_rate:.0%}" if win_rate is not None else "—"
+    target_color = "var(--good)" if (win_rate or 0) >= 0.70 else \
+        ("var(--warning)" if (win_rate or 0) >= 0.60 else "var(--text)")
+    strip = statstrip([
+        ("Record", f"{wins}-{n - wins}" if n else "0-0", f"{len(open_bets)} open"),
+        ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
+         "target 70% by month 1"),
+        ("Days running", str(days), f"since {first.date()}" if first else "no bets yet"),
+        ("Flat-stake P&L", f"{pnl:+d}¢" if n else "—", "1 contract per bet"),
+        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", ""),
+        ("Policy", f"≥{PAPER_MIN_PROB:.0%} prob",
+         f"+ ≥{PAPER_MIN_EDGE * 100:.0f}% edge · selective"),
+    ])
+    breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
+<div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
+<div class="metric"><div class="k">advisory basis</div><div class="v mono">{bucket(lambda b: b.basis == 'advisory')}</div></div>
+<div class="metric"><div class="k">tour (A)</div><div class="v mono">{bucket(lambda b: b.tier == 'A')}</div></div>
+<div class="metric"><div class="k">challenger</div><div class="v mono">{bucket(lambda b: b.tier == 'C')}</div></div>
+<div class="metric"><div class="k">ITF</div><div class="v mono">{bucket(lambda b: b.tier == '15')}</div></div>
+<div class="metric"><div class="k">prob ≥ 80%</div><div class="v mono">{bucket(lambda b: b.model_prob >= 0.8)}</div></div>
+</div>"""
+
+    def rows_html(pairs) -> str:
+        out = []
+        for b, player in pairs:
+            oc = {"won": tag("good", "✓", "won"), "lost": tag("accent", "✕", "lost"),
+                  "void": tag("neutral", "·", "void"),
+                  "open": tag("warn", "…", "open")}[b.status]
+            pnl_txt = f"{b.pnl_cents:+d}¢" if b.pnl_cents is not None else "—"
+            match = (b.reasoning or {}).get("match", b.event_ticker)
+            out.append(f"""<tr>
+<td class="mono sub2">{pt(b.created_at)}</td>
+<td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span></td>
+<td class="mono">{b.price_cents}¢</td>
+<td class="mono">{b.model_prob:.0%}</td>
+<td class="mono">+{b.edge * 100:.1f}%</td>
+<td>{tag('neutral', '·', b.basis)} {tag('neutral', '·', b.tier or '?')}</td>
+<td>{oc}</td>
+<td class="mono" style="text-align:right;font-weight:800">{pnl_txt}</td></tr>""")
+        return "".join(out)
+
+    body = pagehead("Strategy Lab", "Bot Testrun",
+                    f"{n} settled · policy iterates until 70%") + strip + f"""
+<p class="prose" style="margin:0 0 18px">The bot places <strong>imaginary</strong>
+one-contract bets for itself — selectively; most matches get no bet. Settled
+results are the tuning data: the policy (probability floor, edge floor,
+confidence gate) iterates until the record holds above 70%. Nothing here is,
+or ever becomes, a real order.</p>
+<section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
+<span class="aside">where the record comes from — the improvement signal</span></div>
+<div class="rule"></div>{breakdown}</section>
+<section class="block"><div class="blockhead"><h4>Bets</h4></div>
+<div class="rule"></div><div class="tw">
+<table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>model</th>
+<th>edge</th><th>basis</th><th>status</th><th style="text-align:right">P&amp;L</th></tr>
+{rows_html(open_bets) + rows_html(settled) or
+ '<tr><td colspan="8" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
+</table></div></section>"""
+    return web.Response(text=page("Bot Testrun", "testrun", body),
                         content_type="text/html")
 
 
@@ -655,6 +744,7 @@ def make_app() -> web.Application:
     app = web.Application(middlewares=[token_guard])
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
+    app.router.add_get("/testrun", testrun)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/report", report)
