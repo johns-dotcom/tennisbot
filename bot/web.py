@@ -1220,6 +1220,9 @@ async def player_detail(request: web.Request) -> web.Response:
     from bot.models import Match
     from bot.stats.profile import build_profile, compute_set_rates, load_history
 
+    from bot.models import ChartingStat
+    from bot.stats.profile import compute_charting
+
     pid = int(request.match_info["pid"])
     as_of = datetime.now(timezone.utc).date() + timedelta(days=1)
     with db_session() as db:
@@ -1229,6 +1232,13 @@ async def player_detail(request: web.Request) -> web.Response:
         history = load_history(db, pid)
         prof = build_profile(db, pid, as_of)
         set_rates = compute_set_rates(history, as_of)
+        ch_cols = ("winners", "winners_fh", "winners_bh", "unforced",
+                   "unforced_fh", "unforced_bh", "serve_pts", "aces", "first_in",
+                   "first_won", "second_in", "second_won", "return_pts",
+                   "return_pts_won")
+        ch_rows = [{c: getattr(r, c) for c in ch_cols} for r in db.execute(
+            select(ChartingStat).where(ChartingStat.player_id == pid)).scalars()]
+        charting = compute_charting(ch_rows)
         opp = Player.__table__.alias()
         recent = db.execute(
             select(Match, Player.full_name, Player.id)
@@ -1314,6 +1324,33 @@ point data · past year, widened to career if thin</span></div>
 </div>
 {f'<div class="tw" style="margin-top:12px"><table class="t"><tr><th>level</th><th>record</th></tr>{lv_rows}</table></div>' if lv_rows else ''}
 </section>"""
+
+    ch = charting
+    charting_html = ""
+    if ch and ch.n_matches:
+        ch_cells = [
+            ("winners/match", f"{ch.winners_per_match:.1f}" if ch.winners_per_match else "—"),
+            ("UFE/match", f"{ch.unforced_per_match:.1f}" if ch.unforced_per_match else "—"),
+            ("W:UFE ratio", f"{ch.winner_ufe_ratio:.2f}" if ch.winner_ufe_ratio else "—"),
+            ("FH winners", pctf(ch.fh_winner_share)),
+            ("BH winners", pctf(ch.bh_winner_share)),
+            ("FH of UFE", pctf(ch.fh_ufe_share)),
+            ("ace rate", pctf(ch.ace_rate, 1)),
+            ("1st-serve win", pctf(ch.first_serve_win)),
+            ("2nd-serve win", pctf(ch.second_serve_win)),
+            ("return win", pctf(ch.return_win)),
+        ]
+        cells = "".join(
+            f'<div class="metric"><div class="k">{k}</div>'
+            f'<div class="v mono">{v}</div></div>' for k, v in ch_cells)
+        charting_html = f"""<section class="block"><div class="blockhead">
+<h4>Shot-level (Match Charting Project)</h4>
+<span class="aside">{ch.n_matches} hand-charted matches · winners, errors and
+wing splits no feed sells</span></div><div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(96px,1fr))">
+{cells}</div>
+<p class="sub2" style="margin-top:8px">Data © Tennis Abstract Match Charting
+Project (CC BY-NC-SA 4.0).</p></section>"""
     m_rows = []
     for m, opp_name, opp_id in recent:
         won = m.winner_id == pid
@@ -1344,6 +1381,7 @@ days since last decider win:
 </section>
 {serve_html}
 {clutch_html}
+{charting_html}
 <section class="block"><div class="blockhead"><h4>Surfaces</h4></div>
 <div class="rule"></div><div class="tw"><table class="t">
 <tr><th>surface</th><th>past year</th><th>career</th></tr>

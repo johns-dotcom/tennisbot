@@ -56,6 +56,13 @@ def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False,
         db.commit()
     except Exception as e:
         log.error("kalshi results sync failed", error=str(e))
+    try:
+        from bot.sources.charting import ChartingSource
+
+        results.append(ChartingSource().sync(db, full=full))
+        db.commit()
+    except Exception as e:
+        log.error("charting sync failed", error=str(e))
     if not skip_live:
         results.append(ApiTennisSource().sync(db, full=full))
         db.commit()

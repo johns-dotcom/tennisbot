@@ -294,6 +294,48 @@ class PaperBet(Base):
     pnl_cents: Mapped[int | None] = mapped_column(Integer)
 
 
+class ChartingStat(Base):
+    """One player's aggregate line from a Match Charting Project match
+    (Overview 'Total' row). Shot-level detail — winners, unforced errors,
+    FH/BH splits — that no commercial feed exposes. Separate from the results
+    tables: this is hand-charted depth over ~5000 matches, not full coverage.
+
+    Data © Tennis Abstract Match Charting Project (CC BY-NC-SA 4.0):
+    attribution required, non-commercial, personal research only.
+    """
+
+    __tablename__ = "charting_stats"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    match_id: Mapped[str] = mapped_column(String(160))  # MCP match_id
+    tour: Mapped[str] = mapped_column(String(8))  # 'atp' | 'wta'
+    player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"))
+    player_name: Mapped[str] = mapped_column(String(160))
+    match_date: Mapped[date | None] = mapped_column(Date)
+    tournament: Mapped[str | None] = mapped_column(String(128))
+    surface: Mapped[str | None] = mapped_column(String(16))
+    serve_pts: Mapped[int | None] = mapped_column(Integer)
+    aces: Mapped[int | None] = mapped_column(Integer)
+    dfs: Mapped[int | None] = mapped_column(Integer)
+    first_in: Mapped[int | None] = mapped_column(Integer)
+    first_won: Mapped[int | None] = mapped_column(Integer)
+    second_in: Mapped[int | None] = mapped_column(Integer)
+    second_won: Mapped[int | None] = mapped_column(Integer)
+    bk_pts: Mapped[int | None] = mapped_column(Integer)  # break points faced
+    bp_saved: Mapped[int | None] = mapped_column(Integer)
+    return_pts: Mapped[int | None] = mapped_column(Integer)
+    return_pts_won: Mapped[int | None] = mapped_column(Integer)
+    winners: Mapped[int | None] = mapped_column(Integer)
+    winners_fh: Mapped[int | None] = mapped_column(Integer)
+    winners_bh: Mapped[int | None] = mapped_column(Integer)
+    unforced: Mapped[int | None] = mapped_column(Integer)
+    unforced_fh: Mapped[int | None] = mapped_column(Integer)
+    unforced_bh: Mapped[int | None] = mapped_column(Integer)
+    __table_args__ = (
+        UniqueConstraint("match_id", "player_name", name="uq_charting_match_player"),
+        Index("ix_charting_player", "player_id"),
+    )
+
+
 class IngestState(Base):
     """Key-value watermarks for incremental ingest (repo commit SHAs, sync dates)."""
 

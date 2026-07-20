@@ -274,6 +274,54 @@ def compute_clutch(history: list[MatchRow], as_of: date,
 
 
 @dataclass
+class ChartingBlock:
+    """Shot-level aggregates from the Match Charting Project. None when the
+    player has no charted matches (coverage is ~5000 matches, not universal)."""
+    n_matches: int
+    winners_per_match: float | None
+    unforced_per_match: float | None
+    winner_ufe_ratio: float | None      # aggression efficiency
+    fh_winner_share: float | None       # forehand share of winners
+    bh_winner_share: float | None
+    fh_ufe_share: float | None          # which wing leaks errors
+    ace_rate: float | None              # aces / serve points
+    first_serve_win: float | None
+    second_serve_win: float | None
+    return_win: float | None
+
+
+def compute_charting(rows: list[dict]) -> ChartingBlock:
+    """rows: charting_stats dicts for one player (each a match 'Total' line)."""
+    if not rows:
+        return ChartingBlock(0, *([None] * 10))
+
+    def total(k):
+        return sum(r[k] for r in rows if r.get(k) is not None)
+
+    n = len(rows)
+    w, ufe = total("winners"), total("unforced")
+    wfh, wbh = total("winners_fh"), total("winners_bh")
+    ufh, ubh = total("unforced_fh"), total("unforced_bh")
+    svpt, aces = total("serve_pts"), total("aces")
+    first_in, first_won = total("first_in"), total("first_won")
+    second_in, second_won = total("second_in"), total("second_won")
+    ret, ret_won = total("return_pts"), total("return_pts_won")
+    return ChartingBlock(
+        n_matches=n,
+        winners_per_match=w / n if n else None,
+        unforced_per_match=ufe / n if n else None,
+        winner_ufe_ratio=(w / ufe) if ufe else None,
+        fh_winner_share=(wfh / w) if w else None,
+        bh_winner_share=(wbh / w) if w else None,
+        fh_ufe_share=(ufh / ufe) if ufe else None,
+        ace_rate=(aces / svpt) if svpt else None,
+        first_serve_win=(first_won / first_in) if first_in else None,
+        second_serve_win=(second_won / second_in) if second_in else None,
+        return_win=(ret_won / ret) if ret else None,
+    )
+
+
+@dataclass
 class TrajectoryBlock:
     last60: Stat
     last180: Stat
