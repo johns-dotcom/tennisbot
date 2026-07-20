@@ -99,14 +99,21 @@ Brier 0.2035, log loss 0.5914, calibration gaps ≤ ±0.015 across all buckets
 (after PLATT_A=1.65 pre-match sharpening fitted on 2023-24, n=120k, held out from
 eval). Isolation enforced by 4 structural AST tests (tests/test_isolation.py).
 
-### Phase 3.5 — Market recorder + state estimator
+### Phase 3.5 — Market recorder + state estimator  [DONE 2026-07-19]
 Recorder FIRST (all ticks/trades/score updates → market_ticks with session_id);
 `replay <session>`; rule-based estimator (sets-won state space only; volume-confirmed
 discontinuity detector, asymmetric fav/dog signatures; set-duration transition priors;
 snap-to-score reconciliation → state_inference_log; persist to live_match_state after
 every transition — no memory-only state).
-**DONE when:** estimator replays a recorded session; `inference-report` runs
-(hit rate, avg lead time, false-boundary rate).
+**DONE check passed:** synthetic Bo3 session recorded via MarketRecorder, replayed
+via `python -m bot replay` → 3/3 boundaries inferred ahead of delayed score
+(avg lead 116s, 0 false boundaries); `inference-report` renders hit rate / lead /
+false-boundary rate with clean-vs-gap split. 14 estimator unit tests cover noise
+rejection (quote-only, degraded, too-early), asymmetric thresholds, conflict
+kill+snap, missed-boundary logging, quarantine, restore. `graduate` also
+implemented (reports thresholds; never flips the flag). Known v1 limits: anchor
+from first trade (pre-match trading weakens set-1 gate), minutes/sets duration
+approximation.
 
 ### Phase 4 — Kalshi integration (READ ONLY)
 Fetch docs.kalshi.com first; RSA env-var auth verified with one GET; scheduled market
@@ -163,4 +170,4 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
   written, untested against live API). Then Phase 1 DONE check fully passes.
 - Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
 - Phase 3 (probability engine) DONE 2026-07-19.
-- Phase 3.5 (market recorder + state estimator) IN PROGRESS.
+- Phase 3.5 DONE 2026-07-19. Phase 4 (Kalshi read-only integration) next.

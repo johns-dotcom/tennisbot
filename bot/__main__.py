@@ -74,8 +74,32 @@ def main() -> int:
         print(report.render())
         return 0
 
-    phase = {"replay": 3.5, "inference-report": 3.5,
-             "watch": 4, "graduate": 5}.get(args.cmd)
+    if args.cmd == "replay":
+        from bot.db import session
+        from bot.market.replay import replay_session
+
+        with session() as db:
+            print(replay_session(db, args.session_id).render())
+        return 0
+
+    if args.cmd == "inference-report":
+        from bot.db import session
+        from bot.reports import inference_report
+
+        with session() as db:
+            print(inference_report(db))
+        return 0
+
+    if args.cmd == "graduate":
+        from bot.db import session
+        from bot.reports import graduate_report
+
+        with session() as db:
+            text, ok = graduate_report(db)
+        print(text)
+        return 0 if ok else 1
+
+    phase = {"watch": 4}.get(args.cmd)
     print(f"'{args.cmd}' is implemented in Phase {phase} — not built yet.", file=sys.stderr)
     return 2
 
