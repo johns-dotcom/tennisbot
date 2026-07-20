@@ -158,6 +158,30 @@ def compute_deciding_sets(history: list[MatchRow], as_of: date, last_n: int = 7)
     )
 
 
+def compute_set_rates(history: list[MatchRow], as_of: date,
+                      min_sample: int = 8) -> dict[int, Stat]:
+    """Win rate in set N specifically (set 1, set 2, set 3…), the backbone of
+    gameflow analysis: 'set 1 is her strongest set at 68%'.
+
+    last-365d window first, widened to career below min_sample, else omitted.
+    """
+    ms = _before(history, as_of)
+    cutoff = as_of - timedelta(days=365)
+    career: dict[int, list[int]] = {}
+    recent: dict[int, list[int]] = {}
+    for m in ms:
+        for set_no, won in m.set_results:
+            career.setdefault(set_no, [0, 0])[0 if won else 1] += 1
+            if m.match_date >= cutoff:
+                recent.setdefault(set_no, [0, 0])[0 if won else 1] += 1
+    out: dict[int, Stat] = {}
+    for n in sorted(career):
+        r365 = rate(*recent.get(n, [0, 0]), window=f"set{n}_last365")
+        rcar = rate(*career[n], window=f"set{n}_career")
+        out[n] = pick(min_sample, r365, rcar)
+    return out
+
+
 @dataclass
 class TrajectoryBlock:
     last60: Stat
@@ -281,16 +305,18 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
     if not rows:
         return []
 
-    # decider outcomes in one query: the completed set numbered best_of
+    # all completed sets in one query: decider outcome + per-set-number results
     match_ids = [r[0] for r in rows]
     best_of_by_id = {r[0]: (r[5] or 3) for r in rows}
     deciders: dict[int, bool] = {}
+    sets_by_match: dict[int, list[tuple[int, bool]]] = {}
     for chunk_start in range(0, len(match_ids), 10000):
         chunk = match_ids[chunk_start:chunk_start + 10000]
         for mid, set_no, won_by_winner in db.execute(
             select(MatchSet.match_id, MatchSet.set_number, MatchSet.set_won_by_match_winner)
             .where(MatchSet.match_id.in_(chunk), MatchSet.completed.is_(True))
         ):
+            sets_by_match.setdefault(mid, []).append((set_no, won_by_winner))
             if set_no == best_of_by_id[mid]:
                 deciders[mid] = won_by_winner
 
@@ -309,6 +335,8 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
             reached_decider=reached,
             won_decider=(dec_won_by_match_winner == won) if reached else None,
             tourney_level=level, round=rnd,
+            set_results=tuple((n, wbw == won) for n, wbw in
+                              sorted(sets_by_match.get(mid, ()))),
         ))
     return history
 

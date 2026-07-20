@@ -1,57 +1,93 @@
 from datetime import datetime, timezone
 
-from bot.scenarios import build_candidates_for_match
+from bot.scenarios import build_gameflow
+from bot.stats.profile import compute_set_rates
 from tests.test_advisory import _profiles
+from tests.test_stats_profile import AS_OF
 
 START = datetime(2026, 7, 21, 15, 0, tzinfo=timezone.utc)
 
 
-def build(p_a=0.55):
-    a, b, _, _ = _profiles()  # A strong in deciders; B all-skunk wins, decider-poor
-    return build_candidates_for_match(
+def build(p_a=0.62, fatigue_b=None, model_confidence=0.8):
+    a, b, hist_a, hist_b = _profiles()  # A strong in deciders; B decider-poor
+    return build_gameflow(
         ticker_a="EV-ADA", ticker_b="EV-ZEL", event_ticker="EV",
         name_a="Julia Adams", name_b="Petra Zelnickova", id_a=1, id_b=2,
-        prof_a=a, prof_b=b, p_a=p_a, best_of=3, start=START,
-        event_label="Adams vs Zelnickova")
+        prof_a=a, prof_b=b, hist_a=hist_a, hist_b=hist_b,
+        set_rates_a=compute_set_rates(hist_a, AS_OF, min_sample=5),
+        set_rates_b=compute_set_rates(hist_b, AS_OF, min_sample=5),
+        p_a=p_a, best_of=3, start=START, as_of=AS_OF,
+        model_confidence=model_confidence,
+        fatigue_b=fatigue_b, event_label="Adams vs Zelnickova")
 
 
-def test_decider_edge_generated_for_divergent_records():
-    cands = build()
-    dec = [c for c in cands if c.kind == "decider_edge"]
-    assert len(dec) == 1
-    c = dec[0]
-    assert c.market_ticker == "EV-ADA"  # Adams is the better decider side
-    assert c.state_key == "1-1"
-    assert c.p_at_state > 0.5  # conditional prob favors her once there
-    assert "set 3" in c.narrative
-    assert "straight" in c.narrative  # B's losing decider streak cited
+def test_gameflow_picks_the_stronger_side():
+    c = build()
+    assert c is not None
+    assert c.kind == "gameflow"
+    assert c.market_ticker == "EV-ADA"  # Adams: model + decider edge
+    assert c.state_key == "plan"
 
 
-def test_resilient_favorite_needs_strong_prematch():
-    weak = [c for c in build(p_a=0.55) if c.kind == "resilient_favorite"]
-    assert not weak
-    strong = [c for c in build(p_a=0.72) if c.kind == "resilient_favorite"]
-    assert len(strong) == 1
-    c = strong[0]
-    assert c.market_ticker == "EV-ADA"
-    assert c.state_key == "0-1"
-    assert 0.40 <= c.p_at_state < c.p_prematch
+def test_gameflow_sequenced_structure():
+    c = build()
+    n = c.narrative
+    assert "is the play" in n                       # entry thesis
+    assert "If it reaches set 3" in n               # decider branch
+    assert "straight set 3s" in n                   # opponent decider streak
+    assert "drops set 1" in n and "stay away" in n  # risk rule
+    assert "%" in n                                 # stat-dense
 
 
-def test_narrative_numbers_come_from_facts():
+def test_gameflow_fatigue_cited():
+    c = build(fatigue_b={"played": True, "went_distance": True})
+    assert "played yesterday and went the distance" in c.narrative
+    no_fat = build()
+    assert "played yesterday" not in no_fat.narrative
+
+
+def test_gameflow_facts_payload_complete():
+    c = build()
+    f = c.facts
+    assert f["match"] == "Julia Adams vs Petra Zelnickova"
+    assert 1 in f["set_rates_watch"] or "1" in f["set_rates_watch"]
+    assert f["decider_watch"] is not None
+    assert isinstance(f["support"], list)
+
+
+def test_gameflow_decider_prob_consistent():
+    c = build()
+    # watch side is the better decider player: conditional prob should beat 50%
+    assert c.p_at_state > 0.5
+    assert 0 < c.p_prematch < 1
+
+
+def test_gameflow_cites_samples_and_confidence():
+    c = build(model_confidence=0.8)
+    n = c.narrative
     import re
+    # every set rate cited with its W-L sample and window
+    assert re.search(r"\d+% \(\d+-\d+, (past year|career)\)", n), n
+    assert "(past year)" in n or "(career)" in n  # decider records windowed
+    assert "model confidence 80%" in n
+    assert c.facts["model_confidence"] == 0.8
 
-    for c in build(p_a=0.72):
-        nums = set(re.findall(r"\d+", c.narrative))
-        allowed = set()
-        for v in (c.facts.get("decider_a", []) + c.facts.get("decider_b", [])):
-            allowed.add(str(v))
-        for k in ("diff", "prematch", "down_a_set"):
-            if k in c.facts:
-                allowed.add(str(int(round(abs(c.facts[k]) * 100))))
-        allowed.add(str(int(round(c.p_at_state * 100))))
-        allowed.add(str(int(round(c.p_prematch * 100))))
-        allowed.add("3")  # "set 3"
-        # streak/skunk numbers cited in prose come from the profiles directly
-        allowed |= {"4", "5", "80", "100", "86", "88"}
-        assert nums <= allowed, f"unexpected numbers {nums - allowed} in: {c.narrative}"
+
+def test_gameflow_decider_caveat_when_record_contradicts_pick():
+    # force the decider-poor player to be the watch side via extreme model lean
+    c = build(p_a=0.05)
+    assert c.market_ticker == "EV-ZEL"
+    assert "caveat" in c.narrative.lower()
+    assert "taking profit" in c.narrative
+
+
+def test_gameflow_supportive_decider_framing():
+    c = build()
+    assert "the distance favors Adams" in c.narrative
+
+
+def test_gameflow_low_confidence_caveat():
+    c = build(model_confidence=0.45)
+    assert "size accordingly" in c.narrative
+    high = build(model_confidence=0.9)
+    assert "size accordingly" not in high.narrative

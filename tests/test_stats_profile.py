@@ -15,16 +15,22 @@ AS_OF = date(2026, 7, 1)
 
 def mk(days_ago: int, won: bool, *, opp: int = 99, surface: str = "Hard", best_of: int = 3,
        outcome: str = "completed", sets_won: int | None = None, sets_lost: int | None = None,
-       reached_decider: bool = False, won_decider: bool | None = None) -> MatchRow:
+       reached_decider: bool = False, won_decider: bool | None = None,
+       sets: tuple | None = None) -> MatchRow:
     if sets_won is None:
         sets_won = 2 if won else (1 if reached_decider else 0)
     if sets_lost is None:
         sets_lost = (1 if reached_decider else 0) if won else 2
+    if sets is None and outcome == "completed":
+        if reached_decider:
+            sets = ((1, won), (2, not won), (3, bool(won_decider)))
+        else:
+            sets = ((1, won), (2, won))
     return MatchRow(
         match_date=AS_OF - timedelta(days=days_ago), won=won, opponent_id=opp,
         surface=surface, best_of=best_of, outcome=outcome, sets_won=sets_won,
         sets_lost=sets_lost, reached_decider=reached_decider,
-        won_decider=won_decider, tourney_level="A",
+        won_decider=won_decider, tourney_level="A", set_results=sets or (),
     )
 
 
@@ -129,6 +135,22 @@ def test_fallback_pick_widens():
     wide = rate(3, 2, "career")
     picked = pick(4, narrow, wide)
     assert picked.method == "widened" and picked.window == "career"
+
+
+def test_set_number_rates():
+    from bot.stats.profile import compute_set_rates
+
+    # 10 matches: wins set 1 in 8, set 2 in 5, decider record 2-1
+    hist = ([mk(10 + i, True, sets=((1, True), (2, True))) for i in range(5)] +
+            [mk(30 + i, True, sets=((1, True), (2, False), (3, True))) for i in range(2)] +
+            [mk(50 + i, False, sets=((1, True), (2, False), (3, False))) for i in range(1)] +
+            [mk(60 + i, False, sets=((1, False), (2, False))) for i in range(2)])
+    rates = compute_set_rates(hist, AS_OF, min_sample=8)
+    assert rates[1].wins == 8 and rates[1].losses == 2
+    assert abs(rates[1].value - 0.8) < 1e-9
+    assert rates[2].wins == 5 and rates[2].losses == 5
+    # only 3 deciders < min_sample 8 in both windows -> omitted, never thin-sampled
+    assert rates[3].is_omitted
 
 
 def test_stat_never_fabricates_on_empty():

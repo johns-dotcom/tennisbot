@@ -384,19 +384,22 @@ async def scenarios(request: web.Request) -> web.Response:
     kind_chip = {
         "decider_edge": chip("warning", "⚖", "decider edge"),
         "resilient_favorite": chip("good", "▲", "resilient favorite"),
+        "gameflow": chip("good", "◆", "gameflow plan"),
     }
     cards = []
     for sc, player in rows:
         match_label = (sc.facts or {}).get("match") or sc.event_ticker
+        watch_note = "gameflow plan" if sc.scenario_state == "plan" \
+            else f"at {esc(sc.scenario_state)} sets"
         cards.append(f"""<div class="card">
 <h2>{esc(match_label)} <span style="font-weight:400">· watch
-<strong>{esc(player)}</strong> at {esc(sc.scenario_state)} sets</span></h2>
+<strong>{esc(player)}</strong> · {watch_note}</span></h2>
 <p style="margin:4px 0 8px">{kind_chip.get(sc.kind, '')}
 {chip('muted', '⏱', pt(sc.scheduled_start))}
 {chip('muted', '№', f'salience {sc.salience:.2f}')}</p>
 <div class="prose">{esc(sc.narrative)}</div>
 <p class="mono" style="color:var(--ink-3);font-size:12px;margin-bottom:0">
-prematch {sc.prematch_prob:.0%} → at {esc(sc.scenario_state)}:
+prematch {sc.prematch_prob:.0%} → in a decider:
 {sc.model_prob_at_state:.0%} · {esc(sc.market_ticker)}</p>
 </div>""")
     header = (f'<p class="prose" style="margin-bottom:14px">Generated daily for '

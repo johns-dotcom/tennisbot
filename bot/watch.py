@@ -339,23 +339,33 @@ class WatchService:
     # ---------- settlement resolution (track record) ----------
 
     async def settlement_loop(self) -> None:
-        """Resolve results for markets that carry sent advisories, so the
-        track-record page can score them. Runs every 30 min."""
+        """Resolve results for recently-finished markets: scores the track
+        record (advisory outcomes) and records final set counts (fatigue
+        signal for scenario generation). Runs every 30 min."""
         from sqlalchemy import select
 
-        from bot.models import Advisory, KalshiMarket
+        from bot.models import KalshiMarket
 
         while not self.stop.is_set():
             try:
+                now = utcnow()
                 with db_session() as db:
-                    tickers = db.execute(
-                        select(Advisory.market_ticker).where(
-                            Advisory.status == "sent").distinct()).scalars().all()
                     rows = db.execute(select(KalshiMarket).where(
-                        KalshiMarket.ticker.in_(tickers),
-                        KalshiMarket.result.is_(None))).scalars().all() if tickers else []
-                    pending = [r.ticker for r in rows]
-                for ticker in pending:
+                        KalshiMarket.result.is_(None),
+                        KalshiMarket.player_a_id.is_not(None))).scalars().all()
+                    pending = []
+                    for r in rows:
+                        occ_raw = (r.raw or {}).get("occurrence_datetime")
+                        if not occ_raw:
+                            continue
+                        try:
+                            occ = datetime.fromisoformat(occ_raw.replace("Z", "+00:00"))
+                        except ValueError:
+                            continue
+                        # match should be over but not ancient
+                        if timedelta(hours=2) <= now - occ <= timedelta(hours=72):
+                            pending.append((r.ticker, (r.raw or {}).get("_milestone_id")))
+                for ticker, milestone_id in pending:
                     if self.stop.is_set():
                         break
                     try:
@@ -363,15 +373,31 @@ class WatchService:
                     except Exception:
                         continue
                     result = (m.get("result") or "").strip().lower()
-                    if result in ("yes", "no", "void"):
-                        with db_session() as db:
-                            row = db.execute(select(KalshiMarket).where(
-                                KalshiMarket.ticker == ticker)).scalar()
-                            if row is not None:
-                                row.result = result
-                                row.settled_at = utcnow()
-                                row.status = m.get("status") or row.status
-                        log.info("market settled", ticker=ticker, result=result)
+                    if result not in ("yes", "no", "void"):
+                        continue
+                    final_sets = None
+                    if milestone_id:
+                        try:
+                            payload = await asyncio.to_thread(
+                                self.client.live_data, milestone_id)
+                            sets = self.client.sets_from_live_data(payload)
+                            if sets:
+                                final_sets = sets[0] + sets[1]
+                        except Exception:
+                            pass
+                    with db_session() as db:
+                        row = db.execute(select(KalshiMarket).where(
+                            KalshiMarket.ticker == ticker)).scalar()
+                        if row is not None:
+                            row.result = result
+                            row.settled_at = utcnow()
+                            row.status = m.get("status") or row.status
+                            if final_sets is not None:
+                                raw = dict(row.raw or {})
+                                raw["_final_sets"] = final_sets
+                                row.raw = raw
+                    log.info("market settled", ticker=ticker, result=result,
+                             final_sets=final_sets)
             except Exception as e:
                 log.error("settlement loop error", error=str(e))
             try:

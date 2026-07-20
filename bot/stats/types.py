@@ -31,6 +31,8 @@ class MatchRow:
     won_decider: bool | None  # None if no completed decider
     tourney_level: str | None
     round: str | None = None
+    # per completed set from this player's perspective: ((set_number, won), ...)
+    set_results: tuple = ()
 
 
 PLAYED_OUTCOMES = ("completed", "ret", "def")
