@@ -18,7 +18,8 @@ def _profiles():
               [mk(45 + i * 5, True) for i in range(8)])
     hist_b = ([mk(6, False, reached_decider=True, won_decider=False),
                mk(16, False, reached_decider=True, won_decider=False),
-               mk(26, False, reached_decider=True, won_decider=False)] +
+               mk(26, False, reached_decider=True, won_decider=False),
+               mk(31, False, reached_decider=True, won_decider=False)] +
               [mk(36 + i * 5, True, sets_lost=0) for i in range(7)])
 
     class Prof:

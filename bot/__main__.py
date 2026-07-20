@@ -34,6 +34,7 @@ def main() -> int:
     sub.add_parser("inference-report", help="estimator accuracy vs delayed scores")
     sub.add_parser("graduate", help="check probation graduation thresholds")
     sub.add_parser("web", help="dashboard UI (advisory delivery surface)")
+    sub.add_parser("scenarios", help="generate today's gameflow scenarios")
 
     args = parser.parse_args()
 
@@ -109,6 +110,15 @@ def main() -> int:
         from bot.web import main as web_main
 
         return web_main()
+
+    if args.cmd == "scenarios":
+        from bot.db import session
+        from bot.scenarios import generate_scenarios
+
+        with session() as db:
+            n = generate_scenarios(db)
+        print(f"{n} scenarios generated")
+        return 0
 
     print(f"unknown command '{args.cmd}'", file=sys.stderr)
     return 2

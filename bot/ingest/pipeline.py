@@ -56,6 +56,12 @@ def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False,
         from bot.stats.cache import refresh_stats_cache
 
         refresh_stats_cache(db)
+    try:
+        from bot.scenarios import generate_scenarios
+
+        generate_scenarios(db)
+    except Exception as e:
+        log.error("scenario generation failed", error=str(e))
     for r in results:
         log.info("sync result", source=r.source, matches=r.matches_upserted,
                  players=r.players_upserted, tournaments=r.tournaments_upserted,

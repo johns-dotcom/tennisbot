@@ -112,6 +112,7 @@ def page(title: str, active: str, body: str) -> str:
     navs = "".join(
         f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
         for href, key, label in (("/", "home", "Advisories"),
+                                 ("/scenarios", "scenarios", "Scenarios"),
                                  ("/track", "track", "Track record"),
                                  ("/live", "live", "Live"),
                                  ("/report", "report", "Estimator"),
@@ -367,6 +368,51 @@ async def queue(request: web.Request) -> web.Response:
     return web.Response(text=page("Review queue", "queue", body), content_type="text/html")
 
 
+async def scenarios(request: web.Request) -> web.Response:
+    from bot.models import Scenario
+
+    with db_session() as db:
+        latest_day = db.execute(
+            select(func.max(Scenario.created_for))).scalar()
+        rows = db.execute(
+            select(Scenario, Player.full_name)
+            .join(Player, Player.id == Scenario.player_id, isouter=True)
+            .where(Scenario.created_for == latest_day)
+            .order_by(Scenario.salience.desc())
+        ).all() if latest_day else []
+
+    kind_chip = {
+        "decider_edge": chip("warning", "⚖", "decider edge"),
+        "resilient_favorite": chip("good", "▲", "resilient favorite"),
+    }
+    cards = []
+    for sc, player in rows:
+        match_label = (sc.facts or {}).get("match") or sc.event_ticker
+        cards.append(f"""<div class="card">
+<h2>{esc(match_label)} <span style="font-weight:400">· watch
+<strong>{esc(player)}</strong> at {esc(sc.scenario_state)} sets</span></h2>
+<p style="margin:4px 0 8px">{kind_chip.get(sc.kind, '')}
+{chip('muted', '⏱', pt(sc.scheduled_start))}
+{chip('muted', '№', f'salience {sc.salience:.2f}')}</p>
+<div class="prose">{esc(sc.narrative)}</div>
+<p class="mono" style="color:var(--ink-3);font-size:12px;margin-bottom:0">
+prematch {sc.prematch_prob:.0%} → at {esc(sc.scenario_state)}:
+{sc.model_prob_at_state:.0%} · {esc(sc.market_ticker)}</p>
+</div>""")
+    header = (f'<p class="prose" style="margin-bottom:14px">Generated daily for '
+              f'matches in the next 48h (latest: {latest_day}). These are '
+              f'pre-computed gameflow situations — if the match reaches the named '
+              f'state, the model already knows which side is live. The engine '
+              f'still applies every gate before any advisory fires.</p>') \
+        if latest_day else ""
+    body = header + ("".join(cards) or
+                     '<div class="card"><div class="empty">No scenarios yet — they '
+                     'generate with the daily ingest run, or on demand via '
+                     '<span class="mono">python -m bot scenarios</span>.</div></div>')
+    return web.Response(text=page("Scenarios", "scenarios", body),
+                        content_type="text/html")
+
+
 async def track(request: web.Request) -> web.Response:
     from bot.track import advisory_outcome, advisory_pnl_cents
 
@@ -459,6 +505,7 @@ async def token_guard(request: web.Request, handler):
 def make_app() -> web.Application:
     app = web.Application(middlewares=[token_guard])
     app.router.add_get("/", home)
+    app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/report", report)
