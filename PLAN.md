@@ -140,7 +140,10 @@ meaningful state change; kill on retirement/suspension. Two-stage generation
 template). Delivery = advisories audit row + structured log (Discord removed by user decision). Probation mode default ON;
 `graduate` reports thresholds; flip is manual only.
 **DONE when:** end-to-end dry run on one live market → validated, correctly labeled
-advisory persisted to advisories + visible in logs.
+advisory persisted to advisories + visible in logs/dashboard. [Engine LIVE in
+production probation mode since 2026-07-19; estimator verified on a real set
+boundary (BRUBOO ITF, 6c/50-contract jump, mirrored signs); first advisory
+pending a live match passing all gates — monitored.]
 
 ### Phase 5.5 — Live-results source activation (moved from Phase 1 by user decision)
 User signs up for api-tennis.com trial → API_TENNIS_KEY in .env → run live sync →
@@ -158,6 +161,12 @@ feed_gaps auditing (≥30s gap = stale treatment); inference-report clean-vs-gap
 DEPLOY.md.
 **DONE when:** deployed; restart test passes; manual worker kill mid-match shows
 quarantine in logs; one real [PROBATION] advisory persisted/logged from production.
+[Status 2026-07-19: DEPLOYED — Railway project 400a8a62, dashboard live at
+tennisbot-production-1d98.up.railway.app (web/worker/ingest + Postgres, cron
+30 9 * * *, prod DB backfilled 284k matches, worker fitted 282,773 matches).
+Restart integration test passes (tests/test_restart.py). Web UI replaced Discord
+as the advisory surface. Remaining: mid-match worker-kill verification + first
+production [PROBATION] advisory — both monitored, fire on the next live window.]
 
 ## Environment notes (for session resume)
 - Machine has no Docker/Homebrew; Python via uv (3.12.13), `~/.local/bin/uv`.
