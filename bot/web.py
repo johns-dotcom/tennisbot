@@ -776,52 +776,78 @@ model — most of these will pass without one. ✓ = clears every gate now;
 {rowsel or empty}
 </table></div></section>"""
 
-    # --- Hold vs Take-Profit comparison (same picks, two exits) ---
-    def variant_stats(emap):
-        st = [(b, p) for b, p in bets if emap[b.id][0] in ("won", "lost", "took_profit")]
-        w = sum(1 for b, _ in st if emap[b.id][0] in WON)
-        pc = sum(emap[b.id][1] or 0 for b, _ in st)
-        stk = sum(b.price_cents * (b.units or 1) for b, _ in st)
-        un = sum((emap[b.id][1] or 0) / b.price_cents for b, _ in st if b.price_cents)
-        return len(st), w, pc, un, (pc / stk if stk else None)
+    # --- Hold vs Take-Profit comparison ---
+    # Like-for-like: only matches that have FINISHED (result known), with both
+    # exit rules derived from that same result. Identical denominators — the
+    # only differences are exit outcomes (reversal salvages), not timing.
+    from bot.track import advisory_outcome
 
-    def cum_series(emap):
-        chron = sorted([b for b, _ in bets if b.settled_at
-                        and emap[b.id][0] in ("won", "lost", "took_profit")],
+    def cmp_out(b, tp: bool):
+        res = results.get(b.market_ticker)
+        o = advisory_outcome(b.side, res)
+        u = b.units or 1
+        if o is None:
+            return None  # match not finished → excluded from BOTH
+        if o == "void":
+            return 0
+        if not tp or b.price_cents >= TP_LIMIT:
+            return (100 - b.price_cents) * u if o == "won" else -b.price_cents * u
+        yb, nb = touched.get(b.market_ticker, (None, None))
+        hit = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
+              (b.side == "no" and (nb or 0) >= TP_LIMIT)
+        if hit or o == "won":
+            return (TP_LIMIT - b.price_cents) * u
+        return -b.price_cents * u
+
+    finished = [(b, p) for b, p in bets if cmp_out(b, False) is not None]
+
+    def cstats(tp: bool):
+        wins = sum(1 for b, _ in finished if cmp_out(b, tp) > 0)
+        losses = sum(1 for b, _ in finished if cmp_out(b, tp) < 0)
+        pc = sum(cmp_out(b, tp) for b, _ in finished)
+        stk = sum(b.price_cents * (b.units or 1) for b, _ in finished)
+        un = sum(cmp_out(b, tp) / b.price_cents for b, _ in finished if b.price_cents)
+        return wins, losses, pc, un, (pc / stk if stk else None)
+
+    def cseries(tp: bool):
+        chron = sorted([b for b, _ in finished if b.settled_at],
                        key=lambda b: b.settled_at)
         cum, series = 0, []
         for b in chron:
-            cum += (emap[b.id][1] or 0)
+            cum += cmp_out(b, tp)
             series.append((b.settled_at, cum / 100))
         return series
 
-    hn, hw, hpc, hun, hroi = variant_stats(hold_effs)
-    tn, tw, tpc, tun, troi = variant_stats(tp_effs)
-
-    def cmp_cell(v):
-        return v if v else "—"
+    nfin = len(finished)
+    tp_live = sum(1 for b, _ in bets if results.get(b.market_ticker) is None
+                  and (lambda t: (b.side == "yes" and (t[0] or 0) >= TP_LIMIT)
+                       or (b.side == "no" and (t[1] or 0) >= TP_LIMIT))(
+                      touched.get(b.market_ticker, (None, None))))
     comparison_html = ""
-    if hn or tn:
-        overlay = timeline_svg(cum_series(hold_effs), "$", [],
-                               points2=cum_series(tp_effs),
+    if nfin:
+        hw, hl, hpc, hun, hroi = cstats(False)
+        tw, tl, tpc, tun, troi = cstats(True)
+        overlay = timeline_svg(cseries(False), "$", [], points2=cseries(True),
                                label="hold to settlement", label2="90¢ take-profit")
+        roi = lambda v: f"{v:+.1%}" if v is not None else "—"
         comparison_html = f"""<section class="block"><div class="blockhead">
-<h4>Hold vs Take-Profit</h4><span class="aside">same picks · two exit rules</span></div>
+<h4>Hold vs Take-Profit</h4><span class="aside">same {nfin} finished matches · two exit rules</span></div>
 <div class="rule"></div>
 <div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
-<div class="metric"><div class="k">hold · record</div><div class="v mono">{hw}-{hn - hw}</div></div>
+<div class="metric"><div class="k">hold · record</div><div class="v mono">{hw}-{hl}</div></div>
 <div class="metric"><div class="k">hold · $</div><div class="v mono">{hpc / 100:+.2f}</div></div>
 <div class="metric"><div class="k">hold · units</div><div class="v mono">{hun:+.2f}u</div></div>
-<div class="metric"><div class="k">hold · ROI</div><div class="v mono">{cmp_cell(f'{hroi:+.1%}' if hroi is not None else '')}</div></div>
-<div class="metric"><div class="k">TP · record</div><div class="v mono">{tw}-{tn - tw}</div></div>
+<div class="metric"><div class="k">hold · ROI</div><div class="v mono">{roi(hroi)}</div></div>
+<div class="metric"><div class="k">TP · record</div><div class="v mono">{tw}-{tl}</div></div>
 <div class="metric"><div class="k">TP · $</div><div class="v mono">{tpc / 100:+.2f}</div></div>
 <div class="metric"><div class="k">TP · units</div><div class="v mono">{tun:+.2f}u</div></div>
-<div class="metric"><div class="k">TP · ROI</div><div class="v mono">{cmp_cell(f'{troi:+.1%}' if troi is not None else '')}</div></div>
+<div class="metric"><div class="k">TP · ROI</div><div class="v mono">{roi(troi)}</div></div>
 </div>
 <div style="margin-top:12px">{overlay}</div>
-<p class="sub2" style="margin-top:6px">Does taking profit at 90¢ beat riding to
-settlement? Take-profit gives up 10¢ per winner but salvages leads that
-reverse. This is the answer, on identical picks.</p></section>"""
+<p class="sub2" style="margin-top:6px">Identical picks, both scored on the same
+{nfin} finished matches — so any record difference is take-profit salvaging a
+lead that reversed, not a timing artifact. TP gives up 10¢ per clean winner but
+banks reversals.{f' (TP has also realized {tp_live} live position(s) on matches still in play — shown in the bets table, held out here for a like-for-like record.)' if tp_live else ''}</p></section>"""
 
     title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
     active = "testrun"  # TP is a sibling variant under the same nav tab
