@@ -29,8 +29,7 @@ class Settings(BaseSettings):
     kalshi_discovery_interval_s: int = 900
     kalshi_score_poll_interval_s: int = 25
 
-    # --- advisory delivery ---
-    discord_webhook_url: str = ""
+    # --- advisory rendering (delivery is DB + structured logs only) ---
     anthropic_api_key: str = ""
     anthropic_model: str = "claude-sonnet-5"
 

@@ -29,8 +29,8 @@
 - Deployed on Railway: `worker` service (watch loop) + Railway cron (daily ingest)
 - Local dev: docker-compose Postgres, `.env`; production config via Railway env vars
 - All timestamps UTC in storage, US/Pacific in display
-- Logs to stdout (structured JSON) — Railway captures them. Advisories also push to
-  Discord webhook (env: DISCORD_WEBHOOK_URL).
+- Logs to stdout (structured JSON) — Railway captures them. 
+
 
 ## Workflow
 - Work one phase at a time per PLAN.md. Do not start phase N+1 until phase N's DONE

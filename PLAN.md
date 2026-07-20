@@ -2,8 +2,9 @@
 
 Advisory-only system: player database + stat profiles ("play scripts") from Sackmann
 historical data and api-tennis.com recent results, live Kalshi market monitoring with
-odds-implied match-state inference, own-data win probabilities, narrative advisories
-to Discord. Never trades. All rules in CLAUDE.md bind every phase.
+odds-implied match-state inference, own-data win probabilities, and narrative
+advisories persisted to the DB + structured logs (no external delivery — user
+decision 2026-07-19, Discord removed). Never trades. All rules in CLAUDE.md bind every phase.
 
 **Live results source ({{LIVE_RESULTS_SOURCE}} resolved): api-tennis.com**
 (env: `API_TENNIS_KEY`).
@@ -55,7 +56,7 @@ tennisbot/
 │   │   ├── render.py          # Anthropic API prose rendering
 │   │   ├── validate.py        # numeric validator (regex-extract, assert ∈ fact block)
 │   │   ├── template.py        # plain-template fallback rendering
-│   │   └── discord.py         # webhook embed push
+│   │   └── deliver.py         # DB audit row + structured log line (no Discord)
 │   ├── engine.py              # edge detection, gating, debounce, probation labeling
 │   ├── watch.py               # live loop + aiohttp health endpoint + SIGTERM protocol
 │   └── reports.py             # inference-report, graduate
@@ -136,10 +137,10 @@ Gates (ALL): edge ≥ 6% default, model confidence ≥ min, volume ≥ floor, st
 confidence ≥ 85% or score-confirmed; hold/release/kill pending on score; debounce per
 meaningful state change; kill on retirement/suspension. Two-stage generation
 (deterministic fact block → Anthropic prose) + numeric validator (retry once → plain
-template). Discord embed + advisories audit row. Probation mode default ON;
+template). Delivery = advisories audit row + structured log (Discord removed by user decision). Probation mode default ON;
 `graduate` reports thresholds; flip is manual only.
 **DONE when:** end-to-end dry run on one live market → validated, correctly labeled
-advisory in Discord.
+advisory persisted to advisories + visible in logs.
 
 ### Phase 5.5 — Live-results source activation (moved from Phase 1 by user decision)
 User signs up for api-tennis.com trial → API_TENNIS_KEY in .env → run live sync →
@@ -156,7 +157,7 @@ live_match_state, <60s resume / ≥60s STALE quarantine); restart integration te
 feed_gaps auditing (≥30s gap = stale treatment); inference-report clean-vs-gap split;
 DEPLOY.md.
 **DONE when:** deployed; restart test passes; manual worker kill mid-match shows
-quarantine in logs; one real [PROBATION] advisory in Discord from production.
+quarantine in logs; one real [PROBATION] advisory persisted/logged from production.
 
 ## Environment notes (for session resume)
 - Machine has no Docker/Homebrew; Python via uv (3.12.13), `~/.local/bin/uv`.
@@ -179,4 +180,4 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
   written, untested against live API). Then Phase 1 DONE check fully passes.
 - Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
 - Phase 3 (probability engine) DONE 2026-07-19.
-- Phase 3.5 DONE. Phase 4 DONE 2026-07-19 (Kalshi creds in .env; WS streaming verified live). Phase 5 (edge detection + advisories) next; needs DISCORD_WEBHOOK_URL + ANTHROPIC_API_KEY for the dry run. GitHub remote configured (github.com-tennisbot alias); push pending user adding deploy key.
+- Phase 3.5 DONE. Phase 4 DONE 2026-07-19 (Kalshi creds in .env; WS streaming verified live). Phase 5 built (Discord removed by user decision 2026-07-19; delivery = DB + logs); dry run needs ANTHROPIC_API_KEY (else template fallback) + a live match. GitHub remote configured (github.com-tennisbot alias); push pending user adding deploy key.

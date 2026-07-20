@@ -22,7 +22,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
 
-from bot.advisory.discord import push_advisory
+from bot.advisory.deliver import deliver_advisory
 from bot.advisory.facts import build_fact_block, build_facts
 from bot.advisory.render import render_prose
 from bot.config import settings
@@ -239,10 +239,10 @@ class AdvisoryEngine:
         prose, validated, used_template = render_prose(block)
         ctx = self._context(ticker)
         adv_id = self._persist(block, ctx, prose, validated, used_template, "sent")
-        pushed = push_advisory(block, prose)
+        pushed = deliver_advisory(block, prose)
         with self.db_session() as db:
             db.execute(Advisory.__table__.update().where(Advisory.id == adv_id)
-                       .values(discord_pushed_at=datetime.now(timezone.utc)
+                       .values(delivered_at=datetime.now(timezone.utc)
                                if pushed else None))
         self.last_advised[ticker] = (est.state_key, band if band is not None
                                      else edge_band(block.edge))

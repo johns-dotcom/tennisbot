@@ -2,8 +2,9 @@
 
 Advisory-only tennis live-betting analysis system for Kalshi markets. Maintains
 ATP/WTA/ITF player statistical profiles, monitors live Kalshi tennis markets,
-infers in-play match state from odds movement, and pushes narrative betting
-advisories to Discord. **It advises only — it never trades.**
+infers in-play match state from odds movement, and produces narrative betting
+advisories (persisted to the database and emitted as structured logs).
+**It advises only — it never trades.**
 
 See `CLAUDE.md` for binding project rules, `PLAN.md` for architecture and phase
 status, and `DEPLOY.md` (Phase 6) for the Railway runbook.
