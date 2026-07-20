@@ -29,4 +29,4 @@ alembic upgrade head
 python -m bot ingest   # Sackmann backfill + api-tennis sync
 ```
 
-CLI: `ingest | watch | profile "Name" | backtest --from --to | replay <session> | inference-report | graduate`
+CLI: `ingest | watch | web | profile "Name" | backtest --from --to | replay <session> | inference-report | graduate`
