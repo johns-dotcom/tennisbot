@@ -209,10 +209,16 @@ class WatchService:
             ya = body.get("yes_ask") if isinstance(body.get("yes_ask"), int) \
                 else dollars_to_cents(body.get("yes_ask_dollars"))
             vol = body.get("volume")
+            try:
+                vol = int(float(vol)) if vol is not None else None
+            except (TypeError, ValueError):
+                vol = None
             self.recorder.quote(ticker, now, yb, ya,
                                 100 - ya if ya is not None else None,
                                 100 - yb if yb is not None else None, volume=vol)
             est.on_quote(now, yb, ya)
+            if self.advisory_hook:
+                self.advisory_hook.on_quote(ticker, est, yb, ya, vol)
         elif mtype == "trade":
             price = body.get("yes_price") if isinstance(body.get("yes_price"), int) \
                 else dollars_to_cents(body.get("yes_price_dollars"))
@@ -220,7 +226,11 @@ class WatchService:
             self.recorder.trade(ticker, now, price or 0, count)
             est.on_trade(now, price or 0, count)
         elif mtype == "market_lifecycle_v2":
-            self.recorder.lifecycle(ticker, now, body.get("event_type", "unknown"), raw=body)
+            event = body.get("event_type", "unknown")
+            self.recorder.lifecycle(ticker, now, event, raw=body)
+            if self.advisory_hook and event in ("paused", "halted", "suspended",
+                                                "closed", "determined", "settled"):
+                self.advisory_hook.kill_pending(ticker, f"market {event}")
 
     def _active_tickers(self) -> list[str]:
         """Markets whose match is near/inside its playing window — the only ones
@@ -264,6 +274,12 @@ class WatchService:
                                         degraded=True)
                     est = self._estimator(ticker, info["series"])
                     est.on_quote(now, yb, ya, degraded=True)  # never triggers detection
+                    if self.advisory_hook:
+                        try:
+                            vol = int(float(m.get("volume_fp") or 0))
+                        except (TypeError, ValueError):
+                            vol = None
+                        self.advisory_hook.on_quote(ticker, est, yb, ya, vol)
                 except Exception as e:
                     log.warning("rest fallback poll failed", ticker=ticker, error=str(e))
             await asyncio.sleep(8 + random.uniform(0, 4))
@@ -342,6 +358,14 @@ class WatchService:
         await self.stop.wait()
         await runner.cleanup()
 
+    def _fit_model(self):
+        from bot.prob.elo import SetElo
+
+        model = SetElo()
+        with db_session() as db:
+            model.fit_from_db(db)
+        return model
+
     def _handle_sigterm(self) -> None:
         log.info("SIGTERM: flushing state and shutting down")
         self.stop.set()
@@ -355,6 +379,12 @@ class WatchService:
                 b: load_priors(db, lvl, None)
                 for b, lvl in (("tour", "A"), ("challenger", "C"), ("itf", "15"),
                                ("slam", "G"))}
+        log.info("fitting probability model from history (one-time, ~1-3 min)")
+        model = await asyncio.to_thread(self._fit_model)
+        from bot.engine import AdvisoryEngine
+
+        self.advisory_hook = AdvisoryEngine(db_session, model)
+        log.info("advisory engine armed", probation=self.cfg.probation)
         async def supervised(fn, name: str):
             while not self.stop.is_set():
                 try:

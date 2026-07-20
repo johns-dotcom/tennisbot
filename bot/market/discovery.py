@@ -55,11 +55,15 @@ def discover_markets(db: Session, client: KalshiClient) -> dict:
         prev = existing.get(m["ticker"])
         if ev and not (prev and prev["milestone"]) and ev not in milestone_by_event:
             need_milestone.add(ev)
+    best_of_by_event: dict[str, int] = {}
     for ev in need_milestone:
         try:
             ms = client.milestones_for_event(ev)
             if ms:
                 milestone_by_event[ev] = ms[0]["id"]
+                bo = (ms[0].get("details") or {}).get("best_of")
+                if bo:
+                    best_of_by_event[ev] = int(bo)
         except Exception as e:
             log.warning("milestone lookup failed", event=ev, error=str(e))
 
@@ -76,11 +80,13 @@ def discover_markets(db: Session, client: KalshiClient) -> dict:
             stats["seen_unchanged"] = stats.get("seen_unchanged", 0) + 1
             continue
         try:
-            _upsert_one(db, matchers, series, m, milestone_by_event, now, stats)
+            _upsert_one(db, matchers, series, m, milestone_by_event,
+                        best_of_by_event, now, stats)
             db.commit()
         except OperationalError:
             db.rollback()
-            _upsert_one(db, matchers, series, m, milestone_by_event, now, stats)
+            _upsert_one(db, matchers, series, m, milestone_by_event,
+                        best_of_by_event, now, stats)
             db.commit()
     for i in range(0, len(unchanged), 500):
         db.execute(update(KalshiMarket)
@@ -92,8 +98,8 @@ def discover_markets(db: Session, client: KalshiClient) -> dict:
 
 
 def _upsert_one(db: Session, matchers: dict, series: str, m: dict,
-                milestone_by_event: dict[str, str], now: datetime,
-                stats: dict) -> None:
+                milestone_by_event: dict[str, str], best_of_by_event: dict[str, int],
+                now: datetime, stats: dict) -> None:
     tour = TENNIS_SERIES[series]
     ticker = m["ticker"]
     row = db.execute(
@@ -112,8 +118,9 @@ def _upsert_one(db: Session, matchers: dict, series: str, m: dict,
         row.close_time = datetime.fromisoformat(close.replace("Z", "+00:00"))
     raw = dict(m)
     raw["_series"] = series
-    prev_milestone = (row.raw or {}).get("_milestone_id")
-    raw["_milestone_id"] = prev_milestone or milestone_by_event.get(row.event_ticker)
+    prev = row.raw or {}
+    raw["_milestone_id"] = prev.get("_milestone_id") or milestone_by_event.get(row.event_ticker)
+    raw["_best_of"] = prev.get("_best_of") or best_of_by_event.get(row.event_ticker, 3)
     row.raw = raw
 
     if row.player_a_id is None:
