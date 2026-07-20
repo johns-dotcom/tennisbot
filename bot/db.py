@@ -12,7 +12,8 @@ _session_factory = None
 def engine():
     global _engine
     if _engine is None:
-        _engine = create_engine(settings().database_url, pool_pre_ping=True)
+        _engine = create_engine(settings().database_url, pool_pre_ping=True,
+                                pool_recycle=240)
     return _engine
 
 

@@ -99,8 +99,12 @@ def main() -> int:
         print(text)
         return 0 if ok else 1
 
-    phase = {"watch": 4}.get(args.cmd)
-    print(f"'{args.cmd}' is implemented in Phase {phase} — not built yet.", file=sys.stderr)
+    if args.cmd == "watch":
+        from bot.watch import main as watch_main
+
+        return watch_main()
+
+    print(f"unknown command '{args.cmd}'", file=sys.stderr)
     return 2
 
 

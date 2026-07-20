@@ -24,8 +24,10 @@ class Settings(BaseSettings):
     # --- Kalshi (READ ONLY — never any trading endpoint) ---
     kalshi_api_key_id: str = ""
     kalshi_private_key_b64: str = ""
-    kalshi_api_base: str = "https://api.elections.kalshi.com/trade-api/v2"
-    kalshi_ws_url: str = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+    kalshi_api_base: str = "https://external-api.kalshi.com/trade-api/v2"
+    kalshi_ws_url: str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
+    kalshi_discovery_interval_s: int = 900
+    kalshi_score_poll_interval_s: int = 25
 
     # --- advisory delivery ---
     discord_webhook_url: str = ""

@@ -27,11 +27,13 @@ log = get_logger("matching")
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 _WS_RE = re.compile(r"\s+")
+_PAREN_RE = re.compile(r"\([^)]*\)")  # Kalshi disambiguators: "Cezar Cretu (b. 2001)"
 
 
 def normalize_name(name: str) -> str:
-    """Lowercase, strip diacritics/punctuation, collapse whitespace."""
-    s = unicodedata.normalize("NFKD", name or "")
+    """Lowercase, strip parentheticals/diacritics/punctuation, collapse whitespace."""
+    s = _PAREN_RE.sub(" ", name or "")
+    s = unicodedata.normalize("NFKD", s)
     s = "".join(c for c in s if not unicodedata.combining(c))
     s = _PUNCT_RE.sub(" ", s.lower())
     return _WS_RE.sub(" ", s).strip()

@@ -170,4 +170,4 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
   written, untested against live API). Then Phase 1 DONE check fully passes.
 - Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
 - Phase 3 (probability engine) DONE 2026-07-19.
-- Phase 3.5 DONE 2026-07-19. Phase 4 (Kalshi read-only integration) next.
+- Phase 3.5 DONE. Phase 4 DONE 2026-07-19 (Kalshi creds in .env; WS streaming verified live). Phase 5 (edge detection + advisories) next; needs DISCORD_WEBHOOK_URL + ANTHROPIC_API_KEY for the dry run. GitHub remote configured (github.com-tennisbot alias); push pending user adding deploy key.
