@@ -233,11 +233,14 @@ class WatchService:
                 self.advisory_hook.kill_pending(ticker, f"market {event}")
 
     def _active_tickers(self) -> list[str]:
-        """Markets whose match is near/inside its playing window — the only ones
-        worth polling (rate limits; 386 open markets but ~a dozen live)."""
+        """Markets worth polling: actually live per the milestone sweep, or
+        near/inside the scheduled window (fallback while status is unknown)."""
         now = utcnow()
         out = []
         for ticker, info in self.watched.items():
+            if info.get("live_status") == "live":
+                out.append(ticker)
+                continue
             occ = (info.get("occurrence") or "").replace("Z", "+00:00")
             try:
                 start = datetime.fromisoformat(occ)
@@ -246,6 +249,43 @@ class WatchService:
             if start - timedelta(minutes=10) <= now <= start + timedelta(hours=6):
                 out.append(ticker)
         return out
+
+    async def live_status_loop(self) -> None:
+        """Every 2 min: one milestone sweep → which matches are ACTUALLY live
+        (tennis runs early/late; scheduled times lie). Updates the in-memory
+        watch set immediately and persists status changes to kalshi_markets."""
+        from sqlalchemy import select
+
+        from bot.models import KalshiMarket
+
+        while not self.stop.is_set():
+            try:
+                statuses = await asyncio.to_thread(
+                    self.client.tennis_milestone_statuses)
+                changed: dict[str, str] = {}
+                for ticker, info in self.watched.items():
+                    ev = info.get("event_ticker")
+                    st = statuses.get(ev)
+                    if st and info.get("live_status") != st:
+                        info["live_status"] = st
+                        changed[ev] = st
+                if changed:
+                    with db_session() as db:
+                        rows = db.execute(select(KalshiMarket).where(
+                            KalshiMarket.event_ticker.in_(list(changed)))
+                        ).scalars().all()
+                        for r in rows:
+                            raw = dict(r.raw or {})
+                            raw["_live_status"] = changed[r.event_ticker]
+                            r.raw = raw
+                    log.info("live status changes", n=len(changed),
+                             live=[e for e, s in changed.items() if s == "live"])
+            except Exception as e:
+                log.warning("live status sweep failed", error=str(e))
+            try:
+                await asyncio.wait_for(self.stop.wait(), timeout=120)
+            except asyncio.TimeoutError:
+                pass
 
     # ---------- REST fallback (degraded) ----------
 
@@ -556,7 +596,8 @@ class WatchService:
             (self.discovery_loop, "discovery"), (self.ws_loop, "websocket"),
             (self.rest_fallback_loop, "rest_fallback"), (self.score_loop, "score"),
             (self.settlement_loop, "settlement"), (self.paper_loop, "paper"),
-            (self.scenario_loop, "scenarios"), (self.health_server, "health"))]
+            (self.scenario_loop, "scenarios"), (self.live_status_loop, "live_status"),
+            (self.health_server, "health"))]
 
         async def shutdown_watchdog():
             await self.stop.wait()

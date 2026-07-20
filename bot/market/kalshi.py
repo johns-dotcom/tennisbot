@@ -144,6 +144,32 @@ class KalshiClient:
         d = self._get("/milestones", related_event_ticker=event_ticker, limit=10)
         return d.get("milestones", [])
 
+    def tennis_milestone_statuses(self, since_hours: int = 36) -> dict[str, str]:
+        """event_ticker -> live status ('live'/'not_started'/'P'…) for recent
+        tennis matches, one API call. The authoritative what-is-actually-live
+        signal — scheduled times drift, this doesn't."""
+        from datetime import timedelta
+
+        start = (utcnow() - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        out: dict[str, str] = {}
+        cursor = None
+        for _ in range(5):  # paginate defensively
+            params = {"type": "tennis_tournament_singles",
+                      "minimum_start_date": start, "limit": 200}
+            if cursor:
+                params["cursor"] = cursor
+            d = self._get("/milestones", **params)
+            for m in d.get("milestones", []):
+                det = m.get("details") or {}
+                ev = det.get("main_game_event_ticker")
+                status = det.get("status")
+                if ev and status:
+                    out[ev] = status
+            cursor = d.get("cursor")
+            if not cursor:
+                break
+        return out
+
     def live_data(self, milestone_id: str) -> dict:
         return self._get(f"/live_data/milestone/{milestone_id}").get("live_data", {})
 

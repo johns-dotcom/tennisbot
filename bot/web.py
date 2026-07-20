@@ -606,17 +606,23 @@ async def live(request: web.Request) -> web.Response:
         global_last_seen = max((m.last_seen_at for m in markets
                                 if m.last_seen_at), default=None)
         discovery_alive = global_last_seen is not None and global_last_seen >= seen_cutoff
+        ENDED = {"finished", "complete", "ended", "closed", "cancelled", "P"}
         live_evs, soon_evs, done_evs = [], [], []
         for ev_ticker, ev in events.items():
             settled = any(m.result for m in ev["sides"])
             last_seen = max((m.last_seen_at for m in ev["sides"]
                              if m.last_seen_at), default=None)
             gone = discovery_alive and last_seen is not None and last_seen < seen_cutoff
-            if settled or gone:
+            # authoritative: the milestone sweep's actual match status
+            status = next(((m.raw or {}).get("_live_status") for m in ev["sides"]
+                           if (m.raw or {}).get("_live_status")), None)
+            if settled or gone or status in ENDED:
                 if now - ev["occ"] <= timedelta(hours=18):
                     done_evs.append((ev_ticker, ev))
                 continue
-            if ev["occ"] - LIVE_WINDOW_BEFORE <= now <= ev["occ"] + LIVE_WINDOW_AFTER:
+            if status == "live":
+                live_evs.append((ev_ticker, ev))
+            elif ev["occ"] - LIVE_WINDOW_BEFORE <= now <= ev["occ"] + LIVE_WINDOW_AFTER:
                 live_evs.append((ev_ticker, ev))
             elif now < ev["occ"] <= now + UPCOMING_HORIZON:
                 soon_evs.append((ev_ticker, ev))
