@@ -33,6 +33,7 @@ def main() -> int:
 
     sub.add_parser("inference-report", help="estimator accuracy vs delayed scores")
     sub.add_parser("graduate", help="check probation graduation thresholds")
+    sub.add_parser("web", help="dashboard UI (advisory delivery surface)")
 
     args = parser.parse_args()
 
@@ -103,6 +104,11 @@ def main() -> int:
         from bot.watch import main as watch_main
 
         return watch_main()
+
+    if args.cmd == "web":
+        from bot.web import main as web_main
+
+        return web_main()
 
     print(f"unknown command '{args.cmd}'", file=sys.stderr)
     return 2
