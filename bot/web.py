@@ -208,29 +208,123 @@ async def home(request: web.Request) -> web.Response:
     return web.Response(text=page("Advisories", "home", body), content_type="text/html")
 
 
+LIVE_WINDOW_BEFORE = timedelta(minutes=10)
+LIVE_WINDOW_AFTER = timedelta(hours=6)
+UPCOMING_HORIZON = timedelta(hours=12)
+
+
+def _latest_quotes(db, tickers: list[str]) -> dict[str, tuple]:
+    """ticker -> (yes_bid, yes_ask, ts) from the most recent quote tick."""
+    if not tickers:
+        return {}
+    from sqlalchemy import text as sqltext
+
+    rows = db.execute(sqltext("""
+        SELECT DISTINCT ON (market_ticker) market_ticker, yes_bid, yes_ask, ts
+        FROM market_ticks
+        WHERE market_ticker = ANY(:tickers) AND kind = 'quote'
+          AND ts > now() - interval '30 minutes'
+        ORDER BY market_ticker, ts DESC"""), {"tickers": tickers}).all()
+    return {r[0]: (r[1], r[2], r[3]) for r in rows}
+
+
 async def live(request: web.Request) -> web.Response:
-    with db_session() as db:
-        rows = db.execute(
-            select(LiveMatchState, KalshiMarket.title)
-            .join(KalshiMarket, KalshiMarket.ticker == LiveMatchState.market_ticker,
-                  isouter=True)
-            .order_by(LiveMatchState.updated_at.desc()).limit(60)
-        ).all()
     now = datetime.now(timezone.utc)
-    items = []
-    for st, title in rows:
-        fresh = st.last_tick_at and (now - st.last_tick_at) < timedelta(minutes=10)
-        conf = chip("good", "✓", "confirmed") if st.last_confirmed_state == st.state \
-            else chip("warning", "≈", f"{st.confidence:.0%} est.")
-        flags = chip("critical", "⛔", "STALE") if st.stale else (
-            chip("muted", "·", "idle") if not fresh else "")
-        items.append(f"""<tr><td>{esc(title or st.market_ticker)}<br>
-<span class="mono">{esc(st.market_ticker)}</span></td>
-<td><strong>{esc(st.state)}</strong></td><td>{conf} {flags}</td>
-<td class="mono">{pt(st.last_tick_at)}</td></tr>""")
-    body = f"""<div class="card"><h2>Live match states (estimator)</h2>
-<table><tr><th>market</th><th>sets</th><th>state confidence</th><th>last tick</th></tr>
-{''.join(items) or '<tr><td colspan="4" class="empty">No estimator state yet.</td></tr>'}
+    with db_session() as db:
+        markets = db.execute(select(KalshiMarket).where(
+            KalshiMarket.status.in_(["active", "open"]))).scalars().all()
+
+        # group complementary per-player markets by event
+        events: dict[str, dict] = {}
+        for m in markets:
+            occ_raw = (m.raw or {}).get("occurrence_datetime")
+            if not occ_raw:
+                continue
+            try:
+                occ = datetime.fromisoformat(occ_raw.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            ev = events.setdefault(m.event_ticker, {
+                "occ": occ, "sides": [], "series": (m.raw or {}).get("_series", "")})
+            ev["sides"].append(m)
+
+        live_evs, soon_evs = [], []
+        for ev_ticker, ev in events.items():
+            if ev["occ"] - LIVE_WINDOW_BEFORE <= now <= ev["occ"] + LIVE_WINDOW_AFTER:
+                live_evs.append((ev_ticker, ev))
+            elif now < ev["occ"] <= now + UPCOMING_HORIZON:
+                soon_evs.append((ev_ticker, ev))
+        live_evs.sort(key=lambda e: e[1]["occ"])
+        soon_evs.sort(key=lambda e: e[1]["occ"])
+
+        all_tickers = [m.ticker for _, ev in live_evs for m in ev["sides"]]
+        quotes = _latest_quotes(db, all_tickers)
+        states = {s.market_ticker: s for s in db.execute(
+            select(LiveMatchState).where(
+                LiveMatchState.market_ticker.in_(all_tickers))).scalars().all()} \
+            if all_tickers else {}
+        advised = set(db.execute(
+            select(Advisory.market_ticker).where(
+                Advisory.market_ticker.in_(all_tickers),
+                Advisory.status.in_(["sent", "pending"]))).scalars().all()) \
+            if all_tickers else set()
+
+    series_label = {"KXATPMATCH": "ATP", "KXWTAMATCH": "WTA", "KXWTAGAME": "WTA",
+                    "KXATPCHALLENGERMATCH": "Challenger", "KXITFMATCH": "ITF M",
+                    "KXITFWMATCH": "ITF W"}
+
+    def side_cell(m) -> str:
+        name = (m.raw or {}).get("yes_sub_title") or m.ticker.rsplit("-", 1)[-1]
+        q = quotes.get(m.ticker)
+        if q and q[0] is not None and q[1] is not None:
+            mid = (q[0] + q[1]) / 2
+            return f"{esc(name)} <strong>{mid:.0f}¢</strong>"
+        return f"{esc(name)} <span class='mono'>—</span>"
+
+    def event_rows(evs, show_state: bool) -> str:
+        out = []
+        for ev_ticker, ev in evs:
+            sides = sorted(ev["sides"], key=lambda m: m.ticker)
+            est = next((states.get(m.ticker) for m in sides if states.get(m.ticker)), None)
+            fresh_tick = max((q[2] for m in sides if (q := quotes.get(m.ticker))),
+                             default=None)
+            if show_state and est is not None:
+                if est.stale:
+                    st_cell = f"<strong>{esc(est.state)}</strong> " + \
+                        chip("critical", "⛔", "STALE")
+                elif est.last_confirmed_state == est.state:
+                    st_cell = f"<strong>{esc(est.state)}</strong> " + \
+                        chip("good", "✓", "score")
+                else:
+                    st_cell = f"<strong>{esc(est.state)}</strong> " + \
+                        chip("warning", "≈", f"{est.confidence:.0%}")
+            else:
+                st_cell = "<span class='mono'>0-0</span>" if show_state else "—"
+            play = chip("good", "▲", "play") if any(m.ticker in advised for m in sides) \
+                else chip("muted", "·", "no play")
+            cells = " · ".join(side_cell(m) for m in sides[:2])
+            out.append(f"""<tr>
+<td>{chip('muted', '', series_label.get(ev['series'], ev['series'] or '?'))}</td>
+<td>{cells}<br><span class="mono">{esc(ev_ticker)}</span></td>
+<td class="mono">{pt(ev['occ'])}</td>
+{f'<td>{st_cell}</td>' if show_state else ''}
+{f'<td>{play}</td>' if show_state else ''}
+{f'<td class="mono">{pt(fresh_tick)}</td>' if show_state else ''}</tr>""")
+        return "".join(out)
+
+    live_html = event_rows(live_evs, True)
+    soon_html = event_rows(soon_evs, False)
+    body = f"""<div class="card"><h2>Live now ({len(live_evs)})</h2>
+<table><tr><th>tour</th><th>match · prices</th><th>started</th><th>sets</th>
+<th>advisory</th><th>last tick</th></tr>
+{live_html or '<tr><td colspan="6" class="empty">No tennis matches in the playing window right now.</td></tr>'}
+</table>
+<p class="prose">Every live match the bot is watching appears here whether or not
+a play fired. Prices are the latest streamed mid; sets come from the estimator
+(≈ inferred from odds movement, ✓ confirmed by the delayed score).</p></div>
+<div class="card"><h2>Starting soon ({len(soon_evs)})</h2>
+<table><tr><th>tour</th><th>match</th><th>starts</th></tr>
+{soon_html or '<tr><td colspan="3" class="empty">Nothing scheduled in the next 12 hours.</td></tr>'}
 </table></div>"""
     return web.Response(text=page("Live", "live", body), content_type="text/html")
 
