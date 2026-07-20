@@ -91,10 +91,13 @@ computation (scripts/verify_profiles.py) for Jannik Sinner (ATP), Aryna Sabalenk
 shares all exact matches (12/12). Semantics: as_of strict (match_date < as_of); W.O.
 excluded from all stats; RET/DEF count; round-order sequencing within tourney week.
 
-### Phase 3 — Probability engine
+### Phase 3 — Probability engine  [DONE 2026-07-19]
 WinProbabilityModel interface; surface-adjusted set-level Elo baseline + logistic
 in-play state adjustment; circularity isolation test (price structurally unreachable).
-**DONE when:** `python -m bot backtest --from --to` reports Brier + calibration curve.
+**DONE check passed:** backtest 2025-01-01→2026-06-02: 69,827 matches scored,
+Brier 0.2035, log loss 0.5914, calibration gaps ≤ ±0.015 across all buckets
+(after PLATT_A=1.65 pre-match sharpening fitted on 2023-24, n=120k, held out from
+eval). Isolation enforced by 4 structural AST tests (tests/test_isolation.py).
 
 ### Phase 3.5 — Market recorder + state estimator
 Recorder FIRST (all ticks/trades/score updates → market_ticks with session_id);
@@ -159,4 +162,5 @@ quarantine in logs; one real [PROBATION] advisory in Discord from production.
 - BLOCKED on user: API_TENNIS_KEY needed to exercise ApiTennisSource (adapter
   written, untested against live API). Then Phase 1 DONE check fully passes.
 - Phase 2 (stats engine) DONE 2026-07-19; cache refresh wired into ingest.
-- Phase 3 (probability engine) next.
+- Phase 3 (probability engine) DONE 2026-07-19.
+- Phase 3.5 (market recorder + state estimator) IN PROGRESS.

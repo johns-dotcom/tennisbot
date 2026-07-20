@@ -62,7 +62,19 @@ def main() -> int:
             print(render_profile(build_profile(db, res.player_id, as_of)))
         return 0
 
-    phase = {"backtest": 3, "replay": 3.5, "inference-report": 3.5,
+    if args.cmd == "backtest":
+        from datetime import date
+
+        from bot.db import session
+        from bot.prob.backtest import run_backtest
+
+        with session() as db:
+            report = run_backtest(db, date.fromisoformat(args.date_from),
+                                  date.fromisoformat(args.date_to))
+        print(report.render())
+        return 0
+
+    phase = {"replay": 3.5, "inference-report": 3.5,
              "watch": 4, "graduate": 5}.get(args.cmd)
     print(f"'{args.cmd}' is implemented in Phase {phase} — not built yet.", file=sys.stderr)
     return 2
