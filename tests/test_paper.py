@@ -48,3 +48,27 @@ def test_no_bet_without_quote():
 def test_selectivity_probability_floor_is_high():
     # the policy exists to hit a 70% record: floor must be near/above that
     assert PAPER_MIN_PROB >= 0.65
+
+
+def test_unit_sizing_default_one():
+    from bot.paper import size_units
+
+    assert size_units(0.70, 0.04, 0.65) == 1
+
+
+def test_unit_sizing_two_needs_all_thresholds():
+    from bot.paper import size_units
+
+    assert size_units(0.76, 0.07, 0.80) == 2
+    assert size_units(0.76, 0.07, 0.65) == 1  # confidence short
+    assert size_units(0.76, 0.04, 0.80) == 1  # edge short
+
+
+def test_unit_sizing_three_is_extreme_and_capped():
+    from bot.paper import size_units, decide_bet
+
+    assert size_units(0.85, 0.12, 0.90) == 3
+    assert size_units(0.85, 0.12, 0.80) == 2  # one threshold short of 3u
+    assert size_units(0.99, 0.30, 0.99) == 3  # never above 3
+    d = decide_bet(p_yes=0.85, confidence=0.9, yes_ask=73, yes_bid=71)
+    assert d.place and d.units == 3 and "3u" in d.reason

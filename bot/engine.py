@@ -263,6 +263,7 @@ class AdvisoryEngine:
             PAPER_MIN_PROB,
             BetDecision,
             place_bet,
+            size_units,
         )
 
         prob, price = block.model_prob, block.executable_price_cents
@@ -273,6 +274,7 @@ class AdvisoryEngine:
             return
         decision = BetDecision(True, side=block.recommended_side, prob=prob,
                                edge=edge, price_cents=price,
+                               units=size_units(prob, edge, block.model_confidence),
                                reason="advisory cleared paper policy")
         with self.db_session() as db:
             place_bet(db, event_ticker=ctx["event_ticker"], market_ticker=ticker,

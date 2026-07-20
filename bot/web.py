@@ -192,6 +192,7 @@ def page(title: str, active: str, body: str) -> str:
                                  ("/testrun", "testrun", "Bot Testrun"),
                                  ("/track", "track", "Track record"),
                                  ("/live", "live", "Live"),
+                                 ("/players", "players", "Database"),
                                  ("/report", "report", "Estimator"),
                                  ("/queue", "queue", "Review queue")))
     dot, conn = _feed_status()
@@ -336,7 +337,8 @@ async def scenarios(request: web.Request) -> web.Response:
 <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
 <span class="kicker" style="margin:0">{esc(f.get('event_label') or 'gameflow plan')}</span>
 {tag('outline', '◆', 'gameflow')}</div>
-<div class="title">{esc(match_label)}</div>
+<a href="/match/{esc(sc.event_ticker)}" style="text-decoration:none">
+<div class="title">{esc(match_label)} <span class="sub2">→</span></div></a>
 <div class="sub2 mono">watch <strong style="color:var(--text)">{esc(player)}</strong>
 · {pt(sc.scheduled_start)} · {esc(sc.market_ticker)}</div>
 {metrics}
@@ -371,7 +373,7 @@ async def testrun(request: web.Request) -> web.Response:
     n = len(settled)
     win_rate = wins / n if n else None
     pnl = sum(b.pnl_cents or 0 for b, _ in settled)
-    staked = sum(b.price_cents for b, _ in settled)
+    staked = sum(b.price_cents * (b.units or 1) for b, _ in settled)
     first = min((b.created_at for b, _ in bets), default=None)
     days = (datetime.now(timezone.utc) - first).days if first else 0
 
@@ -388,8 +390,9 @@ async def testrun(request: web.Request) -> web.Response:
         ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
          "target 70% by month 1"),
         ("Days running", str(days), f"since {first.date()}" if first else "no bets yet"),
-        ("Flat-stake P&L", f"{pnl:+d}¢" if n else "—", "1 contract per bet"),
-        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", ""),
+        ("Unit P&L", f"{pnl:+d}¢" if n else "—",
+         "1 unit = 1 contract · max 3u, sparse"),
+        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", "unit-weighted"),
         ("Policy", f"≥{PAPER_MIN_PROB:.0%} prob",
          f"+ ≥{PAPER_MIN_EDGE * 100:.0f}% edge · selective"),
     ])
@@ -400,6 +403,7 @@ async def testrun(request: web.Request) -> web.Response:
 <div class="metric"><div class="k">challenger</div><div class="v mono">{bucket(lambda b: b.tier == 'C')}</div></div>
 <div class="metric"><div class="k">ITF</div><div class="v mono">{bucket(lambda b: b.tier == '15')}</div></div>
 <div class="metric"><div class="k">prob ≥ 80%</div><div class="v mono">{bucket(lambda b: b.model_prob >= 0.8)}</div></div>
+<div class="metric"><div class="k">2u+ bets</div><div class="v mono">{bucket(lambda b: (b.units or 1) >= 2)}</div></div>
 </div>"""
 
     def rows_html(pairs) -> str:
@@ -414,6 +418,7 @@ async def testrun(request: web.Request) -> web.Response:
 <td class="mono sub2">{pt(b.created_at)}</td>
 <td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span></td>
 <td class="mono">{b.price_cents}¢</td>
+<td class="mono" style="font-weight:800">{b.units or 1}u</td>
 <td class="mono">{b.model_prob:.0%}</td>
 <td class="mono">+{b.edge * 100:.1f}%</td>
 <td>{tag('neutral', '·', b.basis)} {tag('neutral', '·', b.tier or '?')}</td>
@@ -433,10 +438,10 @@ or ever becomes, a real order.</p>
 <div class="rule"></div>{breakdown}</section>
 <section class="block"><div class="blockhead"><h4>Bets</h4></div>
 <div class="rule"></div><div class="tw">
-<table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>model</th>
+<table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
 <th>edge</th><th>basis</th><th>status</th><th style="text-align:right">P&amp;L</th></tr>
 {rows_html(open_bets) + rows_html(settled) or
- '<tr><td colspan="8" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
+ '<tr><td colspan="9" class="empty">No paper bets yet — the policy waits for matches that clear every gate.</td></tr>'}
 </table></div></section>"""
     return web.Response(text=page("Bot Testrun", "testrun", body),
                         content_type="text/html")
@@ -624,9 +629,10 @@ async def live(request: web.Request) -> web.Response:
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{series_label.get(ev['series'], '?')}</span>
 <span>{st} {play}</span></div>
-<div>{''.join(rows_html)}</div>
+<a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
+<div>{''.join(rows_html)}</div></a>
 <div class="sub2 mono">{'started' if is_live else 'starts'} {pt(ev['occ'])}
-· {esc(ev_ticker)}</div>
+· <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a></div>
 </div>"""
 
     def done_card(ev_ticker: str, ev: dict) -> str:
@@ -718,6 +724,254 @@ marking the queue row resolved. Unmatched names are never silently dropped.</p>
     return web.Response(text=page("Review queue", "queue", body), content_type="text/html")
 
 
+def _rate_cell(stat) -> str:
+    if stat is None or stat.value is None:
+        return "—"
+    win = "past year" if "last365" in stat.window else \
+        ("career" if "career" in stat.window else "recent")
+    return (f"{stat.value:.0%} <span class='sub2'>({stat.wins}-{stat.losses}, "
+            f"{win})</span>")
+
+
+async def players(request: web.Request) -> web.Response:
+    from bot.matching.market_matcher import normalize_name
+    from bot.models import Match
+
+    q = (request.query.get("q") or "").strip()
+    with db_session() as db:
+        if q:
+            norm = normalize_name(q)
+            found = db.execute(
+                select(Player).where(Player.normalized_name.ilike(f"%{norm}%"))
+                .limit(60)).scalars().all()
+            ids = [p.id for p in found]
+            counts = dict(db.execute(
+                select(Match.winner_id, func.count()).where(
+                    Match.winner_id.in_(ids)).group_by(Match.winner_id)).all()) \
+                if ids else {}
+            losses = dict(db.execute(
+                select(Match.loser_id, func.count()).where(
+                    Match.loser_id.in_(ids)).group_by(Match.loser_id)).all()) \
+                if ids else {}
+            plist = [(p, counts.get(p.id, 0), losses.get(p.id, 0)) for p in found]
+            plist.sort(key=lambda t: t[1] + t[2], reverse=True)
+            heading = f'results for "{q}"'
+        else:
+            cutoff = datetime.now(timezone.utc).date() - timedelta(days=45)
+            active = db.execute(
+                select(Player, func.count(Match.id).label("n"))
+                .join(Match, ((Match.winner_id == Player.id)
+                              | (Match.loser_id == Player.id)))
+                .where(Match.match_date >= cutoff, Match.is_duplicate.is_(False))
+                .group_by(Player.id).order_by(func.count(Match.id).desc())
+                .limit(50)).all()
+            plist = [(p, n, None) for p, n in active]
+            heading = "most active, last 45 days"
+    rows = []
+    for p, w, l in plist:
+        rec = f"{w}-{l}" if l is not None else f"{w} matches"
+        rows.append(f"""<tr>
+<td><a href="/player/{p.id}" style="text-decoration:none">
+<span class="pname">{esc(p.full_name)}</span></a></td>
+<td>{tag('neutral', '·', p.tour.upper())}</td>
+<td class="mono sub2">{esc(p.ioc or '—')}</td>
+<td class="mono">{rec}</td>
+<td class="mono sub2">{esc(p.hand or '—')}</td></tr>""")
+    body = pagehead("Database", "Players", heading) + f"""
+<form method="get" action="/players" style="margin:0 0 18px">
+<input name="q" value="{esc(q)}" placeholder="Search any ATP / WTA / ITF player…"
+ style="width:100%;max-width:480px;background:var(--surface);border:1px solid var(--divider);
+ color:var(--text);font:inherit;padding:10px 14px" autofocus></form>
+<div class="tw"><table class="t">
+<tr><th>player</th><th>tour</th><th>country</th><th>record in DB</th><th>hand</th></tr>
+{''.join(rows) or '<tr><td colspan="5" class="empty">No players matched.</td></tr>'}
+</table></div>
+<p class="prose" style="margin-top:12px">137,000+ players indexed from 2022 on:
+every ATP and WTA tour match, qualifying, Challengers, and men's + women's ITF.
+Click a player for the full play script.</p>"""
+    return web.Response(text=page("Players", "players", body), content_type="text/html")
+
+
+async def player_detail(request: web.Request) -> web.Response:
+    from bot.models import Match
+    from bot.stats.profile import build_profile, compute_set_rates, load_history
+
+    pid = int(request.match_info["pid"])
+    as_of = datetime.now(timezone.utc).date() + timedelta(days=1)
+    with db_session() as db:
+        p = db.get(Player, pid)
+        if p is None:
+            return web.Response(status=404, text="no such player")
+        history = load_history(db, pid)
+        prof = build_profile(db, pid, as_of)
+        set_rates = compute_set_rates(history, as_of)
+        opp = Player.__table__.alias()
+        recent = db.execute(
+            select(Match, Player.full_name, Player.id)
+            .join(Player, Player.id == func.coalesce(
+                func.nullif(Match.winner_id, pid), Match.loser_id))
+            .where(((Match.winner_id == pid) | (Match.loser_id == pid)),
+                   Match.is_duplicate.is_(False),
+                   Match.outcome.in_(("completed", "ret", "def")))
+            .order_by(Match.match_date.desc()).limit(20)).all()
+
+    f, d, t = prof.form, prof.deciding, prof.trajectory
+    age = ""
+    if p.dob:
+        age = f" · {int((datetime.now(timezone.utc).date() - p.dob).days / 365.25)}y"
+    strip = statstrip([
+        ("Career", f"{f.win_rate_career.wins}-{f.win_rate_career.losses}"
+         if f.win_rate_career.wins is not None else "—",
+         f"{f.win_rate_career.value:.0%} win rate" if f.win_rate_career.value else ""),
+        ("Past year", f"{f.win_rate_365.wins}-{f.win_rate_365.losses}"
+         if f.win_rate_365.wins is not None else "—",
+         f"{f.win_rate_365.value:.0%}" if f.win_rate_365.value else ""),
+        ("Streak", (f"W{f.streak}" if f.streak > 0 else f"L{abs(f.streak)}")
+         if f.streak else "—", ""),
+        ("Deciders", f"{d.best.wins}-{d.best.losses}" if not d.best.is_omitted else "—",
+         f"{d.best.value:.0%} · {'past year' if 'last365' in d.best.window else 'career'}"
+         if d.best.value is not None else "insufficient sample"),
+        ("Skunk share", f"{d.skunk_share_of_wins_365.value:.0%}"
+         if not d.skunk_share_of_wins_365.is_omitted
+         and d.skunk_share_of_wins_365.value is not None else "—",
+         "of last-year wins were straight-sets"),
+        ("Form 60d vs 180d", f"{t.delta:+.0%}" if t.delta is not None else "—",
+         f"{t.last60.value:.0%} vs {t.last180.value:.0%}"
+         if t.last60.value is not None and t.last180.value is not None else ""),
+    ])
+    sr_cells = "".join(
+        f'<div class="metric"><div class="k">set {n} win rate</div>'
+        f'<div class="v mono">{_rate_cell(s)}</div></div>'
+        for n, s in sorted(set_rates.items()) if n <= 3)
+    surf_rows = "".join(
+        f"<tr><td>{esc(s.surface)}</td><td class='mono'>{_rate_cell(s.last365)}</td>"
+        f"<td class='mono'>{_rate_cell(s.career)}</td></tr>" for s in prof.surfaces)
+    dec_seq = " ".join(("<span style='color:var(--good)'>W</span>"
+                        if r["won"] else "<span style='color:var(--accent)'>L</span>")
+                       for r in d.last_n_results) or "—"
+    m_rows = []
+    for m, opp_name, opp_id in recent:
+        won = m.winner_id == pid
+        m_rows.append(f"""<tr>
+<td class="mono sub2">{m.match_date}</td>
+<td>{tag('good', '✓', 'W') if won else tag('accent', '✕', 'L')}</td>
+<td><a href="/player/{opp_id}" style="text-decoration:none">
+<span class="pname">{esc(opp_name)}</span></a></td>
+<td class="mono">{esc(m.score_raw or m.outcome)}</td>
+<td class="sub2">{esc(m.round or '')} · {esc(m.surface or '?')} · {esc(m.tourney_level or '')}</td></tr>""")
+    body = pagehead(p.tour.upper() + (f" · {p.ioc}" if p.ioc else ""),
+                    p.full_name, f"{prof.matches_in_db} matches in DB{age}") + strip + f"""
+<section class="block"><div class="blockhead"><h4>Set-by-set profile</h4>
+<span class="aside">the gameflow backbone</span></div><div class="rule"></div>
+<div class="metric-grid" style="grid-template-columns:repeat(3,1fr)">{sr_cells or
+    '<div class="metric"><div class="k">no set data</div><div class="v">—</div></div>'}</div>
+</section>
+<section class="block"><div class="blockhead"><h4>Deciding sets</h4>
+<span class="aside">last {len(d.last_n_results)}: newest first</span></div>
+<div class="rule"></div>
+<p class="prose">Career {d.career.wins}-{d.career.losses}
+({f"{d.career.value:.0%}" if d.career.value is not None else "—"}) ·
+past year {d.last365.wins}-{d.last365.losses}
+({f"{d.last365.value:.0%}" if d.last365.value is not None else "—"}) ·
+sequence {dec_seq} ·
+days since last decider win:
+{d.days_since_decider_win if d.days_since_decider_win is not None else "—"}</p>
+</section>
+<section class="block"><div class="blockhead"><h4>Surfaces</h4></div>
+<div class="rule"></div><div class="tw"><table class="t">
+<tr><th>surface</th><th>past year</th><th>career</th></tr>
+{surf_rows or '<tr><td colspan="3" class="empty">No surface data.</td></tr>'}
+</table></div></section>
+<section class="block"><div class="blockhead"><h4>Recent matches</h4></div>
+<div class="rule"></div><div class="tw"><table class="t">
+<tr><th>date</th><th></th><th>opponent</th><th>score</th><th>context</th></tr>
+{''.join(m_rows) or '<tr><td colspan="5" class="empty">No matches.</td></tr>'}
+</table></div></section>"""
+    return web.Response(text=page(p.full_name, "players", body),
+                        content_type="text/html")
+
+
+async def match_detail(request: web.Request) -> web.Response:
+    from bot.models import Scenario
+    from bot.stats.profile import (
+        build_profile,
+        compute_matchup,
+        compute_set_rates,
+        load_history,
+    )
+
+    event_ticker = request.match_info["event"]
+    as_of = datetime.now(timezone.utc).date() + timedelta(days=1)
+    with db_session() as db:
+        sides = db.execute(select(KalshiMarket).where(
+            KalshiMarket.event_ticker == event_ticker)
+            .order_by(KalshiMarket.ticker)).scalars().all()
+        if len(sides) < 2 or any(m.player_a_id is None for m in sides[:2]):
+            return web.Response(status=404, text="match not found or unmatched")
+        a, b = sides[0], sides[1]
+        pa, pb = db.get(Player, a.player_a_id), db.get(Player, b.player_a_id)
+        hist_a, hist_b = load_history(db, pa.id), load_history(db, pb.id)
+        prof_a, prof_b = build_profile(db, pa.id, as_of), build_profile(db, pb.id, as_of)
+        sr_a, sr_b = compute_set_rates(hist_a, as_of), compute_set_rates(hist_b, as_of)
+        mu = compute_matchup(hist_a, hist_b, pb.id, pa.id, as_of, None)
+        sc = db.execute(select(Scenario).where(Scenario.event_ticker == event_ticker)
+                        .order_by(Scenario.created_for.desc())).scalars().first()
+        quotes = _latest_quotes(db, [a.ticker, b.ticker])
+        est = db.execute(select(LiveMatchState).where(
+            LiveMatchState.market_ticker.in_([a.ticker, b.ticker]))).scalars().first()
+
+    def px(m):
+        q = quotes.get(m.ticker)
+        return f"{(q[0] + q[1]) / 2:.0f}¢" if q and q[0] is not None else "—"
+
+    def profile_col(p, prof, sr):
+        f, d = prof.form, prof.deciding
+        cells = "".join(
+            f'<div class="metric"><div class="k">set {n}</div>'
+            f'<div class="v mono">{_rate_cell(s)}</div></div>'
+            for n, s in sorted(sr.items()) if n <= 3)
+        return f"""<div class="card">
+<a href="/player/{p.id}" style="text-decoration:none">
+<div class="title">{esc(p.full_name)}</div></a>
+<div class="sub2">{p.tour.upper()} · {esc(p.ioc or '')} ·
+{prof.matches_in_db} matches in DB</div>
+<div class="metric-grid" style="grid-template-columns:repeat(3,1fr)">{cells}</div>
+<div class="prose">Past year {f.win_rate_365.wins}-{f.win_rate_365.losses} ·
+last 10: {f.last10.wins}-{f.last10.losses} ·
+deciders {d.best.wins if not d.best.is_omitted else '—'}-{d.best.losses if not d.best.is_omitted else ''}
+{f"({d.best.value:.0%})" if d.best.value is not None else ""} ·
+streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if f.streak else "—"}</div>
+</div>"""
+
+    h2h_txt = f"{mu.h2h.wins}-{mu.h2h.losses}" if mu.h2h.n else "no meetings"
+    common = (f"vs {mu.common_opponent_count} common opponents: "
+              f"{pa.full_name.split()[-1]} {mu.common_opponents.wins}-{mu.common_opponents.losses}, "
+              f"{pb.full_name.split()[-1]} {mu.common_opponents_b.wins}-{mu.common_opponents_b.losses}"
+              if not mu.common_opponents.is_omitted else "")
+    state_txt = ""
+    if est:
+        state_txt = f" · estimator {est.state} ({est.confidence:.0%})"
+    scenario_html = f"""<section class="block"><div class="blockhead">
+<h4>Gameflow plan</h4><span class="aside">generated {sc.created_for}</span></div>
+<div class="rule"></div><div class="prose">{esc(sc.narrative)}</div></section>""" \
+        if sc else ""
+    body = pagehead("Match", (a.title or "").split(":")[0].replace("Will ", "")
+                    or event_ticker,
+                    f"{px(a)} / {px(b)}{state_txt}") + f"""
+<div class="cards" style="grid-template-columns:repeat(auto-fit,minmax(340px,1fr));margin-bottom:26px">
+{profile_col(pa, prof_a, sr_a)}
+{profile_col(pb, prof_b, sr_b)}
+</div>
+<section class="block"><div class="blockhead"><h4>Head to head</h4></div>
+<div class="rule"></div>
+<p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
+{f"(sets {mu.h2h_sets[0]}-{mu.h2h_sets[1]})" if mu.h2h.n else ""}.
+{esc(common)}</p></section>
+{scenario_html}
+<p class="sub2 mono">{esc(a.ticker)} · {esc(b.ticker)}</p>"""
+    return web.Response(text=page("Match", "scenarios", body), content_type="text/html")
+
+
 async def healthz(request: web.Request) -> web.Response:
     return web.json_response({"ok": True})
 
@@ -745,6 +999,9 @@ def make_app() -> web.Application:
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/testrun", testrun)
+    app.router.add_get("/players", players)
+    app.router.add_get("/player/{pid:\\d+}", player_detail)
+    app.router.add_get("/match/{event}", match_detail)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
     app.router.add_get("/report", report)

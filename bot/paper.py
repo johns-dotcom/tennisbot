@@ -36,6 +36,21 @@ PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20
 
+# Unit sizing: 1u default; 2u strong conviction; 3u EXTREMELY sparse — every
+# threshold must be extreme simultaneously. Never more than 3.
+UNITS_2 = {"prob": 0.75, "edge": 0.06, "conf": 0.75}
+UNITS_3 = {"prob": 0.82, "edge": 0.10, "conf": 0.85}
+
+
+def size_units(prob: float, edge: float, confidence: float) -> int:
+    if (prob >= UNITS_3["prob"] and edge >= UNITS_3["edge"]
+            and confidence >= UNITS_3["conf"]):
+        return 3
+    if (prob >= UNITS_2["prob"] and edge >= UNITS_2["edge"]
+            and confidence >= UNITS_2["conf"]):
+        return 2
+    return 1
+
 
 @dataclass
 class BetDecision:
@@ -44,6 +59,7 @@ class BetDecision:
     prob: float = 0.0
     edge: float = 0.0
     price_cents: int = 0
+    units: int = 1
     reason: str = ""
 
 
@@ -66,10 +82,12 @@ def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
     if best is None:
         return BetDecision(False, reason="no side clears prob+edge gates")
     side, prob, price, edge = best
+    units = size_units(prob, edge, confidence)
     return BetDecision(True, side=side, prob=round(prob, 3), edge=round(edge, 3),
-                       price_cents=price,
+                       price_cents=price, units=units,
                        reason=f"prob {prob:.0%} ≥ {PAPER_MIN_PROB:.0%}, "
-                              f"edge {edge * 100:.1f}% ≥ {PAPER_MIN_EDGE * 100:.0f}%")
+                              f"edge {edge * 100:.1f}% ≥ {PAPER_MIN_EDGE * 100:.0f}%"
+                              f"{f', {units}u conviction' if units > 1 else ''}")
 
 
 def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
@@ -86,12 +104,12 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
         market_ticker=market_ticker, player_id=player_id, side=decision.side,
         price_cents=decision.price_cents, model_prob=decision.prob,
         model_confidence=round(confidence, 3), edge=decision.edge, basis=basis,
-        tier=tier, state_at_placement=state,
+        units=max(1, min(3, decision.units)), tier=tier, state_at_placement=state,
         reasoning={**(reasoning or {}), "policy_reason": decision.reason}))
     db.commit()
     log.info("PAPER BET PLACED", event=event_ticker, side=decision.side,
              price=decision.price_cents, prob=decision.prob, edge=decision.edge,
-             basis=basis)
+             units=decision.units, basis=basis)
     return True
 
 
@@ -108,7 +126,9 @@ def settle_open_bets(db: Session) -> int:
         if outcome is None:
             continue
         bet.status = outcome if outcome in ("won", "lost") else "void"
-        bet.pnl_cents = advisory_pnl_cents(bet.side, bet.price_cents, result)
+        per_contract = advisory_pnl_cents(bet.side, bet.price_cents, result)
+        bet.pnl_cents = per_contract * (bet.units or 1) \
+            if per_contract is not None else None
         bet.settled_at = datetime.now(timezone.utc)
         n += 1
         log.info("paper bet settled", event=bet.event_ticker, outcome=bet.status,
