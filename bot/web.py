@@ -157,6 +157,35 @@ def tag(kind: str, icon: str, label: str) -> str:
     return f'<span class="tag tag-{kind}">{icon} {esc(label)}</span>'
 
 
+def kalshi_url(ticker: str) -> str:
+    """Series-board link (kalshi.com blocks fetchers, so the deep per-market
+    URL format is unverified; the series page is one click away and stable)."""
+    series = ticker.split("-")[0].lower()
+    return f"https://kalshi.com/markets/{series}"
+
+
+def kalshi_link(ticker: str) -> str:
+    return (f'<a href="{kalshi_url(ticker)}" target="_blank" rel="noopener" '
+            f'class="sub2">Kalshi ↗</a>')
+
+
+def fact_panel(adv) -> str:
+    """Expandable 'why' panel: the stored fact block + the gates it passed."""
+    fb = adv.fact_block or {}
+    facts = fb.get("facts") or []
+    rows = "".join(
+        f"<li>{esc(f.get('hint'))} <span class='sub2 mono'>"
+        f"(salience {f.get('salience', 0):.2f})</span></li>" for f in facts)
+    gates = (f"edge +{adv.edge * 100:.1f}% (≥6) · model conf "
+             f"{adv.model_confidence:.0%} · volume {adv.market_volume or '—'} · "
+             f"state conf {adv.state_confidence:.0%}"
+             f"{' · score-confirmed' if adv.state_confirmed else ''}")
+    return f"""<details style="margin-top:6px"><summary class="sub2"
+ style="cursor:pointer">why — fact block &amp; gates</summary>
+<ul class="prose" style="margin:6px 0 4px 18px;padding:0">{rows or '<li>—</li>'}</ul>
+<div class="sub2 mono">gates passed: {gates}</div></details>"""
+
+
 def state_tags(confirmed: bool, probation: bool) -> str:
     out = [tag("good", "✓", "score-confirmed") if confirmed
            else tag("warn", "≈", "inferred")]
@@ -230,14 +259,12 @@ research use · advisory only, nothing here is an order.</footer>"""
         return body + footer
     navs = "".join(
         f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
-        for href, key, label in (("/", "home", "Advisories"),
+        for href, key, label in (("/", "home", "Overview"),
+                                 ("/live", "live", "Live"),
                                  ("/scenarios", "scenarios", "Scenarios"),
                                  ("/testrun", "testrun", "Bot Testrun"),
-                                 ("/track", "track", "Track record"),
-                                 ("/live", "live", "Live"),
                                  ("/players", "players", "Database"),
-                                 ("/report", "report", "Estimator"),
-                                 ("/queue", "queue", "Review queue")))
+                                 ("/system", "system", "System")))
     dot, conn = _feed_status()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -314,13 +341,48 @@ def statstrip(items: list[tuple[str, str, str]]) -> str:
 
 
 async def home(request: web.Request) -> web.Response:
+    from bot.models import Scenario
+
+    now = datetime.now(timezone.utc)
     with db_session() as db:
         s = _summary(db)
         rows = db.execute(
             select(Advisory, Player.full_name)
             .join(Player, Player.id == Advisory.recommended_player_id, isouter=True)
-            .order_by(Advisory.created_at.desc()).limit(40)
+            .order_by(Advisory.created_at.desc()).limit(15)
         ).all()
+        live_mkts = db.execute(select(KalshiMarket).where(
+            KalshiMarket.status.in_(["active", "open"]),
+            KalshiMarket.player_a_id.is_not(None),
+            KalshiMarket.raw["_live_status"].astext == "live")
+            .limit(12)).scalars().all()
+        next_plans = db.execute(
+            select(Scenario, Player.full_name)
+            .join(Player, Player.id == Scenario.player_id, isouter=True)
+            .where(Scenario.scheduled_start > now)
+            .order_by(Scenario.scheduled_start).limit(3)).all()
+
+    live_events: dict[str, list] = {}
+    for m in live_mkts:
+        live_events.setdefault(m.event_ticker, []).append(m)
+    live_cards = "".join(
+        f'<a class="tag tag-accent" style="text-decoration:none" '
+        f'href="/match/{esc(ev)}">● '
+        f'{esc((sides[0].title or "").split(":")[0].replace("Will ", "").split(" win the ")[-1] if sides else ev)}</a>'
+        for ev, sides in list(live_events.items())[:6])
+    plan_cards = "".join(
+        f'<a class="tag tag-neutral" style="text-decoration:none" '
+        f'href="/match/{esc(sc.event_ticker)}">○ {esc((sc.facts or {}).get("match", sc.event_ticker))} '
+        f'· {pt(sc.scheduled_start)}</a>'
+        for sc, _p in next_plans)
+    overview = f"""<section class="block"><div class="blockhead">
+<h4>Right now</h4><span class="aside"><a href="/live">full board →</a></span></div>
+<div class="rule"></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+{live_cards or '<span class="sub2">no matches live</span>'}</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
+<span class="sub2">next plans:</span>
+{plan_cards or '<span class="sub2">none scheduled</span>'}</div></section>"""
     hr = f"{s['hit_rate']:.0%}" if s["hit_rate"] is not None else "—"
     lead = f"{s['avg_lead']:.0f}s" if s["avg_lead"] is not None else "—"
     strip = statstrip([
@@ -340,13 +402,14 @@ async def home(request: web.Request) -> web.Response:
         items.append(f"""<tr>
 <td class="mono sub2">{pt(adv.created_at)}</td>
 <td><span class="pname">{esc(player)}</span><br>
-<span class="mono sub2">{esc(adv.market_ticker)}</span>{prose}</td>
+<span class="mono sub2">{esc(adv.market_ticker)}</span> · {kalshi_link(adv.market_ticker)}
+{prose}{fact_panel(adv)}</td>
 <td class="mono">{adv.executable_price_cents}¢</td>
 <td class="mono" style="color:var(--accent);font-weight:800">+{adv.edge * 100:.1f}%</td>
 <td>{esc(adv.inferred_state)}<br>{state_tags(adv.state_confirmed, adv.probation)}</td>
 <td>{status}</td></tr>""")
-    body = pagehead("Signal", "Advisories",
-                    f"updated {datetime.now(PACIFIC):%H:%M:%S} PT") + strip + f"""
+    body = pagehead("Terminal", "Overview",
+                    f"updated {datetime.now(PACIFIC):%H:%M:%S} PT") + strip + overview + f"""
 <section class="block"><div class="blockhead"><h4>Feed</h4>
 <span class="aside mono">every gate must pass before a row appears here</span></div>
 <div class="rule"></div><div class="tw">
@@ -498,6 +561,7 @@ async def testrun(request: web.Request) -> web.Response:
             out.append(f"""<tr>
 <td class="mono sub2">{pt(b.created_at)}</td>
 <td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span>
+· {kalshi_link(b.market_ticker)}
 {why(b, player)}</td>
 <td class="mono">{b.price_cents}¢</td>
 <td class="mono" style="font-weight:800">{b.units or 1}u</td>
@@ -508,8 +572,40 @@ async def testrun(request: web.Request) -> web.Response:
 <td class="mono" style="text-align:right;font-weight:800">{pnl_txt}</td></tr>""")
         return "".join(out)
 
+    # pace vs the 70% month-1 target
+    if n == 0:
+        pace = "No settled bets yet — pace unknown."
+    elif win_rate >= 0.70:
+        pace = f"On target: {wins}-{n - wins} ({win_rate:.1%}) — hold above 70%."
+    else:
+        import math
+        need = math.ceil((0.70 * n - wins) / 0.30)
+        pace = (f"Below target at {win_rate:.1%}: needs {need} straight winners "
+                f"to reach 70% — the tuning breakdown below says where to look.")
+
+    # cumulative timeline with policy-version markers
+    chron = sorted([b for b, _ in settled if b.settled_at],
+                   key=lambda b: b.settled_at)
+    cum, pts = 0, []
+    vmarks, last_ver = [], None
+    for b in chron:
+        cum += (b.pnl_cents or 0)
+        pts.append((b.settled_at, cum / 100))
+        ver = (b.reasoning or {}).get("policy_version", "v1")
+        if ver != last_ver:
+            if last_ver is not None:
+                vmarks.append((b.settled_at, ver))
+            last_ver = ver
+    timeline = timeline_svg(pts, "$", vmarks)  # one contract settles at $1
+    timeline_html = f"""<section class="block"><div class="blockhead">
+<h4>Cumulative P&amp;L</h4><span class="aside">{esc(pace)}</span></div>
+<div class="rule"></div>{timeline or
+    '<p class="prose">Chart appears after the first two settlements.</p>'}
+<p class="sub2">Dashed markers = policy version changes; records before and
+after a tune are never blended silently.</p></section>"""
+
     body = pagehead("Strategy Lab", "Bot Testrun",
-                    f"{n} settled · policy iterates until 70%") + strip + f"""
+                    f'{n} settled · <a href="/track">advisory track record →</a>') + strip + timeline_html + f"""
 <p class="prose" style="margin:0 0 18px">The bot places <strong>imaginary</strong>
 one-contract bets for itself — selectively; most matches get no bet. Settled
 results are the tuning data: the policy (probability floor, edge floor,
@@ -677,6 +773,70 @@ def price_chart_svg(points: list[tuple[datetime, float]], marks: list[dict],
 </svg></div>{legend}</section>"""
 
 
+def timeline_svg(points: list[tuple[datetime, float]], unit: str,
+                 vmarks: list[tuple[datetime, str]] = ()) -> str:
+    """Cumulative-value line with vertical annotation markers (policy versions).
+    Auto y-domain; zero line emphasized when the range crosses it."""
+    if len(points) < 2:
+        return ""
+    W, H, PL, PR, PT_, PB = 860, 200, 54, 10, 12, 26
+    t0, t1 = points[0][0].timestamp(), points[-1][0].timestamp()
+    vals = [v for _, v in points]
+    lo, hi = min(min(vals), 0), max(max(vals), 0)
+    if hi == lo:
+        hi = lo + 1
+
+    def x(ts): return PL + (ts - t0) / max(t1 - t0, 1) * (W - PL - PR)
+    def y(v): return PT_ + (hi - v) / (hi - lo) * (H - PT_ - PB)
+
+    path = "M" + " L".join(f"{x(p[0].timestamp()):.1f},{y(p[1]):.1f}" for p in points)
+    zero = (f'<line x1="{PL}" y1="{y(0):.0f}" x2="{W - PR}" y2="{y(0):.0f}" '
+            f'stroke="rgba(243,242,242,.25)" stroke-width="1.5"/>'
+            f'<text x="{PL - 8}" y="{y(0) + 4:.0f}" text-anchor="end" font-size="10" '
+            f'fill="rgba(243,242,242,.45)">0{unit}</text>') if lo < 0 < hi or lo == 0 else ""
+    ymax_lbl = (f'<text x="{PL - 8}" y="{y(hi) + 4:.0f}" text-anchor="end" font-size="10" '
+                f'fill="rgba(243,242,242,.45)">{hi:+.0f}{unit}</text>')
+    vlines = "".join(
+        f'<g><title>{esc(lbl)}</title>'
+        f'<line x1="{x(ts.timestamp()):.0f}" y1="{PT_}" x2="{x(ts.timestamp()):.0f}" '
+        f'y2="{H - PB}" stroke="var(--warning)" stroke-width="1.5" stroke-dasharray="4 3"/>'
+        f'<text x="{x(ts.timestamp()) + 4:.0f}" y="{PT_ + 10}" font-size="10" '
+        f'fill="var(--warning)">{esc(lbl)}</text></g>'
+        for ts, lbl in vmarks)
+    return f"""<div class="tw"><svg viewBox="0 0 {W} {H}" role="img"
+ aria-label="cumulative {esc(unit)} over time"
+ style="width:100%;min-width:640px;display:block">
+{zero}{ymax_lbl}{vlines}
+<path d="{path}" fill="none" stroke="var(--accent)" stroke-width="2"
+ stroke-linejoin="round"/>
+</svg></div>"""
+
+
+def histogram_svg(buckets: list[tuple[str, int]], accent_note: str = "") -> str:
+    """Small labeled bar histogram (lead-time distribution)."""
+    if not buckets or all(n == 0 for _, n in buckets):
+        return ""
+    W, H, PB = 560, 130, 34
+    bw = W / len(buckets)
+    peak = max(n for _, n in buckets)
+    bars = []
+    for i, (label, n) in enumerate(buckets):
+        bh = (n / peak) * (H - PB - 14) if peak else 0
+        bx = i * bw + 8
+        bars.append(
+            f'<g><title>{esc(label)}: {n}</title>'
+            f'<rect x="{bx:.0f}" y="{H - PB - bh:.0f}" width="{bw - 16:.0f}" '
+            f'height="{bh:.0f}" fill="var(--accent)"/>'
+            f'<text x="{bx + (bw - 16) / 2:.0f}" y="{H - PB - bh - 4:.0f}" '
+            f'text-anchor="middle" font-size="11" fill="var(--text)">{n}</text>'
+            f'<text x="{bx + (bw - 16) / 2:.0f}" y="{H - PB + 14:.0f}" '
+            f'text-anchor="middle" font-size="10" '
+            f'fill="rgba(243,242,242,.5)">{esc(label)}</text></g>')
+    return (f'<div class="tw"><svg viewBox="0 0 {W} {H}" role="img" '
+            f'aria-label="distribution{esc(accent_note)}" '
+            f'style="width:100%;max-width:620px;display:block">{"".join(bars)}</svg></div>')
+
+
 def trigger_html(sc, est_state: str | None, is_live: bool,
                  watch_mid: float | None) -> str:
     """Plan-vs-reality for a gameflow scenario: armed → hit → done, with the
@@ -832,7 +992,8 @@ async def live(request: web.Request) -> web.Response:
 <div>{''.join(rows_html)}</div></a>
 {plan_row}
 <div class="sub2 mono">{'started' if is_live else 'starts'} {pt(ev['occ'])}
-· <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a></div>
+· <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a>
+· {kalshi_link(sides[0].ticker)}</div>
 </div>"""
 
     def done_card(ev_ticker: str, ev: dict) -> str:
@@ -877,51 +1038,106 @@ the board as soon as their market settles or closes on Kalshi.</p>"""
     return respond(request, "Live", "live", body)
 
 
-async def report(request: web.Request) -> web.Response:
+async def system(request: web.Request) -> web.Response:
     from bot.reports import graduate_report, inference_report
 
+    from bot.config import settings as cfg_fn
+
+    cfg = cfg_fn()
     with db_session() as db:
         text = inference_report(db)
-        grad, _ = graduate_report(db)
+        grad, grad_ok = graduate_report(db)
         gaps = db.execute(select(FeedGap).order_by(FeedGap.gap_start.desc()).limit(15)
                           ).scalars().all()
+        clean = db.execute(select(StateInferenceLog).where(
+            StateInferenceLog.session_had_gap.is_(False))).scalars().all()
+
+    n_i = len(clean)
+    hits_i = sum(1 for r in clean if r.hit)
+    hit_rate = hits_i / n_i if n_i else None
+    false_rate = (n_i - hits_i) / n_i if n_i else None
+    leads = [r.lead_time_seconds for r in clean
+             if r.hit and r.lead_time_seconds is not None]
+    avg_lead = sum(leads) / len(leads) if leads else None
+    est_strip = statstrip([
+        ("Confirmed transitions", str(n_i),
+         f"graduation needs ≥ {cfg.graduate_min_confirmed_transitions}"),
+        ("Hit rate (clean)", f"{hit_rate:.0%}" if hit_rate is not None else "—",
+         f"needs ≥ {cfg.graduate_min_hit_rate:.0%}"),
+        ("False boundaries", f"{false_rate:.0%}" if false_rate is not None else "—",
+         f"needs ≤ {cfg.graduate_max_false_boundary_rate:.0%}"),
+        ("Avg score lead", f"{avg_lead:.0f}s" if avg_lead is not None else "—",
+         "how far the bot beats the scoreboard"),
+        ("Probation", "ON" if cfg.probation else "OFF",
+         "lifts only by manual config change"),
+    ])
+    prog = min(1.0, n_i / cfg.graduate_min_confirmed_transitions)
+    checks = [
+        (n_i >= cfg.graduate_min_confirmed_transitions,
+         f"{n_i}/{cfg.graduate_min_confirmed_transitions} transitions"),
+        (hit_rate is not None and hit_rate >= cfg.graduate_min_hit_rate,
+         f"hit rate {hit_rate:.0%}" if hit_rate is not None else "hit rate —"),
+        (false_rate is not None and false_rate <= cfg.graduate_max_false_boundary_rate,
+         f"false rate {false_rate:.0%}" if false_rate is not None else "false rate —"),
+    ]
+    check_tags = " ".join(tag("good" if ok else "neutral", "✓" if ok else "○", lbl)
+                          for ok, lbl in checks)
+    grad_html = f"""<section class="block"><div class="blockhead">
+<h4>Graduation progress</h4>
+<span class="aside">{'ALL THRESHOLDS MET — manual flip is now allowed' if grad_ok
+ else 'probation continues until every check passes'}</span></div>
+<div class="rule"></div>
+<div style="height:10px;background:var(--surface);border:1px solid var(--divider)">
+<div style="height:100%;width:{prog:.0%};background:var(--accent)"></div></div>
+<p style="margin:8px 0 0">{check_tags}</p></section>"""
+    buckets = [("<30s", 0), ("30-60s", 0), ("1-2m", 0), ("2-4m", 0), ("4m+", 0)]
+    bl = [b[1] for b in buckets]
+    for v in leads:
+        i = 0 if v < 30 else 1 if v < 60 else 2 if v < 120 else 3 if v < 240 else 4
+        bl[i] += 1
+    buckets = [(buckets[i][0], bl[i]) for i in range(5)]
+    lead_html = f"""<section class="block"><div class="blockhead">
+<h4>Lead-time distribution</h4><span class="aside">seconds the estimator beat
+the delayed score, confirmed inferences only</span></div>
+<div class="rule"></div>{histogram_svg(buckets, " of score lead times") or
+    '<p class="prose">Appears once confirmed inferences accumulate.</p>'}</section>"""
     gap_rows = "".join(
         f"<tr><td class='mono sub2'>{esc(g.market_ticker)}</td><td class='mono'>{pt(g.gap_start)}</td>"
         f"<td class='mono'>{g.duration_seconds or 0:.0f}s</td></tr>" for g in gaps)
-    body = pagehead("Accountability", "Estimator") + f"""
-<section class="block"><div class="blockhead"><h4>Inference report</h4></div>
-<div class="rule"></div><pre class="report">{esc(text)}</pre></section>
-<section class="block"><div class="blockhead"><h4>Graduation check</h4>
-<span class="aside">probation lifts only by manual config change</span></div>
-<div class="rule"></div><pre class="report">{esc(grad)}</pre></section>
+    with db_session() as db:
+        qrows = db.execute(select(MatchReviewQueue).where(
+            MatchReviewQueue.resolved.is_(False))
+            .order_by(MatchReviewQueue.created_at.desc()).limit(100)).scalars().all()
+    qitems = "".join(
+        f"<tr><td class='pname'>{esc(r.raw_name)}</td><td>{esc(r.source)}</td>"
+        f"<td class='sub2'>{esc((r.context or {}).get('reason'))}</td>"
+        f"<td class='mono sub2'>{esc((r.context or {}).get('ticker', ''))}</td>"
+        f"<td class='mono sub2'>{pt(r.created_at)}</td></tr>" for r in qrows)
+    queue_html = f"""<section class="block"><div class="blockhead">
+<h4>Review queue — unmatched names ({len(qrows)})</h4>
+<span class="aside">never silently dropped</span></div>
+<div class="rule"></div><div class="tw">
+<table class="t"><tr><th>name</th><th>source</th><th>reason</th><th>market</th><th>queued</th></tr>
+{qitems or '<tr><td colspan="5" class="empty">Queue is empty.</td></tr>'}
+</table></div>
+<p class="prose" style="margin-top:10px">Resolve by inserting a row into
+<span class="mono">player_aliases</span> (alias_normalized → player_id) and
+marking the queue row resolved.</p></section>"""
+    body = pagehead("System", "Estimator & Data Health") + est_strip + grad_html + lead_html + f"""
+<details class="block"><summary class="sub2" style="cursor:pointer">raw reports</summary>
+<pre class="report" style="margin-top:8px">{esc(text)}
+
+{esc(grad)}</pre></details>
 <section class="block"><div class="blockhead"><h4>Recent feed gaps</h4></div>
 <div class="rule"></div><div class="tw"><table class="t">
 <tr><th>market</th><th>start</th><th>duration</th></tr>
 {gap_rows or '<tr><td colspan="3" class="empty">None recorded.</td></tr>'}
-</table></div></section>"""
-    return respond(request, "Estimator", "report", body)
+</table></div></section>""" + queue_html
+    return respond(request, "System", "system", body)
 
 
-async def queue(request: web.Request) -> web.Response:
-    with db_session() as db:
-        rows = db.execute(select(MatchReviewQueue).where(
-            MatchReviewQueue.resolved.is_(False))
-            .order_by(MatchReviewQueue.created_at.desc()).limit(100)).scalars().all()
-    items = "".join(
-        f"<tr><td class='pname'>{esc(r.raw_name)}</td><td>{esc(r.source)}</td>"
-        f"<td class='sub2'>{esc((r.context or {}).get('reason'))}</td>"
-        f"<td class='mono sub2'>{esc((r.context or {}).get('ticker', ''))}</td>"
-        f"<td class='mono sub2'>{pt(r.created_at)}</td></tr>" for r in rows)
-    body = pagehead("Data Hygiene", "Review Queue", f"{len(rows)} unmatched names") + f"""
-<section class="block"><div class="rule"></div><div class="tw">
-<table class="t"><tr><th>name</th><th>source</th><th>reason</th><th>market</th><th>queued</th></tr>
-{items or '<tr><td colspan="5" class="empty">Queue is empty.</td></tr>'}
-</table></div>
-<p class="prose" style="margin-top:10px">Resolve by inserting a row into
-<span class="mono">player_aliases</span> (alias_normalized → player_id) and
-marking the queue row resolved. Unmatched names are never silently dropped.</p>
-</section>"""
-    return respond(request, "Review queue", "queue", body)
+async def legacy_redirect(request: web.Request) -> web.Response:
+    raise web.HTTPFound("/system")
 
 
 def _rate_cell(stat) -> str:
@@ -1290,8 +1506,9 @@ def make_app() -> web.Application:
     app.router.add_get("/api/events", api_events)
     app.router.add_get("/track", track)
     app.router.add_get("/live", live)
-    app.router.add_get("/report", report)
-    app.router.add_get("/queue", queue)
+    app.router.add_get("/system", system)
+    app.router.add_get("/report", legacy_redirect)
+    app.router.add_get("/queue", legacy_redirect)
     app.router.add_get("/healthz", healthz)
     return app
 

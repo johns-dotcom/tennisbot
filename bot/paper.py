@@ -30,6 +30,10 @@ from bot.track import advisory_outcome, advisory_pnl_cents
 
 log = get_logger("paper")
 
+# bump whenever any threshold below changes — the testrun timeline annotates
+# version changes so before/after records never blend silently
+POLICY_VERSION = "v1"
+
 PAPER_MIN_PROB = 0.68
 PAPER_MIN_EDGE = 0.03
 PAPER_MIN_CONF = 0.60
@@ -105,7 +109,8 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
         price_cents=decision.price_cents, model_prob=decision.prob,
         model_confidence=round(confidence, 3), edge=decision.edge, basis=basis,
         units=max(1, min(3, decision.units)), tier=tier, state_at_placement=state,
-        reasoning={**(reasoning or {}), "policy_reason": decision.reason}))
+        reasoning={**(reasoning or {}), "policy_reason": decision.reason,
+                   "policy_version": POLICY_VERSION}))
     db.commit()
     log.info("PAPER BET PLACED", event=event_ticker, side=decision.side,
              price=decision.price_cents, prob=decision.prob, edge=decision.edge,
