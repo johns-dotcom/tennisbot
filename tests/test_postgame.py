@@ -16,11 +16,12 @@ def test_won_straight_sets():
 
 
 def test_lost_but_salvaged_by_take_profit():
-    # backed YES, lost, but our side touched 90 mid-match -> TP salvages
+    # backed YES, lost, but our side touched 90 mid-match -> TP salvages.
+    # $10/unit: tp_pnl 35c -> +$3.50, hold loss 55c -> $5.50
     a = postgame_analysis("Rune", "Sinner", "yes", "no", "6-4 3-6 4-6", 1, 2,
                           True, 55, -55, "took_profit", 35, -2, "Rune is the play")
     assert "led first" in a and "take-profit salvaged" in a
-    assert "+35" in a and "−55" in a
+    assert "$3.50" in a and "$5.50" in a
 
 
 def test_no_scoreline_returns_empty():

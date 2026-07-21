@@ -512,6 +512,13 @@ engine still applies every gate before any advisory fires.</p>
 
 
 TP_LIMIT = 90  # take-profit limit price (cents) for the TP variant
+USD_PER_UNIT = 10  # a testrun "unit" of stake = $10 (i.e. 10 Kalshi contracts)
+
+
+def dol(pnl_cents) -> float:
+    """Convert a paper-bet P&L (cents at 1 contract per unit) to dollars under
+    the $10-per-unit convention."""
+    return pnl_cents * USD_PER_UNIT / 100.0
 
 
 def _tp_effective(b, result, touched90):
@@ -591,14 +598,16 @@ def postgame_analysis(pick: str, opp: str, side: str, result: str | None,
     else:
         S.append(f"<strong>Missed.</strong> {pick} lost {line}.")
 
-    if not won and touched90 and tp_pnl is not None:
+    if not won and touched90 and tp_pnl is not None and hold_pnl is not None:
         S.append(f"But {pick} led first — our side traded up to {TP_LIMIT}¢ before "
                  f"the reversal, so the {TP_LIMIT}¢ take-profit salvaged "
-                 f"+{tp_pnl}¢ here where holding took the full −{price_cents}¢.")
+                 f"+${dol(tp_pnl):.2f} here where holding took a "
+                 f"${dol(abs(hold_pnl)):.2f} loss.")
     elif won and tp_status == "took_profit" and hold_pnl is not None \
             and tp_pnl is not None and tp_pnl < hold_pnl:
-        S.append(f"Hold banked +{hold_pnl}¢; the {TP_LIMIT}¢ exit capped at "
-                 f"+{tp_pnl}¢ — ~{hold_pnl - tp_pnl}¢ given up for the early lock-in.")
+        S.append(f"Hold banked +${dol(hold_pnl):.2f}; the {TP_LIMIT}¢ exit capped "
+                 f"at +${dol(tp_pnl):.2f} — ~${dol(hold_pnl - tp_pnl):.2f} left on "
+                 f"the table for the early lock-in.")
 
     if thesis:
         first = thesis.split(". ")[0]
@@ -734,8 +743,8 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         ("Record", f"{wins}-{n - wins}" if n else "0-0", f"{len(open_bets)} open"),
         ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
          "target 70% by month 1"),
-        ("Profit ($)", f'<span style="color:{pcolor}">{pnl / 100:+.2f}</span>' if n else "—",
-         "1 contract per unit"),
+        ("Profit ($)", f'<span style="color:{pcolor}">{dol(pnl):+.2f}</span>' if n else "—",
+         "$10 per unit"),
         ("Profit (units)", f'<span style="color:{pcolor}">{profit_units:+.2f}u</span>' if n else "—",
          "profit ÷ stake, unit-weighted"),
         ("ROI", f"{pnl / staked:+.1%}" if staked else "—", f"{days}d running"),
@@ -746,7 +755,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         (("90¢" if not is_tp else "Hold") + " · record",
          f"{ow}-{ol}", "same picks, other exit"),
         (("90¢" if not is_tp else "Hold") + " · profit",
-         f'<span style="color:{"var(--good)" if opc > 0 else "var(--accent)" if opc < 0 else "var(--text)"}">{opc / 100:+.2f}</span>'
+         f'<span style="color:{"var(--good)" if opc > 0 else "var(--accent)" if opc < 0 else "var(--text)"}">{dol(opc):+.2f}</span>'
          if (ow + ol) else "—", "on the same finished matches"),
     ])(*mode_stats(not is_tp)), cols=4)
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
@@ -796,7 +805,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                   "lost": tag("accent", "✕", "lost"),
                   "void": tag("neutral", "·", "void"),
                   "open": tag("warn", "…", "open")}[st]
-            pnl_txt = f"{pc:+d}¢" if pc is not None else "—"
+            pnl_txt = f"${dol(pc):+.2f}" if pc is not None else "—"
             match = (b.reasoning or {}).get("match", b.event_ticker)
             out.append(f"""<tr>
 <td class="mono sub2">{pt(b.created_at)}</td>
@@ -831,7 +840,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         cum, series, vm, last = 0, [], [], None
         for b in chron:
             cum += cmp_out(b, tp)
-            series.append((b.settled_at, cum / 100))
+            series.append((b.settled_at, dol(cum)))
             ver = (b.reasoning or {}).get("policy_version", "v1")
             if ver != last:
                 if last is not None:
@@ -993,7 +1002,7 @@ justify-content:space-between;gap:12px">
 <th style="text-align:right">Take-Profit</th><th style="text-align:right">Δ</th></tr>
 {drow("record", f"{hw}-{hl}", f"{tw}-{tl}", f"{tw - hw:+d}W", "var(--muted)")}
 {drow("win rate", wr(hw, hw + hl), wr(tw, tw + tl), f"{(tw/(tw+tl) if (tw+tl) else 0) - (hw/(hw+hl) if (hw+hl) else 0):+.0%}")}
-{drow("profit ($)", f"{hpc / 100:+.2f}", f"{tpc / 100:+.2f}", f"{d_pnl / 100:+.2f}")}
+{drow("profit ($)", f"{dol(hpc):+.2f}", f"{dol(tpc):+.2f}", f"{dol(d_pnl):+.2f}")}
 {drow("profit (units)", f"{hun:+.2f}u", f"{tun:+.2f}u", f"{d_un:+.2f}u")}
 {drow("ROI", roi(hroi), roi(troi), f"{(troi - hroi):+.1%}" if hroi is not None and troi is not None else "—")}
 </table>"""
@@ -1004,7 +1013,7 @@ justify-content:space-between;gap:12px">
 <div class="rule"></div>
 <div class="tw">{table}</div>
 <p class="prose" style="margin-top:10px"><strong>{verdict}</strong> by
-{abs(net) / 100:+.2f} on these {nfin} matches. Why they differ: take-profit
+{dol(abs(net)):+.2f} on these {nfin} matches. Why they differ: take-profit
 <strong>salvaged {salv_n}</strong> lead(s) that reversed (+{salv / 100:.2f}, the
 limit banked ~90¢ before the collapse) and <strong>capped {cap_n}</strong> clean
 winner(s) at 90¢ ({cap / 100:.2f}, giving up ~10¢ each vs holding to 100¢).
@@ -1017,8 +1026,9 @@ the Cumulative P&amp;L chart above.</p>
     title = "Bot Testrun"
     active = "testrun"
     exit_note = f"""<p class="prose" style="margin:0 0 18px">The bot places
-<strong>imaginary</strong> one-contract bets for itself — selectively; most
-matches get no bet. The headline record holds every bet to settlement
+<strong>imaginary</strong> bets for itself at <strong>$10 per unit</strong>
+(1–3 units) — selectively; most matches get no bet. The headline record holds
+every bet to settlement
 (100¢/0¢); the <strong>{TP_LIMIT}¢ take-profit</strong> variant below runs the
 <em>same</em> picks with a limit sell at {TP_LIMIT}¢ — banking {TP_LIMIT}¢ on
 winners but salvaging leads that later collapse. Both exits are tracked and
@@ -1108,8 +1118,7 @@ async def testrun_history(request: web.Request) -> web.Response:
         badge = tag("good", "✓", "won") if o == "won" else tag("accent", "✕", "lost")
         pc = lambda v: ("var(--good)" if (v or 0) > 0 else
                         "var(--accent)" if (v or 0) < 0 else "var(--muted)")
-        tp_txt = (f"+{tp_pnl}¢" if tp_status == "took_profit" else
-                  f"{tp_pnl:+d}¢" if tp_pnl is not None else "—")
+        tp_txt = f"${dol(tp_pnl):+.2f}" if tp_pnl is not None else "—"
         entries.append(f"""<div style="padding:14px 0;border-top:1px solid var(--divider)">
 <div class="blockhead"><h4 style="font-size:16px">{esc(player or pick)} {badge}
 <span class="mono sub2" style="font-weight:400">{esc(line or '—')}</span></h4>
@@ -1117,7 +1126,7 @@ async def testrun_history(request: web.Request) -> web.Response:
 {analysis}
 <div class="metric-grid" style="grid-template-columns:repeat(4,1fr);margin-top:8px">
 <div class="metric"><div class="k">bet</div><div class="v mono">{esc(b.side)} @ {b.price_cents}¢ · {b.units or 1}u</div></div>
-<div class="metric"><div class="k">hold P&amp;L</div><div class="v mono" style="color:{pc(b.pnl_cents)}">{f'{b.pnl_cents:+d}¢' if b.pnl_cents is not None else '—'}</div></div>
+<div class="metric"><div class="k">hold P&amp;L</div><div class="v mono" style="color:{pc(b.pnl_cents)}">{f'${dol(b.pnl_cents):+.2f}' if b.pnl_cents is not None else '—'}</div></div>
 <div class="metric"><div class="k">90¢ take-profit</div><div class="v mono" style="color:{pc(tp_pnl)}">{tp_txt}</div></div>
 <div class="metric"><div class="k">CLV</div><div class="v mono" style="color:{pc(clv)}">{f'{clv:+d}¢' if clv is not None else '—'}</div></div>
 </div>
