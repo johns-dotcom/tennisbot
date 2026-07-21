@@ -35,24 +35,25 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v5"  # v5: continuous confidence-driven decimal unit sizing
+POLICY_VERSION = "v6"  # v6: floor re-based to the recalibrated probability scale
 
-# v4 selectivity (from the CLV/edge dig on 54 settled bets): the bot was betting
-# ~indiscriminately (54 in ~1.5 days) and the losers were concentrated in three
-# buckets, so we simply stop betting them:
-#   - model < 82%      → skip. The 68-82% band won only ~57% and lost money;
-#     82-90% was the only well-calibrated, profitable band.
-#   - edge > 15%       → skip. 15-30% went ~50%, >30% went ~38% — a huge "edge"
-#     is model error / a stale quote, not value (was merely down-sized in v2).
-#   - Challenger tier  → demoted: needs a stronger favorite (>=86%) to bet, since
-#     the tier ran 50% overall.
-PAPER_MIN_PROB = 0.82
+# v6 — why the floor came back down. v4 set an 82% floor because the 68-82% band
+# won only ~57%; but that was OVERCONFIDENCE, and v3 fixed it by recalibrating
+# the model (PLATT_A 1.65→1.437), which SHRANK every probability. Keeping the
+# 82% floor on the recalibrated scale double-counted the same fix: it rejected
+# ~all opportunities (a "high-prob favorite WITH positive edge" is rare — the
+# market prices favorites efficiently), so the bots placed almost nothing. v6
+# restores a floor of 0.68 on the now-honest scale (a recalibrated 0.68 genuinely
+# wins ~0.68), while KEEPING v4's still-valid guards:
+#   - edge > 15%      → skip (model error / stale quote, not value)
+#   - Challenger tier → demoted, needs a stronger favorite (>=72%)
+PAPER_MIN_PROB = 0.68
 PAPER_MIN_EDGE = 0.03
 PAPER_MAX_EDGE = 0.15
 PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20
-CHALLENGER_MIN_PROB = 0.86
+CHALLENGER_MIN_PROB = 0.72
 
 # kept for sizing (multi-unit requires a believable edge, not an outlier)
 EDGE_SANE_MAX = PAPER_MAX_EDGE

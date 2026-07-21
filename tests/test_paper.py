@@ -30,31 +30,29 @@ def test_no_bet_on_low_confidence():
     assert not d.place and "confidence" in d.reason
 
 
-# --- v4 selectivity ------------------------------------------------------
+# --- v6 selectivity (floor re-based to the recalibrated scale) -----------
 
-def test_v4_probability_floor_is_the_calibrated_band():
-    assert PAPER_MIN_PROB >= 0.82
-    # 78% favorite with a big edge is now skipped — below the calibrated band
-    d = decide_bet(p_yes=0.78, confidence=0.9, yes_ask=60, yes_bid=58)
-    assert not d.place
-
-
-def test_v4_skips_big_edges_entirely():
-    # the Kayo Nishimura case: 90% model vs 65¢ = +25% edge. v2 sized it 1u;
-    # v4 skips it outright (edge > 15% is model error, not value).
-    d = decide_bet(p_yes=0.90, confidence=1.0, yes_ask=65, yes_bid=63)
-    assert not d.place
+def test_v6_floor_is_a_favorite_band_not_a_coinflip():
+    # v6 floor is 0.68 (recalibrated & honest); a 78% favorite with value now
+    # clears, but a coin-flip / underdog is still skipped (record-focused)
+    assert 0.65 <= PAPER_MIN_PROB <= 0.75
+    assert decide_bet(p_yes=0.78, confidence=0.9, yes_ask=70, yes_bid=68).place
+    assert not decide_bet(p_yes=0.55, confidence=0.9, yes_ask=42, yes_bid=40).place
 
 
-def test_v4_challenger_is_demoted():
-    # 83% favorite: clears the general 82% floor, but not the Challenger 86% bar
-    ok = decide_bet(p_yes=0.83, confidence=0.9, yes_ask=72, yes_bid=70)
-    assert ok.place
-    chal = decide_bet(p_yes=0.83, confidence=0.9, yes_ask=72, yes_bid=70, tier="C")
-    assert not chal.place
+def test_v6_skips_big_edges_entirely():
+    # the Kayo Nishimura case: 90% model vs 65¢ = +25% edge — skipped (>15%)
+    assert not decide_bet(p_yes=0.90, confidence=1.0, yes_ask=65, yes_bid=63).place
+
+
+def test_v6_challenger_is_demoted():
+    # 70% favorite clears the general 68% floor but not the Challenger 72% bar
+    assert decide_bet(p_yes=0.70, confidence=0.9, yes_ask=65, yes_bid=63).place
+    assert not decide_bet(p_yes=0.70, confidence=0.9, yes_ask=65, yes_bid=63,
+                          tier="C").place
     # a stronger Challenger favorite still clears
-    strong = decide_bet(p_yes=0.88, confidence=0.9, yes_ask=78, yes_bid=76, tier="C")
-    assert strong.place
+    assert decide_bet(p_yes=0.78, confidence=0.9, yes_ask=70, yes_bid=68,
+                      tier="C").place
 
 
 def test_sizing_is_continuous_confidence_driven_and_sparing():
@@ -66,12 +64,12 @@ def test_sizing_is_continuous_confidence_driven_and_sparing():
     # monotone in probability (more confidence the pick wins → bigger stake)
     assert (size_units(0.85, 0.05, 1.0) < size_units(0.90, 0.05, 1.0)
             < size_units(0.95, 0.05, 1.0) <= MAX_UNITS)
-    # multi-unit is sparing: a middling calibrated favorite stays near 1u
-    assert size_units(0.85, 0.05, 1.0) < 1.5
+    # multi-unit is sparing: a near-floor favorite stays close to 1u
+    assert size_units(0.70, 0.05, 1.0) < 1.3
     # gated by data depth: thin data shrinks the same strong pick toward 1u
     assert size_units(0.93, 0.05, 0.62) < size_units(0.93, 0.05, 1.0)
     # floor and cap, and a suspicious edge is never pressed
-    assert size_units(0.82, 0.03, 0.60) == 1.0
+    assert size_units(0.68, 0.03, 0.60) == 1.0
     assert size_units(0.99, 0.05, 1.0) == MAX_UNITS
     assert size_units(0.95, 0.25, 1.0) == 1.0
 
@@ -81,10 +79,10 @@ def test_shared_gate_used_by_both_paths():
     from bot.paper import policy_ok
 
     assert policy_ok(0.85, 0.10, 75, None)
-    assert not policy_ok(0.80, 0.10, 75, None)      # below 82% floor
+    assert not policy_ok(0.60, 0.10, 70, None)      # below 68% floor
     assert not policy_ok(0.90, 0.25, 65, None)      # edge > 15%
-    assert not policy_ok(0.85, 0.10, 75, "C")       # Challenger needs 86%
-    assert policy_ok(0.88, 0.10, 78, "C")
+    assert not policy_ok(0.70, 0.05, 65, "C")       # Challenger needs 72%
+    assert policy_ok(0.75, 0.05, 70, "C")
 
 
 def test_policy_parameterization_changes_the_gate():
@@ -92,10 +90,10 @@ def test_policy_parameterization_changes_the_gate():
     # bet the default policy would reject — proving both bots share one gate
     from bot.paper import DEFAULT_POLICY, decide_bet
     from dataclasses import replace
-    loose = replace(DEFAULT_POLICY, min_prob=0.75, version="t2.3")
-    # 78% favorite at 70¢ = 8% edge: below the 82% default floor, above 75%
-    assert not decide_bet(0.78, 0.9, 70, 68).place
-    assert decide_bet(0.78, 0.9, 70, 68, policy=loose).place
+    loose = replace(DEFAULT_POLICY, min_prob=0.60, version="t2.3")
+    # 63% favorite at 58¢ = 5% edge: below the 68% default floor, above 60%
+    assert not decide_bet(0.63, 0.9, 58, 56).place
+    assert decide_bet(0.63, 0.9, 58, 56, policy=loose).place
     # a tighter policy rejects a bet the default would take, naming its version
     tight = replace(DEFAULT_POLICY, min_prob=0.90, version="t2.7")
     rej = decide_bet(0.85, 0.9, 75, 73, policy=tight)
