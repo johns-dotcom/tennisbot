@@ -894,6 +894,10 @@ version changes; records before and after a tune are never blended silently.</p>
     # --- Watching: matches the policy is currently evaluating ---
     from bot.models import Scenario
     from bot.paper import decide_bet
+    from bot.scenarios import SERIES_TIER
+
+    def _tier_of(ticker: str) -> str:
+        return next((t for s, t in SERIES_TIER.items() if ticker.startswith(s)), "15")
 
     now = datetime.now(timezone.utc)
     with db_session() as db:
@@ -924,7 +928,8 @@ version changes; records before and after a tune are never blended silently.</p>
         q = quotes.get(sc.market_ticker)
         yb, ya = (q[0], q[1]) if q else (None, None)
         conf = (sc.facts or {}).get("model_confidence", 0.7)
-        dec = decide_bet(sc.prematch_prob, conf, ya, yb)
+        dec = decide_bet(sc.prematch_prob, conf, ya, yb,
+                         tier=_tier_of(sc.market_ticker))
         price = ya if ya is not None else "—"
         if dec.place:
             verdict = tag("good", "✓", f"clears — {dec.units}u candidate")

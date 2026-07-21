@@ -35,23 +35,40 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v3"  # v3: model recalibrated (PLATT_A 1.65→1.437, less overconfident)
+POLICY_VERSION = "v4"  # v4: selectivity — only the calibrated band, sane edges
 
-PAPER_MIN_PROB = 0.68
+# v4 selectivity (from the CLV/edge dig on 54 settled bets): the bot was betting
+# ~indiscriminately (54 in ~1.5 days) and the losers were concentrated in three
+# buckets, so we simply stop betting them:
+#   - model < 82%      → skip. The 68-82% band won only ~57% and lost money;
+#     82-90% was the only well-calibrated, profitable band.
+#   - edge > 15%       → skip. 15-30% went ~50%, >30% went ~38% — a huge "edge"
+#     is model error / a stale quote, not value (was merely down-sized in v2).
+#   - Challenger tier  → demoted: needs a stronger favorite (>=86%) to bet, since
+#     the tier ran 50% overall.
+PAPER_MIN_PROB = 0.82
 PAPER_MIN_EDGE = 0.03
+PAPER_MAX_EDGE = 0.15
 PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20
+CHALLENGER_MIN_PROB = 0.86
 
-# Quality over quantity (v2): an implausibly large edge at a mid price is far
-# more likely model overconfidence or a stale/thin quote than genuine value, so
-# a big edge is a CAUTION flag, not a reason to press.
-#   - edge above EDGE_SANE_MAX  → never upsize past 1u (don't chase model error)
-#   - edge above EDGE_SUSPECT   → don't bet at all (looks like a data problem)
-# Real conviction (2u/3u) is reserved for well-supported favorites whose edge is
-# in a believable band, not for outliers.
-EDGE_SANE_MAX = 0.15
-EDGE_SUSPECT = 0.30
+# kept for sizing (2u/3u require a believable edge band, not an outlier)
+EDGE_SANE_MAX = PAPER_MAX_EDGE
+
+
+def tier_prob_floor(tier: str | None) -> float:
+    """Challenger is demoted — it needs a stronger favorite to clear."""
+    return CHALLENGER_MIN_PROB if tier == "C" else PAPER_MIN_PROB
+
+
+def policy_ok(prob: float, edge: float, price: int, tier: str | None) -> bool:
+    """The single v4 gate, shared by the prematch and advisory bet paths so they
+    can never drift: calibrated-band favorite, sane edge, sane price."""
+    return (prob >= tier_prob_floor(tier)
+            and PAPER_MIN_EDGE <= edge <= PAPER_MAX_EDGE
+            and PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE)
 
 # Unit sizing: 1u default; 2u strong conviction; 3u EXTREMELY sparse. Every
 # threshold must be met AND the edge must be believable. Never more than 3.
@@ -84,37 +101,30 @@ class BetDecision:
 
 
 def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
-               yes_bid: int | None) -> BetDecision:
+               yes_bid: int | None, tier: str | None = None) -> BetDecision:
     """Pure policy: evaluate one market's two sides, pick at most one."""
     if yes_ask is None or yes_bid is None:
         return BetDecision(False, reason="no quote")
     if confidence < PAPER_MIN_CONF:
         return BetDecision(False, reason=f"model confidence {confidence:.2f} < {PAPER_MIN_CONF}")
-    sides = [("yes", p_yes, yes_ask), ("no", 1 - p_yes, 100 - yes_bid)]
+    floor = tier_prob_floor(tier)
     best = None
-    for side, prob, price in sides:
-        if not (PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE):
-            continue
+    for side, prob, price in [("yes", p_yes, yes_ask), ("no", 1 - p_yes, 100 - yes_bid)]:
         edge = prob - price / 100
-        if prob >= PAPER_MIN_PROB and edge >= PAPER_MIN_EDGE:
-            if best is None or edge > best[3]:
-                best = (side, prob, price, edge)
+        if policy_ok(prob, edge, price, tier) and (best is None or edge > best[3]):
+            best = (side, prob, price, edge)
     if best is None:
-        return BetDecision(False, reason="no side clears prob+edge gates")
+        return BetDecision(False, reason=f"no side clears the calibrated-band policy "
+                                         f"(prob ≥ {floor:.0%}, edge "
+                                         f"{PAPER_MIN_EDGE:.0%}–{PAPER_MAX_EDGE:.0%})")
     side, prob, price, edge = best
-    # quality over quantity: a monstrous edge at a live price is almost always a
-    # stale/thin quote or model error, not free money — pass rather than pile in
-    if edge > EDGE_SUSPECT:
-        return BetDecision(False, side=side, prob=round(prob, 3), edge=round(edge, 3),
-                           price_cents=price,
-                           reason=f"edge {edge * 100:.0f}% implausibly large "
-                                  f"(> {EDGE_SUSPECT * 100:.0f}%) — likely a stale "
-                                  f"quote or model error, skipped")
     units = size_units(prob, edge, confidence)
+    chal = " (Challenger bar)" if tier == "C" else ""
     return BetDecision(True, side=side, prob=round(prob, 3), edge=round(edge, 3),
                        price_cents=price, units=units,
-                       reason=f"prob {prob:.0%} ≥ {PAPER_MIN_PROB:.0%}, "
-                              f"edge {edge * 100:.1f}% ≥ {PAPER_MIN_EDGE * 100:.0f}%"
+                       reason=f"prob {prob:.0%} ≥ {floor:.0%}{chal}, edge "
+                              f"{edge * 100:.1f}% in [{PAPER_MIN_EDGE * 100:.0f}–"
+                              f"{PAPER_MAX_EDGE * 100:.0f}]%"
                               f"{f', {units}u conviction' if units > 1 else ''}")
 
 

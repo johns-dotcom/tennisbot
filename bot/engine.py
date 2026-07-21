@@ -265,26 +265,18 @@ class AdvisoryEngine:
     def _paper_from_advisory(self, ticker: str, ctx: dict, block) -> None:
         """Bot testrun: an advisory that also clears the paper policy becomes
         an imaginary bet (basis 'advisory'). Never an order — CLAUDE.md rule 1."""
-        from bot.paper import (
-            PAPER_MAX_PRICE,
-            PAPER_MIN_EDGE,
-            PAPER_MIN_PRICE,
-            PAPER_MIN_PROB,
-            BetDecision,
-            place_bet,
-            size_units,
-        )
+        from bot.paper import BetDecision, place_bet, policy_ok, size_units
 
         prob, price = block.model_prob, block.executable_price_cents
         edge = block.edge
-        if not (prob >= PAPER_MIN_PROB and edge >= PAPER_MIN_EDGE
-                and PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE
-                and ctx.get("event_ticker")):
+        # same v4 gate as the prematch path (shared policy_ok — no drift)
+        if not (ctx.get("event_ticker")
+                and policy_ok(prob, edge, price, ctx.get("tier"))):
             return
         decision = BetDecision(True, side=block.recommended_side, prob=prob,
                                edge=edge, price_cents=price,
                                units=size_units(prob, edge, block.model_confidence),
-                               reason="advisory cleared paper policy")
+                               reason="advisory cleared paper policy (v4)")
         with self.db_session() as db:
             place_bet(db, event_ticker=ctx["event_ticker"], market_ticker=ticker,
                       player_id=ctx["player_a_id"] if block.recommended_side == "yes"

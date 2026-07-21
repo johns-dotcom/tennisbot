@@ -452,7 +452,8 @@ class WatchService:
                 pred = self.advisory_hook.model.predict(
                     ctx["player_a_id"], ctx["player_b_id"], None, ctx["tier"],
                     MatchState(0, 0, ctx["best_of"]))
-                decision = decide_bet(pred.p_a, pred.confidence, ya, yb)
+                decision = decide_bet(pred.p_a, pred.confidence, ya, yb,
+                                      tier=ctx.get("tier"))
                 if not decision.place:
                     continue
                 with db_session() as db:
