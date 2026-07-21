@@ -317,6 +317,7 @@ research use · advisory only, nothing here is an order.</footer>"""
                                  ("/live", "live", "Live"),
                                  ("/scenarios", "scenarios", "Scenarios"),
                                  ("/testrun", "testrun", "Bot Testrun"),
+                                 ("/history", "history", "History"),
                                  ("/players", "players", "Database"),
                                  ("/flags", "flags", "Flags"),
                                  ("/system", "system", "System")))
@@ -1152,6 +1153,101 @@ Generated from the recorded scoreline and settlement — advisory only.</p>""")
                     '<a href="/testrun">← back to testrun</a>') \
         + strip + intro + log_html
     return respond(request, "Testrun History", "testrun", body)
+
+
+async def history(request: web.Request) -> web.Response:
+    """Time-travel: browse any past day's settled slate — every match that
+    resolved, who won, the scoreline, and which ones the bot played."""
+    import datetime as _dt
+    from sqlalchemy import text as sqltext
+
+    from bot.models import Advisory, KalshiMarket, PaperBet
+
+    qd = request.query.get("d")
+    try:
+        day = _dt.date.fromisoformat(qd) if qd else \
+            datetime.now(timezone.utc).date()
+    except ValueError:
+        day = datetime.now(timezone.utc).date()
+    lo = datetime.combine(day, _dt.time.min, tzinfo=timezone.utc)
+    hi = lo + timedelta(days=1)
+    label = {"KXATPMATCH": "ATP", "KXWTAMATCH": "WTA", "KXWTAGAME": "WTA",
+             "KXATPCHALLENGERMATCH": "CHALLENGER", "KXITFMATCH": "ITF M",
+             "KXITFWMATCH": "ITF W"}
+
+    with db_session() as db:
+        settled = db.execute(sqltext("""
+            SELECT DISTINCT ON (event_ticker) event_ticker, ticker, title, result,
+                   settled_at, raw
+            FROM kalshi_markets
+            WHERE settled_at >= :lo AND settled_at < :hi AND result IN ('yes','no')
+            ORDER BY event_ticker, settled_at DESC"""),
+            {"lo": lo, "hi": hi}).all()
+        tks = [r[1] for r in settled]
+        scl = {}
+        if tks:
+            for r in db.execute(sqltext("""
+                SELECT DISTINCT ON (market_ticker) market_ticker, scoreline, sets_a, sets_b
+                FROM match_score_log WHERE market_ticker = ANY(:t)
+                ORDER BY market_ticker, ts DESC"""), {"t": tks}).all():
+                scl[r[0]] = (r[1], r[2], r[3])
+        our_bets = {b.market_ticker: b for b in db.execute(
+            select(PaperBet).where(PaperBet.market_ticker.in_(tks))).scalars()} \
+            if tks else {}
+        advised = set(db.execute(select(Advisory.market_ticker).where(
+            Advisory.market_ticker.in_(tks), Advisory.status == "sent")).scalars()) \
+            if tks else set()
+
+    cards, our_n, our_w = [], 0, 0
+    for ev, tk, title, result, settled_at, raw in settled:
+        matchup = (title or "").split(" the ", 1)[-1].split(":")[0].split(" match")[0] \
+            if title and " the " in title else (title or ev)
+        yes_name = (raw or {}).get("yes_sub_title") or ""
+        winner = yes_name if result == "yes" else \
+            _opponent_surname(title, yes_name.split()[-1] if yes_name else "")
+        line, sa, sb = scl.get(tk, (None, None, None))
+        score = f' · <span class="mono">{esc(line)}</span>' if line else ""
+        tour = label.get((raw or {}).get("_series", ""), "?")
+        bet = our_bets.get(tk)
+        tag_html = ""
+        if bet is not None:
+            our_n += 1
+            won = bet.status == "won"
+            our_w += won
+            tag_html = (tag("good", "✓", f"bet {bet.side} {bet.units or 1}u — won")
+                        if won else tag("accent", "✕", f"bet {bet.side} {bet.units or 1}u — lost")
+                        if bet.status == "lost" else tag("neutral", "·", f"bet {bet.side}"))
+        elif tk in advised:
+            tag_html = tag("outline", "▲", "advised")
+        cards.append(f"""<div class="card">
+<div style="display:flex;justify-content:space-between;align-items:center">
+<span class="kicker" style="margin:0">{tour}</span><span>{tag_html}</span></div>
+<a href="/match/{esc(ev)}" style="color:inherit;text-decoration:none">
+<div class="pname" style="font-size:15px">{esc(matchup)}</div></a>
+<div class="sub2">won by <strong>{esc(winner) or '—'}</strong>{score}</div>
+<div class="sub2 mono">settled {pt(settled_at)}</div></div>""")
+
+    prev_d = (day - timedelta(days=1)).isoformat()
+    next_d = (day + timedelta(days=1)).isoformat()
+    is_today = day >= datetime.now(timezone.utc).date()
+    nav = (f'<div class="filterbar" style="margin-bottom:16px">'
+           f'<a class="fchip" href="/history?d={prev_d}">← {prev_d}</a>'
+           f'<span class="fchip on">{day.isoformat()}</span>'
+           f'{"" if is_today else f"<a class=fchip href=/history?d={next_d}>{next_d} →</a>"}'
+           f'<a class="fchip" href="/history">today</a></div>')
+    strip = statstrip([
+        ("Matches settled", str(len(settled)), "resolved this day"),
+        ("Bot played", str(our_n), "of the day's slate"),
+        ("Bot record", f"{our_w}-{our_n - our_w}" if our_n else "—", "that day"),
+    ], cols=3)
+    grid = (f'<section class="block"><div class="cards">{"".join(cards)}</div></section>'
+            if cards else
+            '<section class="block"><p class="prose">No matches settled on this '
+            'day (or before the bot started recording).</p></section>')
+    body = pagehead("Archive", "History",
+                    "browse any day's settled slate and the bot's calls") \
+        + nav + strip + grid
+    return respond(request, "History", "history", body)
 
 
 async def track(request: web.Request) -> web.Response:
@@ -2501,6 +2597,7 @@ def make_app() -> web.Application:
     app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/testrun", testrun)
     app.router.add_get("/testrun/history", testrun_history)
+    app.router.add_get("/history", history)
     app.router.add_get("/testrun-tp", testrun_tp)
     app.router.add_get("/players", players)
     app.router.add_get("/player/{pid:\\d+}", player_detail)
