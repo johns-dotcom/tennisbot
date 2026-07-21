@@ -35,7 +35,7 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v2"
+POLICY_VERSION = "v3"  # v3: model recalibrated (PLATT_A 1.65→1.437, less overconfident)
 
 PAPER_MIN_PROB = 0.68
 PAPER_MIN_EDGE = 0.03

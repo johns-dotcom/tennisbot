@@ -28,9 +28,13 @@ TIER_K_MULT = {"G": 1.2, "F": 1.1, "M": 1.1, "A": 1.0, "C": 0.9}
 DEFAULT_TIER_MULT = 0.8  # ITF/Futures and everything else
 PROVISIONAL_1, PROVISIONAL_2 = 30, 100  # set-count thresholds for K boosts
 CONFIDENCE_FULL_SETS = 60  # sets seen for full rating confidence
-# Global sharpening for raw Elo underconfidence, fitted by walk-forward log loss
-# on 2023-24 (n=120,376; 0.6112 → 0.5984). Refit when the rating system changes.
-PLATT_A = 1.65
+# Global calibration for the raw Elo expectation, fitted by walk-forward log
+# loss against realized outcomes only (never price — CLAUDE.md rule 2), via
+# bot.prob.calibrate. The prior 1.65 (fit on 2023-24) over-sharpened the tail:
+# the 2026 walk-forward (n=28,782) showed favorites over-predicting by 2-3 pts
+# per bucket and refit to 1.437 (log loss 0.5981 → 0.5966). b stays 0 — a
+# two-player model must be symmetric, so no bias term. Refit when ratings change.
+PLATT_A = 1.437
 
 
 @dataclass
