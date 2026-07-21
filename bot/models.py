@@ -279,7 +279,8 @@ class PaperBet(Base):
     __tablename__ = "paper_bets"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    event_ticker: Mapped[str] = mapped_column(String(96), unique=True)
+    bot: Mapped[str] = mapped_column(String(8), default="t1", index=True)  # 't1' fixed | 't2' self-improving
+    event_ticker: Mapped[str] = mapped_column(String(96))
     market_ticker: Mapped[str] = mapped_column(String(96))
     player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"))
     side: Mapped[str] = mapped_column(String(4))  # 'yes' | 'no' (vs market_ticker)
@@ -295,6 +296,9 @@ class PaperBet(Base):
     status: Mapped[str] = mapped_column(String(8), default="open")  # open/won/lost/void
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     pnl_cents: Mapped[int | None] = mapped_column(Integer)
+    __table_args__ = (
+        UniqueConstraint("bot", "event_ticker", name="uq_paper_bet_bot_event"),
+    )
 
 
 class ChartingStat(Base):

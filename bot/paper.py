@@ -72,32 +72,55 @@ def _clip01(x: float) -> float:
     return max(0.0, min(1.0, x))
 
 
-def tier_prob_floor(tier: str | None) -> float:
+@dataclass(frozen=True)
+class Policy:
+    """The tunable thresholds a bot bets by. T1 uses DEFAULT_POLICY (fixed,
+    hand-tuned v5); T2 supplies its own self-adapted Policy (see bot/t2.py).
+    size_mult scales the conviction stake (T2 presses/eases with its results)."""
+    min_prob: float = PAPER_MIN_PROB
+    min_edge: float = PAPER_MIN_EDGE
+    max_edge: float = PAPER_MAX_EDGE
+    min_conf: float = PAPER_MIN_CONF
+    min_price: int = PAPER_MIN_PRICE
+    max_price: int = PAPER_MAX_PRICE
+    challenger_min_prob: float = CHALLENGER_MIN_PROB
+    size_mult: float = 1.0
+    version: str = POLICY_VERSION
+
+
+DEFAULT_POLICY = Policy()
+
+
+def tier_prob_floor(tier: str | None, policy: Policy = DEFAULT_POLICY) -> float:
     """Challenger is demoted — it needs a stronger favorite to clear."""
-    return CHALLENGER_MIN_PROB if tier == "C" else PAPER_MIN_PROB
+    return policy.challenger_min_prob if tier == "C" else policy.min_prob
 
 
-def policy_ok(prob: float, edge: float, price: int, tier: str | None) -> bool:
-    """The single v4 gate, shared by the prematch and advisory bet paths so they
-    can never drift: calibrated-band favorite, sane edge, sane price."""
-    return (prob >= tier_prob_floor(tier)
-            and PAPER_MIN_EDGE <= edge <= PAPER_MAX_EDGE
-            and PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE)
+def policy_ok(prob: float, edge: float, price: int, tier: str | None,
+              policy: Policy = DEFAULT_POLICY) -> bool:
+    """The single bet gate, shared by the prematch and advisory paths (and both
+    bots) so they can never drift: calibrated-band favorite, sane edge/price."""
+    return (prob >= tier_prob_floor(tier, policy)
+            and policy.min_edge <= edge <= policy.max_edge
+            and policy.min_price <= price <= policy.max_price)
 
-def size_units(prob: float, edge: float, confidence: float) -> float:
+
+def size_units(prob: float, edge: float, confidence: float,
+               size_mult: float = 1.0) -> float:
     """Continuous, confidence-driven stake in [1.0, MAX_UNITS] (one decimal).
 
     conviction = prob_score · conf_score, where prob_score is how far the pick
     reaches into the strong-favorite range and conf_score is data depth beyond
     the floor. Multiplicative → both must be high, so multi-unit stays sparing.
-    A suspicious (too-large) edge never presses the size."""
+    A suspicious (too-large) edge never presses the size. size_mult lets a bot
+    scale its aggression (T2's self-improvement)."""
     if edge > EDGE_SANE_MAX:
         return 1.0
     prob_score = _clip01((prob - PAPER_MIN_PROB) / (PROB_SATURATION - PAPER_MIN_PROB))
     conf_score = _clip01((confidence - PAPER_MIN_CONF) / (1.0 - PAPER_MIN_CONF))
     conviction = prob_score * conf_score
     units = 1.0 + (MAX_UNITS - 1.0) * conviction ** SIZING_GAMMA
-    return round(min(MAX_UNITS, max(1.0, units)), 1)
+    return round(min(MAX_UNITS, max(1.0, units * size_mult)), 1)
 
 
 @dataclass
@@ -112,53 +135,55 @@ class BetDecision:
 
 
 def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
-               yes_bid: int | None, tier: str | None = None) -> BetDecision:
+               yes_bid: int | None, tier: str | None = None,
+               policy: Policy = DEFAULT_POLICY) -> BetDecision:
     """Pure policy: evaluate one market's two sides, pick at most one."""
     if yes_ask is None or yes_bid is None:
         return BetDecision(False, reason="no quote")
-    if confidence < PAPER_MIN_CONF:
-        return BetDecision(False, reason=f"model confidence {confidence:.2f} < {PAPER_MIN_CONF}")
-    floor = tier_prob_floor(tier)
+    if confidence < policy.min_conf:
+        return BetDecision(False, reason=f"model confidence {confidence:.2f} < {policy.min_conf}")
+    floor = tier_prob_floor(tier, policy)
     best = None
     for side, prob, price in [("yes", p_yes, yes_ask), ("no", 1 - p_yes, 100 - yes_bid)]:
         edge = prob - price / 100
-        if policy_ok(prob, edge, price, tier) and (best is None or edge > best[3]):
+        if policy_ok(prob, edge, price, tier, policy) and (best is None or edge > best[3]):
             best = (side, prob, price, edge)
     if best is None:
-        return BetDecision(False, reason=f"no side clears the calibrated-band policy "
+        return BetDecision(False, reason=f"no side clears the {policy.version} policy "
                                          f"(prob ≥ {floor:.0%}, edge "
-                                         f"{PAPER_MIN_EDGE:.0%}–{PAPER_MAX_EDGE:.0%})")
+                                         f"{policy.min_edge:.0%}–{policy.max_edge:.0%})")
     side, prob, price, edge = best
-    units = size_units(prob, edge, confidence)
+    units = size_units(prob, edge, confidence, policy.size_mult)
     chal = " (Challenger bar)" if tier == "C" else ""
     return BetDecision(True, side=side, prob=round(prob, 3), edge=round(edge, 3),
                        price_cents=price, units=units,
                        reason=f"prob {prob:.0%} ≥ {floor:.0%}{chal}, edge "
-                              f"{edge * 100:.1f}% in [{PAPER_MIN_EDGE * 100:.0f}–"
-                              f"{PAPER_MAX_EDGE * 100:.0f}]%"
+                              f"{edge * 100:.1f}% in [{policy.min_edge * 100:.0f}–"
+                              f"{policy.max_edge * 100:.0f}]%"
                               f"{f', {units:.1f}u conviction' if units > 1 else ''}")
 
 
 def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
               player_id: int | None, decision: BetDecision, confidence: float,
               basis: str, tier: str | None, state: str = "0-0",
-              reasoning: dict | None = None) -> bool:
-    """One bet per event, ever. Returns True if placed."""
+              reasoning: dict | None = None, bot: str = "t1",
+              policy_version: str = POLICY_VERSION) -> bool:
+    """One bet per event per bot. Returns True if placed."""
     exists = db.execute(select(PaperBet.id).where(
-        PaperBet.event_ticker == event_ticker)).first()
+        PaperBet.bot == bot, PaperBet.event_ticker == event_ticker)).first()
     if exists:
         return False
     db.add(PaperBet(
-        created_at=datetime.now(timezone.utc), event_ticker=event_ticker,
+        created_at=datetime.now(timezone.utc), bot=bot, event_ticker=event_ticker,
         market_ticker=market_ticker, player_id=player_id, side=decision.side,
         price_cents=decision.price_cents, model_prob=decision.prob,
         model_confidence=round(confidence, 3), edge=decision.edge, basis=basis,
         units=round(max(1.0, min(MAX_UNITS, decision.units)), 1), tier=tier,
         state_at_placement=state,
         reasoning={**(reasoning or {}), "policy_reason": decision.reason,
-                   "policy_version": POLICY_VERSION}))
+                   "policy_version": policy_version}))
     db.commit()
-    log.info("PAPER BET PLACED", event=event_ticker, side=decision.side,
+    log.info("PAPER BET PLACED", bot=bot, event=event_ticker, side=decision.side,
              price=decision.price_cents, prob=decision.prob, edge=decision.edge,
              units=decision.units, basis=basis)
     return True

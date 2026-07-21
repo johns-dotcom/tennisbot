@@ -317,6 +317,7 @@ research use · advisory only, nothing here is an order.</footer>"""
                                  ("/live", "live", "Live"),
                                  ("/scenarios", "scenarios", "Scenarios"),
                                  ("/testrun", "testrun", "Bot Testrun"),
+                                 ("/testrun/t2", "testrun-t2", "T2"),
                                  ("/history", "history", "History"),
                                  ("/players", "players", "Database"),
                                  ("/flags", "flags", "Flags"),
@@ -635,7 +636,11 @@ def postgame_analysis(pick: str, opp: str, side: str, result: str | None,
 
 
 async def testrun(request: web.Request) -> web.Response:
-    return await _testrun_view(request, "hold")
+    return await _testrun_view(request, bot="t1")
+
+
+async def testrun_t2(request: web.Request) -> web.Response:
+    return await _testrun_view(request, bot="t2")
 
 
 async def testrun_tp(request: web.Request) -> web.Response:
@@ -644,15 +649,20 @@ async def testrun_tp(request: web.Request) -> web.Response:
     raise web.HTTPFound("/testrun")
 
 
-async def _testrun_view(request: web.Request, mode: str) -> web.Response:
+async def _testrun_view(request: web.Request, bot: str = "t1") -> web.Response:
     from bot.models import KalshiMarket, PaperBet, Scenario
-    from bot.paper import PAPER_MIN_EDGE, PAPER_MIN_PROB
+    from bot.paper import DEFAULT_POLICY, PAPER_MIN_EDGE, PAPER_MIN_PROB
+    from bot.t2 import t2_policy, t2_state
 
-    is_tp = mode == "tp"
+    is_tp = False  # both exits shown side-by-side; kept for existing branches
+    is_t2 = bot == "t2"
     with db_session() as db:
+        policy = t2_policy(db) if is_t2 else DEFAULT_POLICY
+        learned = t2_state(db) if is_t2 else None
         bets = db.execute(
             select(PaperBet, Player.full_name)
             .join(Player, Player.id == PaperBet.player_id, isouter=True)
+            .where(PaperBet.bot == bot)
             .order_by(PaperBet.created_at.desc()).limit(300)
         ).all()
         evs = [b.event_ticker for b, _ in bets]
@@ -901,7 +911,8 @@ version changes; records before and after a tune are never blended silently.</p>
 
     now = datetime.now(timezone.utc)
     with db_session() as db:
-        bet_events = set(db.execute(select(PaperBet.event_ticker)).scalars().all())
+        bet_events = set(db.execute(select(PaperBet.event_ticker)
+                                    .where(PaperBet.bot == bot)).scalars().all())
         cand = db.execute(
             select(Scenario, Player.full_name)
             .join(Player, Player.id == Scenario.player_id, isouter=True)
@@ -929,7 +940,7 @@ version changes; records before and after a tune are never blended silently.</p>
         yb, ya = (q[0], q[1]) if q else (None, None)
         conf = (sc.facts or {}).get("model_confidence", 0.7)
         dec = decide_bet(sc.prematch_prob, conf, ya, yb,
-                         tier=_tier_of(sc.market_ticker))
+                         tier=_tier_of(sc.market_ticker), policy=policy)
         price = ya if ya is not None else "—"
         if dec.place:
             verdict = tag("good", "✓", f"clears — {dec.units:.1f}u candidate")
@@ -1029,9 +1040,20 @@ P&amp;L chart above.</p>
 {f'<p class="sub2">(TP has also realized {tp_live} live position(s) on matches still in play — held out here for a like-for-like record.)</p>' if tp_live else ''}
 </section>"""
 
-    title = "Bot Testrun"
-    active = "testrun"
-    exit_note = f"""<p class="prose" style="margin:0 0 18px">The bot places
+    title = "Bot Testrun · T2" if is_t2 else "Bot Testrun"
+    active = "testrun-t2" if is_t2 else "testrun"
+    hist_link = f"/testrun/history?bot={bot}"
+    if is_t2:
+        exit_note = f"""<p class="prose" style="margin:0 0 18px">T2 bets the same
+matches as the base bot, but it <strong>tunes its own policy</strong> from its
+own settled record — the automated version of the hand-tuning behind T1. As
+results come in it nudges its probability floor toward the band where it
+actually wins, tightens its edge cap if big-edge bets underperform, and scales
+its stake with recent ROI (all bounded). Until it has enough settled bets it
+inherits T1's v5 policy. Still <strong>imaginary</strong> bets at $10/unit —
+never an order.</p>"""
+    else:
+        exit_note = f"""<p class="prose" style="margin:0 0 18px">The bot places
 <strong>imaginary</strong> bets for itself at <strong>$10 per unit</strong>
 (1–3 units) — selectively; most matches get no bet. The headline record holds
 every bet to settlement
@@ -1040,12 +1062,41 @@ every bet to settlement
 winners but salvaging leads that later collapse. Both exits are tracked and
 compared on this one page. Settled results are the tuning data: the policy
 iterates until the record holds above 70%. Nothing here is, or ever becomes, a
-real order.</p>"""
+real order. Compare against the <a href="/testrun/t2">self-improving T2 →</a></p>"""
     status_th = "status"
+
+    learned_html = ""
+    if is_t2 and learned:
+        rows = "".join(
+            f'<div class="vsrow"><span class="k">{k}</span>'
+            f'<span class="v mono">{v}</span></div>'
+            for k, v in (("prob floor", f"{policy.min_prob:.0%}"),
+                         ("edge cap", f"{policy.max_edge:.0%}"),
+                         ("stake ×", f"{policy.size_mult:.1f}"),
+                         ("challenger floor", f"{policy.challenger_min_prob:.0%}")))
+        hist = learned.get("history", [])
+        hist_html = "".join(
+            f'<div class="vsrow"><span class="k mono">{esc(h.get("version",""))}</span>'
+            f'<span class="sub2">floor {h.get("min_prob",0):.0%} · edge '
+            f'{h.get("max_edge",0):.0%} · ×{h.get("size_mult",1):.1f}</span></div>'
+            for h in reversed(hist)) or '<div class="sub2">no prior versions yet</div>'
+        learned_html = f"""<section class="block"><div class="blockhead">
+<h4>Self-improvement · {esc(learned.get("version","t2.0"))}</h4>
+<span class="aside">re-tuned from T2's own settled record</span></div>
+<div class="rule"></div>
+<div class="vsgrid" style="margin-bottom:12px"><div class="vscol">
+<div class="vshead">Current learned policy<span>{esc(learned.get("rationale",""))}</span></div>
+{rows}</div><div class="vscol">
+<div class="vshead">Version history<span>most recent first</span></div>
+{hist_html}</div></div>
+<p class="sub2">Adapts only after {esc(str(learned.get("n_basis", 0)))} settled bets
+inform it; every parameter is bounded and each change is versioned so records
+never blend.</p></section>"""
+
     body = pagehead("Strategy Lab", title,
-                    f'{n} settled · <a href="/testrun/history">post-game log →</a> · '
+                    f'{n} settled · <a href="{hist_link}">post-game log →</a> · '
                     f'<a href="/track">advisory track record →</a>') \
-        + strip + exit_note + watching_html + timeline_html + f"""
+        + strip + exit_note + learned_html + watching_html + timeline_html + f"""
 {comparison_html}
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
 <span class="aside">where the record comes from — the improvement signal</span></div>
@@ -1065,11 +1116,15 @@ async def testrun_history(request: web.Request) -> web.Response:
     from bot.models import KalshiMarket, PaperBet, Scenario
     from bot.track import advisory_outcome, clv_cents
 
+    bot = request.query.get("bot", "t1")
+    if bot not in ("t1", "t2"):
+        bot = "t1"
     with db_session() as db:
         bets = db.execute(
             select(PaperBet, Player.full_name)
             .join(Player, Player.id == PaperBet.player_id, isouter=True)
-            .where(PaperBet.status.in_(("won", "lost", "void")))
+            .where(PaperBet.bot == bot,
+                   PaperBet.status.in_(("won", "lost", "void")))
             .order_by(PaperBet.settled_at.desc().nullslast(),
                       PaperBet.created_at.desc()).limit(150)
         ).all()
@@ -1154,8 +1209,9 @@ Generated from the recorded scoreline and settlement — advisory only.</p>""")
                 f'{"".join(entries)}</section>' if entries else
                 '<section class="block"><p class="prose">No settled bets yet — '
                 'analysis appears here once the first bet resolves.</p></section>')
-    body = pagehead("Strategy Lab", "Testrun History",
-                    '<a href="/testrun">← back to testrun</a>') \
+    back = "/testrun/t2" if bot == "t2" else "/testrun"
+    body = pagehead("Strategy Lab", f"Testrun History · {bot.upper()}",
+                    f'<a href="{back}">← back to testrun</a>') \
         + strip + intro + log_html
     return respond(request, "Testrun History", "testrun", body)
 
@@ -1197,7 +1253,8 @@ async def history(request: web.Request) -> web.Response:
                 ORDER BY market_ticker, ts DESC"""), {"t": tks}).all():
                 scl[r[0]] = (r[1], r[2], r[3])
         our_bets = {b.market_ticker: b for b in db.execute(
-            select(PaperBet).where(PaperBet.market_ticker.in_(tks))).scalars()} \
+            select(PaperBet).where(PaperBet.market_ticker.in_(tks),
+                                   PaperBet.bot == "t1")).scalars()} \
             if tks else {}
         advised = set(db.execute(select(Advisory.market_ticker).where(
             Advisory.market_ticker.in_(tks), Advisory.status == "sent")).scalars()) \
@@ -2601,6 +2658,7 @@ def make_app() -> web.Application:
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/testrun", testrun)
+    app.router.add_get("/testrun/t2", testrun_t2)
     app.router.add_get("/testrun/history", testrun_history)
     app.router.add_get("/history", history)
     app.router.add_get("/testrun-tp", testrun_tp)

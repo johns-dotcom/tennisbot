@@ -266,25 +266,31 @@ class AdvisoryEngine:
         """Bot testrun: an advisory that also clears the paper policy becomes
         an imaginary bet (basis 'advisory'). Never an order — CLAUDE.md rule 1."""
         from bot.paper import BetDecision, place_bet, policy_ok, size_units
+        from bot.t2 import iter_bot_policies
 
         prob, price = block.model_prob, block.executable_price_cents
         edge = block.edge
-        # same v4 gate as the prematch path (shared policy_ok — no drift)
-        if not (ctx.get("event_ticker")
-                and policy_ok(prob, edge, price, ctx.get("tier"))):
+        if not ctx.get("event_ticker"):
             return
-        decision = BetDecision(True, side=block.recommended_side, prob=prob,
-                               edge=edge, price_cents=price,
-                               units=size_units(prob, edge, block.model_confidence),
-                               reason="advisory cleared paper policy (v4)")
         with self.db_session() as db:
-            place_bet(db, event_ticker=ctx["event_ticker"], market_ticker=ticker,
-                      player_id=ctx["player_a_id"] if block.recommended_side == "yes"
-                      else ctx["player_b_id"],
-                      decision=decision, confidence=block.model_confidence,
-                      basis="advisory", tier=ctx["tier"], state=block.state_key,
-                      reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
-                                 "state_confirmed": block.state_confirmed})
+            # each bot evaluates the advisory under its own policy (T1 fixed,
+            # T2 self-improving) — shared policy_ok so they can't drift
+            for bot, policy in iter_bot_policies(db):
+                if not policy_ok(prob, edge, price, ctx.get("tier"), policy):
+                    continue
+                decision = BetDecision(
+                    True, side=block.recommended_side, prob=prob, edge=edge,
+                    price_cents=price,
+                    units=size_units(prob, edge, block.model_confidence, policy.size_mult),
+                    reason=f"advisory cleared {policy.version} paper policy")
+                place_bet(db, event_ticker=ctx["event_ticker"], market_ticker=ticker,
+                          player_id=ctx["player_a_id"] if block.recommended_side == "yes"
+                          else ctx["player_b_id"],
+                          decision=decision, confidence=block.model_confidence,
+                          basis="advisory", tier=ctx["tier"], state=block.state_key,
+                          bot=bot, policy_version=policy.version,
+                          reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
+                                     "state_confirmed": block.state_confirmed})
 
     def _kill(self, advisory_id: int, reason: str) -> None:
         with self.db_session() as db:

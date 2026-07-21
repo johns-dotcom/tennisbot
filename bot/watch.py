@@ -415,6 +415,7 @@ class WatchService:
         matches get none — the policy in bot/paper.py decides."""
         from bot.paper import decide_bet, place_bet
         from bot.prob.model import MatchState
+        from bot.t2 import iter_bot_policies
 
         while not self.stop.is_set():
             if self.advisory_hook is None or not self.watched:
@@ -452,18 +453,20 @@ class WatchService:
                 pred = self.advisory_hook.model.predict(
                     ctx["player_a_id"], ctx["player_b_id"], None, ctx["tier"],
                     MatchState(0, 0, ctx["best_of"]))
-                decision = decide_bet(pred.p_a, pred.confidence, ya, yb,
-                                      tier=ctx.get("tier"))
-                if not decision.place:
-                    continue
                 with db_session() as db:
-                    place_bet(db, event_ticker=event_ticker, market_ticker=ticker,
-                              player_id=ctx["player_a_id"] if decision.side == "yes"
-                              else ctx["player_b_id"],
-                              decision=decision, confidence=pred.confidence,
-                              basis="prematch", tier=ctx["tier"],
-                              reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
-                                         "prematch_prob": round(pred.p_a, 3)})
+                    for bot, policy in iter_bot_policies(db):
+                        decision = decide_bet(pred.p_a, pred.confidence, ya, yb,
+                                              tier=ctx.get("tier"), policy=policy)
+                        if not decision.place:
+                            continue
+                        place_bet(db, event_ticker=event_ticker, market_ticker=ticker,
+                                  player_id=ctx["player_a_id"] if decision.side == "yes"
+                                  else ctx["player_b_id"],
+                                  decision=decision, confidence=pred.confidence,
+                                  basis="prematch", tier=ctx["tier"], bot=bot,
+                                  policy_version=policy.version,
+                                  reasoning={"match": f"{ctx['name_a']} vs {ctx['name_b']}",
+                                             "prematch_prob": round(pred.p_a, 3)})
             try:
                 await asyncio.wait_for(self.stop.wait(), timeout=300)
             except asyncio.TimeoutError:
@@ -578,6 +581,17 @@ class WatchService:
 
                 with db_session() as db:
                     settle_open_bets(db)
+                # T2 learns from freshly-settled results
+                try:
+                    from bot.t2 import t2_self_improve
+
+                    with db_session() as db:
+                        r = t2_self_improve(db)
+                    if r.get("changed"):
+                        log.info("T2 policy updated", version=r.get("version"),
+                                 rationale=r.get("rationale"))
+                except Exception as e:
+                    log.warning("T2 self-improve failed", error=str(e))
             except Exception as e:
                 log.error("settlement loop error", error=str(e))
             try:

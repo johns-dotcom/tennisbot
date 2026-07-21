@@ -85,3 +85,25 @@ def test_shared_gate_used_by_both_paths():
     assert not policy_ok(0.90, 0.25, 65, None)      # edge > 15%
     assert not policy_ok(0.85, 0.10, 75, "C")       # Challenger needs 86%
     assert policy_ok(0.88, 0.10, 78, "C")
+
+
+def test_policy_parameterization_changes_the_gate():
+    # a self-improved policy with a lower floor / higher edge cap lets through a
+    # bet the default policy would reject — proving both bots share one gate
+    from bot.paper import DEFAULT_POLICY, decide_bet
+    from dataclasses import replace
+    loose = replace(DEFAULT_POLICY, min_prob=0.75, version="t2.3")
+    # 78% favorite at 70¢ = 8% edge: below the 82% default floor, above 75%
+    assert not decide_bet(0.78, 0.9, 70, 68).place
+    assert decide_bet(0.78, 0.9, 70, 68, policy=loose).place
+    # a tighter policy rejects a bet the default would take, naming its version
+    tight = replace(DEFAULT_POLICY, min_prob=0.90, version="t2.7")
+    rej = decide_bet(0.85, 0.9, 75, 73, policy=tight)
+    assert not rej.place and "t2.7" in rej.reason
+
+
+def test_size_mult_scales_the_stake():
+    from bot.paper import size_units
+    base = size_units(0.90, 0.05, 1.0)
+    assert size_units(0.90, 0.05, 1.0, size_mult=1.3) > base
+    assert size_units(0.90, 0.05, 1.0, size_mult=0.7) < base
