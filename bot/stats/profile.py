@@ -161,6 +161,45 @@ def compute_deciding_sets(history: list[MatchRow], as_of: date, last_n: int = 7)
     )
 
 
+# a break of at least this many days reads as a genuine layoff / return, not
+# the normal week-to-week tour gap
+LAYOFF_MIN_DAYS = 45
+RETURN_WINDOW_MATCHES = 6  # only call it a "return" if the gap is this recent
+
+
+@dataclass
+class LayoffBlock:
+    """Rust / return-from-break signal — 'first ITF match in a few months',
+    'back from physical therapy, lost 3 straight', plus recent deciding-set
+    load for the fatigue read ('his fourth set 3 this month')."""
+    days_since_last_match: int | None
+    return_layoff_days: int | None            # the break they just came back from
+    matches_since_return: int | None
+    record_since_return: tuple[int, int] | None  # (w, l) since the return
+    deciders_last_30d: int
+    deciders_last_3d: int                     # back-to-back deciders → acute fatigue
+
+
+def compute_layoff(history: list[MatchRow], as_of: date) -> LayoffBlock:
+    ms = sorted(_before(history, as_of), key=lambda m: m.match_date, reverse=True)
+    if not ms:
+        return LayoffBlock(None, None, None, None, 0, 0)
+    days_since = (as_of - ms[0].match_date).days
+    dec30 = sum(1 for m in ms
+                if m.reached_decider and (as_of - m.match_date).days <= 30)
+    dec3 = sum(1 for m in ms
+               if m.reached_decider and (as_of - m.match_date).days <= 3)
+    ret_days = ret_n = rec = None
+    for i in range(min(RETURN_WINDOW_MATCHES, len(ms) - 1)):
+        gap = (ms[i].match_date - ms[i + 1].match_date).days
+        if gap >= LAYOFF_MIN_DAYS:
+            recent = ms[:i + 1]
+            w = sum(1 for m in recent if m.won)
+            ret_days, ret_n, rec = gap, len(recent), (w, len(recent) - w)
+            break
+    return LayoffBlock(days_since, ret_days, ret_n, rec, dec30, dec3)
+
+
 def compute_set_rates(history: list[MatchRow], as_of: date,
                       min_sample: int = 8) -> dict[int, Stat]:
     """Win rate in set N specifically (set 1, set 2, set 3…), the backbone of
@@ -413,6 +452,7 @@ class ConditionalBlock:
     win_given_set1_lost: Stat       # P(win match | lost set 1)
     decider_given_set1_lost: Stat   # P(reached a deciding set | lost set 1)
     set3_given_lost_set2: Stat      # P(won set 3 | lost set 2 and reached set 3)
+    win_given_won_a_set: Stat       # P(win match | won at least one set) — "gets a foothold, closes"
 
 
 def compute_conditional(history: list[MatchRow], as_of: date,
@@ -440,11 +480,13 @@ def compute_conditional(history: list[MatchRow], as_of: date,
         return pick(min_sample, fn(recent, "last365"), fn(pool, "career"))
 
     lost2 = [m for m in ms if any(n == 2 and not w for n, w in m.set_results)]
+    won_a_set = [m for m in ms if any(w for _, w in m.set_results)]
     return ConditionalBlock(
         win_given_set1_won=best(won1, winrate),
         win_given_set1_lost=best(lost1, winrate),
         decider_given_set1_lost=best(lost1, decider_rate),
         set3_given_lost_set2=best(lost2, set3_rate),
+        win_given_won_a_set=best(won_a_set, winrate),
     )
 
 
@@ -551,6 +593,7 @@ class PlayerProfile:
     conditional: ConditionalBlock | None = None
     schedule: ScheduleBlock | None = None
     age: float | None = None
+    layoff: LayoffBlock | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -664,4 +707,5 @@ def build_profile(db: Session, player_id: int, as_of: date,
         conditional=compute_conditional(history, as_of),
         schedule=compute_schedule(history, as_of),
         age=round((as_of - player.dob).days / 365.25, 1) if player.dob else None,
+        layoff=compute_layoff(history, as_of),
     )

@@ -297,3 +297,47 @@ def test_days_since_decider_played():
     d = compute_deciding_sets(hist, AS_OF)
     assert d.days_since_decider_played == 30   # most recent decider (a loss)
     assert d.days_since_decider_win == 60       # most recent decider WIN
+
+
+def test_compute_layoff_detects_return_from_break():
+    from bot.stats.profile import compute_layoff
+    # 3 recent matches, then a 90-day gap before older history → just returned
+    hist = [mk(2, True), mk(6, False), mk(11, True),
+            mk(101, False), mk(115, True)]
+    lb = compute_layoff(hist, AS_OF)
+    assert lb.days_since_last_match == 2
+    assert lb.return_layoff_days >= 45
+    assert lb.matches_since_return == 3
+    assert lb.record_since_return == (2, 1)
+
+
+def test_compute_layoff_recent_decider_load():
+    from bot.stats.profile import compute_layoff
+    hist = [mk(1, True, reached_decider=True, won_decider=True),
+            mk(2, False, reached_decider=True, won_decider=False),
+            mk(20, True, reached_decider=True, won_decider=True)]
+    lb = compute_layoff(hist, AS_OF)
+    assert lb.deciders_last_3d == 2   # two deciders in the last 72h
+    assert lb.deciders_last_30d == 3
+
+
+def test_compute_layoff_no_history():
+    from bot.stats.profile import compute_layoff
+    lb = compute_layoff([], AS_OF)
+    assert lb.days_since_last_match is None and lb.return_layoff_days is None
+
+
+def test_win_given_won_a_set_conditional():
+    from bot.stats.profile import compute_conditional
+    # won a set in 4 matches, took the match in 3 of them
+    hist = [
+        mk(2, True, sets=((1, True), (2, True))),
+        mk(4, True, sets=((1, False), (2, True), (3, True)), reached_decider=True,
+           won_decider=True),
+        mk(6, True, sets=((1, True), (2, True))),
+        mk(8, False, sets=((1, True), (2, False), (3, False)), reached_decider=True,
+           won_decider=False),
+        mk(10, False, sets=((1, False), (2, False))),  # won no set → excluded
+    ]
+    c = compute_conditional(hist, AS_OF, min_sample=3)
+    assert c.win_given_won_a_set.wins == 3 and c.win_given_won_a_set.losses == 1

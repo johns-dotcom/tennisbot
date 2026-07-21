@@ -199,6 +199,15 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                         f"opener{recover}.")
             salience += 0.1
 
+    # 2c. "gets a foothold, closes" — win rate once they win any set
+    wa = cond.win_given_won_a_set if cond else None
+    if wa and not wa.is_omitted and wa.value is not None and wa.value >= 0.85 \
+            and not _is_thin(wa):
+        bits.append(f"When {w_name} wins a set, they close it out: {wa.wins}-"
+                    f"{wa.losses} ({int(round(wa.value * 100))}%) in matches where "
+                    f"they took at least one — steal set 1 and it's usually over.")
+        salience += (wa.value - 0.85) * 0.5
+
     # 3. decider branch
     dw = do = None
     if da.value is not None and db_.value is not None:
@@ -233,6 +242,21 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                         f"untested if this goes long.")
             salience += 0.08
 
+    # 3c. recent deciding-set form — "won 4 of his last 5 when it goes the distance"
+    def _recent_dec(prof):
+        r = (prof.deciding.last_n_results or [])[:5]
+        return (sum(1 for x in r if x["won"]), len(r)) if len(r) >= 3 else None
+    wrd = _recent_dec(w_prof)
+    if wrd and wrd[0] >= max(3, wrd[1] - 1):
+        bits.append(f"And {w_name} is battle-tested late — won {wrd[0]} of their "
+                    f"last {wrd[1]} {lab}s, so no need to panic if set 1 slips.")
+        salience += 0.07
+    ord_ = _recent_dec(o_prof)
+    if ord_ and ord_[0] <= ord_[1] - 3:
+        bits.append(f"{o_name} has been losing the long ones — {ord_[0]} of their "
+                    f"last {ord_[1]} {lab}s won, vulnerable if this reaches {lab}.")
+        salience += 0.07
+
     # 3b. set-2 → set-3 recovery
     s23 = getattr(w_prof, "conditional", None)
     if s23 and not s23.set3_given_lost_set2.is_omitted \
@@ -263,6 +287,48 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
         bits.append(f"{o_name} is {o_age:.0f} and fading — down "
                     f"{abs(o_delta) * 100:.0f}% from career form this year.")
         salience += 0.08
+
+    # 4b-ii. youth vs age — stamina tilts young if it goes long
+    w_age = getattr(w_prof, "age", None)
+    if w_age and o_age and (o_age - w_age) >= 8:
+        bits.append(f"If it goes the distance, youth helps: {w_name} at "
+                    f"{w_age:.0f} to {o_name}'s {o_age:.0f} — stamina favors the "
+                    f"younger player in a {lab}.")
+        salience += 0.05
+
+    # 4c. recent deciding-set load → acute fatigue late (Kalshi/api recency feed)
+    o_lay = getattr(o_prof, "layoff", None)
+    if o_lay and o_lay.deciders_last_3d >= 1:
+        bits.append(f"{o_name} played a {lab} within the last 72h — acute fatigue "
+                    f"if this one also goes long.")
+        salience += 0.1
+    elif o_lay and o_lay.deciders_last_30d >= 3:
+        bits.append(f"A {lab} would be {o_name}'s {o_lay.deciders_last_30d}th this "
+                    f"month — stamina is a real question late.")
+        salience += 0.06
+
+    # 4d. layoff / return from a break — rust cuts against the returning player
+    def _layoff_note(prof, name):
+        lb = getattr(prof, "layoff", None)
+        if not lb:
+            return None
+        if lb.return_layoff_days and lb.matches_since_return is not None:
+            w, l = lb.record_since_return or (0, 0)
+            return (f"{name} is back from a ~{lb.return_layoff_days}-day layoff — "
+                    f"just {lb.matches_since_return} match(es) in ({w}-{l}), so that "
+                    f"form is a thin, rusty sample")
+        if lb.days_since_last_match and lb.days_since_last_match >= 45:
+            return (f"{name} hasn't played in {lb.days_since_last_match} days — "
+                    f"cold and untested coming in")
+        return None
+    o_lnote = _layoff_note(o_prof, o_name)
+    if o_lnote:
+        bits.append(f"{o_lnote} — an edge for {w_name}.")
+        salience += 0.08
+    w_lnote = _layoff_note(w_prof, w_name)
+    if w_lnote:
+        bits.append(f"(Caveat: {w_lnote}.)")
+        salience -= 0.05
 
     # 5. risk rule — strategy convention, not a statistic
     bits.append(f"If {w_name} drops set 1, do not chase: the second entry only "
