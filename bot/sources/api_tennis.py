@@ -32,6 +32,35 @@ TOUR_MAP = {
     "itf women singles": "wta",
 }
 
+# api-tennis uses long round names ("Round of 16"); Sackmann — and every
+# consumer of Match.round (deciding-set / final detection in scenarios) —
+# expects short codes. Normalise to those. The column is varchar(8), so the
+# fallback also clamps: never emit a value that would overflow.
+_ROUND_MAP = {
+    "final": "F", "the final": "F",
+    "semi-final": "SF", "semi-finals": "SF", "semifinal": "SF", "1/2-finals": "SF",
+    "quarter-final": "QF", "quarter-finals": "QF", "quarterfinal": "QF", "1/4-finals": "QF",
+    "round of 16": "R16", "1/8-finals": "R16",
+    "round of 32": "R32", "1/16-finals": "R32",
+    "round of 64": "R64", "1/32-finals": "R64",
+    "round of 128": "R128", "1/64-finals": "R128",
+}
+
+
+def _norm_round(raw: str | None) -> str | None:
+    if not raw:
+        return None
+    s = raw.strip()
+    key = s.lower()
+    if key in _ROUND_MAP:
+        return _ROUND_MAP[key]
+    # qualifying rounds → Q1/Q2/Q3
+    if key.startswith("qualif"):
+        digits = "".join(c for c in s if c.isdigit())
+        return f"Q{digits[:1]}" if digits else "Q"
+    # already a short code, or anything else — clamp to fit varchar(8)
+    return s[:8]
+
 
 class ApiTennisSource(TennisDataSource):
     name = "api_tennis"
@@ -161,7 +190,7 @@ class ApiTennisSource(TennisDataSource):
             values = dict(
                 tour=tour, source=self.name, source_key=skey, tournament_id=tid,
                 winner_id=winner_id, loser_id=loser_id, match_date=event_date,
-                round=(f.get("tournament_round") or None), best_of=3,
+                round=_norm_round(f.get("tournament_round")), best_of=3,
                 score_raw=(f.get("event_final_result") or None),
                 outcome="completed", sets_won_winner=ww, sets_won_loser=wl,
                 surface=None, tourney_level=None, is_duplicate=is_dup,
@@ -181,7 +210,7 @@ class ApiTennisSource(TennisDataSource):
             values = dict(
                 tour=tour, source=self.name, source_key=skey, tournament_id=tid,
                 winner_id=p1, loser_id=p2,  # side A / side B until completed
-                match_date=event_date, round=(f.get("tournament_round") or None),
+                match_date=event_date, round=_norm_round(f.get("tournament_round")),
                 outcome="scheduled", scheduled_start=self._event_dt(f),
             )
             stmt = pg_insert(Match).values(values).on_conflict_do_update(
