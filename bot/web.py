@@ -845,15 +845,6 @@ justify-content:space-between;gap:12px">
     def cstats(tp: bool):  # reuses the page-level cmp_out / finished / mode_stats
         return mode_stats(tp)
 
-    def cseries(tp: bool):
-        chron = sorted([b for b, _ in finished if b.settled_at],
-                       key=lambda b: b.settled_at)
-        cum, series = 0, []
-        for b in chron:
-            cum += cmp_out(b, tp)
-            series.append((b.settled_at, cum / 100))
-        return series
-
     nfin = len(finished)
     tp_live = sum(1 for b, _ in bets if results.get(b.market_ticker) is None
                   and (lambda t: (b.side == "yes" and (t[0] or 0) >= TP_LIMIT)
@@ -863,8 +854,6 @@ justify-content:space-between;gap:12px">
     if nfin:
         hw, hl, hpc, hun, hroi = cstats(False)
         tw, tl, tpc, tun, troi = cstats(True)
-        overlay = timeline_svg(cseries(False), "$", [], points2=cseries(True),
-                               label="hold to settlement", label2="90¢ take-profit")
         roi = lambda v: f"{v:+.1%}" if v is not None else "—"
         wr = lambda w, t: f"{w / t:.0%}" if t else "—"
 
@@ -910,8 +899,8 @@ justify-content:space-between;gap:12px">
 limit banked ~90¢ before the collapse) and <strong>capped {cap_n}</strong> clean
 winner(s) at 90¢ ({cap / 100:.2f}, giving up ~10¢ each vs holding to 100¢).
 TP wins this trade-off only when it salvages at least one reversal per nine
-winners it caps — here {salv_n} vs {cap_n}.</p>
-<div style="margin-top:12px">{overlay}</div>
+winners it caps — here {salv_n} vs {cap_n}. Both curves are plotted together in
+the Cumulative P&amp;L chart above.</p>
 {f'<p class="sub2">(TP has also realized {tp_live} live position(s) on matches still in play — held out here for a like-for-like record.)</p>' if tp_live else ''}
 </section>"""
 
