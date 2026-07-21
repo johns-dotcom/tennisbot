@@ -483,22 +483,6 @@ engine still applies every gate before any advisory fires.</p>
 TP_LIMIT = 90  # take-profit limit price (cents) for the TP variant
 
 
-def _other_mode_tiles(bets, emap, label, WON):
-    """Two overview tiles summarizing the OTHER exit rule, so the top strip
-    shows both hold and take-profit side by side."""
-    st = [b for b, _ in bets if emap[b.id][0] in ("won", "lost", "took_profit")]
-    w = sum(1 for b in st if emap[b.id][0] in WON)
-    pc = sum(emap[b.id][1] or 0 for b in st)
-    color = "var(--good)" if pc > 0 else ("var(--accent)" if pc < 0 else "var(--text)")
-    return [
-        (f"{label.split()[0]} · record", f"{w}-{len(st) - w}" if st else "0-0",
-         label),
-        (f"{label.split()[0]} · profit",
-         f'<span style="color:{color}">{pc / 100:+.2f}</span>' if st else "—",
-         "same picks, other exit"),
-    ]
-
-
 def _tp_effective(b, result, touched90):
     """Take-profit-at-90 outcome for a paper bet, derived from the same pick.
     A limit sell at 90¢ fills whenever our side's bid reaches 90 — which any
@@ -580,13 +564,40 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
     WON = ("won", "took_profit")
     settled = [(b, p) for b, p in bets if effs[b.id][0] in ("won", "lost", "took_profit")]
     open_bets = [(b, p) for b, p in bets if effs[b.id][0] == "open"]
-    wins = sum(1 for b, _ in settled if effs[b.id][0] in WON)
-    n = len(settled)
+
+    # Headline record/profit for BOTH exit rules on ONE basis: matches that have
+    # FINISHED (result known), each derived from that same result. Identical
+    # denominators — no timing-artifact mismatch between the hold and TP records.
+    from bot.track import advisory_outcome
+
+    def cmp_out(b, tp):
+        o = advisory_outcome(b.side, results.get(b.market_ticker))
+        u = b.units or 1
+        if o is None:
+            return None                       # match not finished → excluded
+        if o == "void":
+            return 0
+        if not tp or b.price_cents >= TP_LIMIT:
+            return (100 - b.price_cents) * u if o == "won" else -b.price_cents * u
+        yb, nb = touched.get(b.market_ticker, (None, None))
+        hit = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
+              (b.side == "no" and (nb or 0) >= TP_LIMIT)
+        return (TP_LIMIT - b.price_cents) * u if (hit or o == "won") else -b.price_cents * u
+
+    finished = [(b, p) for b, p in bets if cmp_out(b, False) is not None]
+
+    def mode_stats(tp):
+        w = sum(1 for b, _ in finished if cmp_out(b, tp) > 0)
+        l = sum(1 for b, _ in finished if cmp_out(b, tp) < 0)
+        pc = sum(cmp_out(b, tp) for b, _ in finished)
+        stk = sum(b.price_cents * (b.units or 1) for b, _ in finished)
+        un = sum(cmp_out(b, tp) / b.price_cents for b, _ in finished if b.price_cents)
+        return w, l, pc, un, (pc / stk if stk else None)
+
+    wins, losses, pnl, profit_units, roi_v = mode_stats(is_tp)
+    n = wins + losses
     win_rate = wins / n if n else None
-    pnl = sum(effs[b.id][1] or 0 for b, _ in settled)          # cents
-    staked = sum(b.price_cents * (b.units or 1) for b, _ in settled)
-    profit_units = sum((effs[b.id][1] or 0) / b.price_cents
-                       for b, _ in settled if b.price_cents)   # units won
+    staked = sum(b.price_cents * (b.units or 1) for b, _ in finished)
     first = min((b.created_at for b, _ in bets), default=None)
     days = (datetime.now(timezone.utc) - first).days if first else 0
 
@@ -621,8 +632,13 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         ("CLV", f'<span style="color:{clv_color}">{avg_clv:+.1f}¢</span>'
          if avg_clv is not None else "—",
          f"beat close {beat}/{len(clv_vals)}" if clv_vals else "vs match-start line"),
-    ] + _other_mode_tiles(bets, tp_effs if not is_tp else hold_effs,
-                          "90¢ take-profit" if not is_tp else "hold to settlement", WON))
+    ] + (lambda ow, ol, opc, oun, _r: [
+        (("90¢" if not is_tp else "Hold") + " · record",
+         f"{ow}-{ol}", "same picks, other exit"),
+        (("90¢" if not is_tp else "Hold") + " · profit",
+         f'<span style="color:{"var(--good)" if opc > 0 else "var(--accent)" if opc < 0 else "var(--text)"}">{opc / 100:+.2f}</span>'
+         if (ow + ol) else "—", "on the same finished matches"),
+    ])(*mode_stats(not is_tp)))
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
 <div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
 <div class="metric"><div class="k">advisory basis</div><div class="v mono">{bucket(lambda b: b.basis == 'advisory')}</div></div>
@@ -699,13 +715,12 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                 f"to reach 70% — the tuning breakdown below says where to look.")
 
     # cumulative timeline — both exit rules overlaid, policy-version markers
-    def cum_of(emap):
-        chron = sorted([b for b, _ in bets if b.settled_at
-                        and emap[b.id][0] in ("won", "lost", "took_profit")],
+    def cum_of(tp):
+        chron = sorted([b for b, _ in finished if b.settled_at],
                        key=lambda b: b.settled_at)
         cum, series, vm, last = 0, [], [], None
         for b in chron:
-            cum += (emap[b.id][1] or 0)
+            cum += cmp_out(b, tp)
             series.append((b.settled_at, cum / 100))
             ver = (b.reasoning or {}).get("policy_version", "v1")
             if ver != last:
@@ -714,8 +729,8 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
                 last = ver
         return series, vm
 
-    pts, vmarks = cum_of(hold_effs)
-    tp_pts, _ = cum_of(tp_effs)
+    pts, vmarks = cum_of(False)
+    tp_pts, _ = cum_of(True)
     timeline = timeline_svg(pts, "$", vmarks, points2=tp_pts,
                             label="hold to settlement", label2="90¢ take-profit")
     timeline_html = f"""<section class="block"><div class="blockhead">
@@ -827,32 +842,8 @@ justify-content:space-between;gap:12px">
     # only differences are exit outcomes (reversal salvages), not timing.
     from bot.track import advisory_outcome
 
-    def cmp_out(b, tp: bool):
-        res = results.get(b.market_ticker)
-        o = advisory_outcome(b.side, res)
-        u = b.units or 1
-        if o is None:
-            return None  # match not finished → excluded from BOTH
-        if o == "void":
-            return 0
-        if not tp or b.price_cents >= TP_LIMIT:
-            return (100 - b.price_cents) * u if o == "won" else -b.price_cents * u
-        yb, nb = touched.get(b.market_ticker, (None, None))
-        hit = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
-              (b.side == "no" and (nb or 0) >= TP_LIMIT)
-        if hit or o == "won":
-            return (TP_LIMIT - b.price_cents) * u
-        return -b.price_cents * u
-
-    finished = [(b, p) for b, p in bets if cmp_out(b, False) is not None]
-
-    def cstats(tp: bool):
-        wins = sum(1 for b, _ in finished if cmp_out(b, tp) > 0)
-        losses = sum(1 for b, _ in finished if cmp_out(b, tp) < 0)
-        pc = sum(cmp_out(b, tp) for b, _ in finished)
-        stk = sum(b.price_cents * (b.units or 1) for b, _ in finished)
-        un = sum(cmp_out(b, tp) / b.price_cents for b, _ in finished if b.price_cents)
-        return wins, losses, pc, un, (pc / stk if stk else None)
+    def cstats(tp: bool):  # reuses the page-level cmp_out / finished / mode_stats
+        return mode_stats(tp)
 
     def cseries(tp: bool):
         chron = sorted([b for b, _ in finished if b.settled_at],
