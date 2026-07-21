@@ -503,6 +503,83 @@ def _tp_effective(b, result, touched90):
     return "open", None
 
 
+def _opponent_surname(title: str | None, pick_surname: str) -> str:
+    """Pull the loser/opponent surname out of a Kalshi title
+    ('Will X win the A vs B: ... match?')."""
+    if not title or " vs " not in title:
+        return "the opponent"
+    mid = title.split(" the ", 1)[-1].split(":")[0].split(" match")[0]
+    parts = [p.strip().split()[-1] for p in mid.split(" vs ") if p.strip()]
+    for p in parts:
+        if p.lower() != pick_surname.lower():
+            return p
+    return parts[-1] if parts else "the opponent"
+
+
+def postgame_analysis(pick: str, opp: str, side: str, result: str | None,
+                      scoreline: str | None, sets_a, sets_b, touched90: bool,
+                      price_cents: int, hold_pnl, tp_status: str, tp_pnl,
+                      clv, thesis: str) -> str:
+    """Deterministic post-game read on a settled bet: what actually happened vs
+    the pre-game thesis, the exit outcome, and CLV. No LLM — the fact block is
+    the prose (same discipline as the advisories)."""
+    from bot.mapping_fix import flip_scoreline
+    from bot.track import advisory_outcome
+
+    o = advisory_outcome(side, result)
+    if o not in ("won", "lost") or sets_a is None or sets_b is None:
+        return ""
+    # match_score_log is YES-oriented; flip to the side we actually backed
+    if side == "yes":
+        ps, os_, line = sets_a, sets_b, (scoreline or "")
+    else:
+        ps, os_, line = sets_b, sets_a, flip_scoreline(scoreline or "")
+    pick, opp, line = esc(pick), esc(opp), esc(line)
+    won = o == "won"
+    wsets = max(ps, os_)
+    straight = won and os_ == 0
+    lost_straight = (not won) and ps == 0
+    decider = wsets >= 2 and (ps + os_) == (2 * wsets - 1)  # went the full distance
+
+    S: list[str] = []
+    if won and straight:
+        S.append(f"<strong>Won as planned.</strong> {pick} closed it out {line} "
+                 f"in straight sets — {opp} never drew level on sets.")
+    elif won and decider:
+        S.append(f"<strong>Won the hard way.</strong> {pick} dropped a set but "
+                 f"took the decider, {line} — the distance held up in our favor.")
+    elif won:
+        S.append(f"<strong>Won.</strong> {pick} came through {line}.")
+    elif lost_straight:
+        S.append(f"<strong>Missed.</strong> {pick} lost in straight sets {line}; "
+                 f"the edge never materialized and {opp} led throughout.")
+    elif decider:
+        S.append(f"<strong>Missed in a decider.</strong> {pick} forced the "
+                 f"distance but lost {line} — right that it would be close, wrong "
+                 f"on the finish.")
+    else:
+        S.append(f"<strong>Missed.</strong> {pick} lost {line}.")
+
+    if not won and touched90 and tp_pnl is not None:
+        S.append(f"But {pick} led first — our side traded up to {TP_LIMIT}¢ before "
+                 f"the reversal, so the {TP_LIMIT}¢ take-profit salvaged "
+                 f"+{tp_pnl}¢ here where holding took the full −{price_cents}¢.")
+    elif won and tp_status == "took_profit" and hold_pnl is not None \
+            and tp_pnl is not None and tp_pnl < hold_pnl:
+        S.append(f"Hold banked +{hold_pnl}¢; the {TP_LIMIT}¢ exit capped at "
+                 f"+{tp_pnl}¢ — ~{hold_pnl - tp_pnl}¢ given up for the early lock-in.")
+
+    if thesis:
+        first = thesis.split(". ")[0]
+        S.append(f"Pre-game read was: “{esc(first)}.”")
+
+    if clv is not None:
+        verb = "beat" if clv > 0 else "lagged" if clv < 0 else "matched"
+        S.append(f"Closing-line value: {verb} the close by {abs(clv)}¢"
+                 + (" (bought too late)." if clv < 0 else "."))
+    return '<div class="prose" style="margin-top:6px">' + " ".join(S) + "</div>"
+
+
 async def testrun(request: web.Request) -> web.Response:
     return await _testrun_view(request, "hold")
 
@@ -919,7 +996,8 @@ iterates until the record holds above 70%. Nothing here is, or ever becomes, a
 real order.</p>"""
     status_th = "status"
     body = pagehead("Strategy Lab", title,
-                    f'{n} settled · <a href="/track">advisory track record →</a>') \
+                    f'{n} settled · <a href="/testrun/history">post-game log →</a> · '
+                    f'<a href="/track">advisory track record →</a>') \
         + strip + exit_note + watching_html + timeline_html + f"""
 {comparison_html}
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
@@ -930,6 +1008,110 @@ real order.</p>"""
 {bets_section("Live-game bets", "fired in-play when an advisory cleared the "
               "policy mid-match", "advisory", "live_open")}"""
     return respond(request, title, active, body)
+
+
+async def testrun_history(request: web.Request) -> web.Response:
+    """Every settled testrun bet with a post-game read: did the thesis hold,
+    what the match actually did, how each exit fared, and CLV."""
+    from sqlalchemy import text as sqltext
+
+    from bot.models import KalshiMarket, PaperBet, Scenario
+    from bot.track import advisory_outcome, clv_cents
+
+    with db_session() as db:
+        bets = db.execute(
+            select(PaperBet, Player.full_name)
+            .join(Player, Player.id == PaperBet.player_id, isouter=True)
+            .where(PaperBet.status.in_(("won", "lost", "void")))
+            .order_by(PaperBet.settled_at.desc().nullslast(),
+                      PaperBet.created_at.desc()).limit(150)
+        ).all()
+        results, closes, titles, touched, scorel, plans = {}, {}, {}, {}, {}, {}
+        if bets:
+            tks = [b.market_ticker for b, _ in bets]
+            evs = [b.event_ticker for b, _ in bets]
+            for tk, res, cl, tt in db.execute(select(
+                    KalshiMarket.ticker, KalshiMarket.result,
+                    KalshiMarket.close_yes_cents, KalshiMarket.title)
+                    .where(KalshiMarket.ticker.in_(tks))).all():
+                results[tk], closes[tk], titles[tk] = res, cl, tt
+            since = min(b.created_at for b, _ in bets)
+            for r in db.execute(sqltext(
+                "SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb "
+                "FROM market_ticks WHERE market_ticker = ANY(:t) AND kind='quote' "
+                "AND ts >= :since GROUP BY market_ticker"),
+                    {"t": tks, "since": since}).all():
+                touched[r[0]] = (r[1], r[2])
+            for r in db.execute(sqltext(
+                "SELECT DISTINCT ON (market_ticker) market_ticker, scoreline, "
+                "sets_a, sets_b FROM match_score_log WHERE market_ticker = ANY(:t) "
+                "ORDER BY market_ticker, ts DESC"), {"t": tks}).all():
+                scorel[r[0]] = (r[1], r[2], r[3])
+            for sc in db.execute(select(Scenario).where(
+                    Scenario.event_ticker.in_(evs))
+                    .order_by(Scenario.created_for)).scalars():
+                plans[sc.event_ticker] = sc
+
+    entries, settled, held, salvaged = [], 0, 0, 0
+    for b, player in bets:
+        res = results.get(b.market_ticker)
+        o = advisory_outcome(b.side, res)
+        if o not in ("won", "lost"):
+            continue
+        settled += 1
+        held += (o == "won")
+        line, sa, sb = scorel.get(b.market_ticker, (None, None, None))
+        yb, nb = touched.get(b.market_ticker, (None, None))
+        t90 = (b.side == "yes" and (yb or 0) >= TP_LIMIT) or \
+              (b.side == "no" and (nb or 0) >= TP_LIMIT)
+        tp_status, tp_pnl = _tp_effective(b, res, t90)
+        clv = clv_cents(b.side, b.price_cents, closes.get(b.market_ticker))
+        pick = (player or "").split()[-1] or "the pick"
+        opp = _opponent_surname(titles.get(b.market_ticker), pick)
+        thesis = plans[b.event_ticker].narrative if b.event_ticker in plans else ""
+        if o == "lost" and t90:
+            salvaged += 1
+        analysis = postgame_analysis(pick, opp, b.side, res, line, sa, sb, t90,
+                                     b.price_cents, b.pnl_cents, tp_status, tp_pnl,
+                                     clv, thesis)
+        badge = tag("good", "✓", "won") if o == "won" else tag("accent", "✕", "lost")
+        pc = lambda v: ("var(--good)" if (v or 0) > 0 else
+                        "var(--accent)" if (v or 0) < 0 else "var(--muted)")
+        tp_txt = (f"+{tp_pnl}¢" if tp_status == "took_profit" else
+                  f"{tp_pnl:+d}¢" if tp_pnl is not None else "—")
+        entries.append(f"""<div style="padding:14px 0;border-top:1px solid var(--divider)">
+<div class="blockhead"><h4 style="font-size:16px">{esc(player or pick)} {badge}
+<span class="mono sub2" style="font-weight:400">{esc(line or '—')}</span></h4>
+<span class="aside">{pt(b.settled_at) if b.settled_at else ''}</span></div>
+{analysis}
+<div class="metric-grid" style="grid-template-columns:repeat(4,1fr);margin-top:8px">
+<div class="metric"><div class="k">bet</div><div class="v mono">{esc(b.side)} @ {b.price_cents}¢ · {b.units or 1}u</div></div>
+<div class="metric"><div class="k">hold P&amp;L</div><div class="v mono" style="color:{pc(b.pnl_cents)}">{f'{b.pnl_cents:+d}¢' if b.pnl_cents is not None else '—'}</div></div>
+<div class="metric"><div class="k">90¢ take-profit</div><div class="v mono" style="color:{pc(tp_pnl)}">{tp_txt}</div></div>
+<div class="metric"><div class="k">CLV</div><div class="v mono" style="color:{pc(clv)}">{f'{clv:+d}¢' if clv is not None else '—'}</div></div>
+</div>
+<a class="sub2" href="/match/{esc(b.event_ticker)}">full match data →</a></div>""")
+
+    hold_rate = f"{held / settled:.0%}" if settled else "—"
+    strip = statstrip([
+        ("Settled bets", str(settled), "post-game analysed"),
+        ("Thesis held", f"{held}/{settled}", f"{hold_rate} of picks won"),
+        ("Reversals salvaged", str(salvaged),
+         "lost on hold, +90¢ on take-profit"),
+    ])
+    intro = ("""<p class="prose" style="margin:0 0 18px">Every settled bot bet,
+newest first, with a post-game read: whether the pre-game thesis held, what the
+match actually did, how each exit (hold vs 90¢) fared, and closing-line value.
+Generated from the recorded scoreline and settlement — advisory only.</p>""")
+    log_html = (f'<section class="block"><div class="blockhead"><h4>Post-game log'
+                f'</h4><span class="aside">{settled} settled bets</span></div>'
+                f'{"".join(entries)}</section>' if entries else
+                '<section class="block"><p class="prose">No settled bets yet — '
+                'analysis appears here once the first bet resolves.</p></section>')
+    body = pagehead("Strategy Lab", "Testrun History",
+                    '<a href="/testrun">← back to testrun</a>') \
+        + strip + intro + log_html
+    return respond(request, "Testrun History", "testrun", body)
 
 
 async def track(request: web.Request) -> web.Response:
@@ -2197,6 +2379,7 @@ def make_app() -> web.Application:
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
     app.router.add_get("/testrun", testrun)
+    app.router.add_get("/testrun/history", testrun_history)
     app.router.add_get("/testrun-tp", testrun_tp)
     app.router.add_get("/players", players)
     app.router.add_get("/player/{pid:\\d+}", player_detail)
