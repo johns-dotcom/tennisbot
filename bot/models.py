@@ -288,7 +288,7 @@ class PaperBet(Base):
     model_confidence: Mapped[float] = mapped_column(Float)
     edge: Mapped[float] = mapped_column(Float)
     basis: Mapped[str] = mapped_column(String(16))  # 'prematch' | 'advisory'
-    units: Mapped[int] = mapped_column(Integer, default=1)  # 1-3; 3 is rare
+    units: Mapped[float] = mapped_column(Float, default=1.0)  # 1.0-3.0, decimal; multi-unit rare
     tier: Mapped[str | None] = mapped_column(String(8))
     state_at_placement: Mapped[str | None] = mapped_column(String(16))
     reasoning: Mapped[dict | None] = mapped_column(JSONB)  # snapshot for tuning

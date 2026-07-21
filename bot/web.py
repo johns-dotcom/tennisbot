@@ -809,12 +809,12 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
             f"{b.model_prob:.0%} against a {b.price_cents}¢ ask — a "
             f"{b.edge * 100:.1f}% edge at {b.model_confidence:.0%} model "
             f"confidence; {basis_txt}.",
-            f"Sized {b.units or 1}u: " + (
-                "baseline unit — cleared the entry gates without 2u conviction."
-                if (b.units or 1) == 1 else
-                "probability, edge and confidence all cleared the 2u conviction bar."
-                if b.units == 2 else
-                "extreme reading on all three axes — the rare 3u."),
+            (lambda u: f"Sized {u:.1f}u: " + (
+                "baseline stake — cleared the gates without extra conviction."
+                if u < 1.5 else
+                "elevated stake — a strong calibrated favorite on solid data."
+                if u < 2.5 else
+                "rare max stake — an exceptional favorite on deep data."))(b.units or 1.0),
         ]
         pr = r.get("policy_reason")
         if pr:
@@ -845,7 +845,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
 · <a class="sub2" href="/match/{esc(b.event_ticker)}">full analysis →</a>
 {why(b, player)}</td>
 <td class="mono">{b.price_cents}¢</td>
-<td class="mono" style="font-weight:800">{b.units or 1}u</td>
+<td class="mono" style="font-weight:800">{b.units or 1:.1f}u</td>
 <td class="mono">{b.model_prob:.0%}</td>
 <td class="mono">+{b.edge * 100:.1f}%</td>
 <td>{tag('neutral', '·', b.basis)} {tag('neutral', '·', b.tier or '?')}</td>
@@ -932,7 +932,7 @@ version changes; records before and after a tune are never blended silently.</p>
                          tier=_tier_of(sc.market_ticker))
         price = ya if ya is not None else "—"
         if dec.place:
-            verdict = tag("good", "✓", f"clears — {dec.units}u candidate")
+            verdict = tag("good", "✓", f"clears — {dec.units:.1f}u candidate")
         elif ya is None:
             verdict = tag("neutral", "○", "awaiting live price")
         else:
@@ -1131,7 +1131,7 @@ async def testrun_history(request: web.Request) -> web.Response:
 <span class="aside">{pt(b.settled_at) if b.settled_at else ''}</span></div>
 {analysis}
 <div class="metric-grid" style="grid-template-columns:repeat(4,1fr);margin-top:8px">
-<div class="metric"><div class="k">bet</div><div class="v mono">{esc(b.side)} @ {b.price_cents}¢ · {b.units or 1}u</div></div>
+<div class="metric"><div class="k">bet</div><div class="v mono">{esc(b.side)} @ {b.price_cents}¢ · {b.units or 1:.1f}u</div></div>
 <div class="metric"><div class="k">hold P&amp;L</div><div class="v mono" style="color:{pc(b.pnl_cents)}">{f'${dol(b.pnl_cents):+.2f}' if b.pnl_cents is not None else '—'}</div></div>
 <div class="metric"><div class="k">90¢ take-profit</div><div class="v mono" style="color:{pc(tp_pnl)}">{tp_txt}</div></div>
 <div class="metric"><div class="k">CLV</div><div class="v mono" style="color:{pc(clv)}">{f'{clv:+d}¢' if clv is not None else '—'}</div></div>
@@ -1219,8 +1219,8 @@ async def history(request: web.Request) -> web.Response:
             our_n += 1
             won = bet.status == "won"
             our_w += won
-            tag_html = (tag("good", "✓", f"bet {bet.side} {bet.units or 1}u — won")
-                        if won else tag("accent", "✕", f"bet {bet.side} {bet.units or 1}u — lost")
+            tag_html = (tag("good", "✓", f"bet {bet.side} {bet.units or 1:.1f}u — won")
+                        if won else tag("accent", "✕", f"bet {bet.side} {bet.units or 1:.1f}u — lost")
                         if bet.status == "lost" else tag("neutral", "·", f"bet {bet.side}"))
         elif tk in advised:
             tag_html = tag("outline", "▲", "advised")
@@ -2294,7 +2294,7 @@ async def match_detail(request: web.Request) -> web.Response:
                 PaperBet.event_ticker == event_ticker)).scalars():
             marks.append({"kind": "bet", "ts": bet.created_at,
                           "price": bet.price_cents,
-                          "title": f"paper bet {bet.units}u @ {bet.price_cents}¢ "
+                          "title": f"paper bet {bet.units:.1f}u @ {bet.price_cents}¢ "
                                    f"({bet.basis})"})
         from bot.models import MatchScoreLog
 
@@ -2568,7 +2568,7 @@ async def api_events(request: web.Request) -> web.Response:
             for a, p in advs],
         "bets": [
             {"id": b.id,
-             "text": f"{p or b.event_ticker} · {b.units}u @ {b.price_cents}¢ · "
+             "text": f"{p or b.event_ticker} · {b.units:.1f}u @ {b.price_cents}¢ · "
                      f"model {b.model_prob:.0%} ({b.basis})"}
             for b, p in bets],
     })

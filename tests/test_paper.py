@@ -57,13 +57,23 @@ def test_v4_challenger_is_demoted():
     assert strong.place
 
 
-def test_unit_sizing_reserved_for_believable_edges():
-    from bot.paper import size_units
+def test_sizing_is_continuous_confidence_driven_and_sparing():
+    from bot.paper import MAX_UNITS, size_units
 
-    assert size_units(0.70, 0.04, 0.65) == 1
-    assert size_units(0.76, 0.07, 0.80) == 2
-    assert size_units(0.85, 0.12, 0.90) == 3
-    assert size_units(0.99, 0.25, 0.99) == 1  # huge edge never upsizes
+    # decimals, in-range
+    v = size_units(0.90, 0.05, 1.0)
+    assert isinstance(v, float) and 1.0 < v < MAX_UNITS
+    # monotone in probability (more confidence the pick wins → bigger stake)
+    assert (size_units(0.85, 0.05, 1.0) < size_units(0.90, 0.05, 1.0)
+            < size_units(0.95, 0.05, 1.0) <= MAX_UNITS)
+    # multi-unit is sparing: a middling calibrated favorite stays near 1u
+    assert size_units(0.85, 0.05, 1.0) < 1.5
+    # gated by data depth: thin data shrinks the same strong pick toward 1u
+    assert size_units(0.93, 0.05, 0.62) < size_units(0.93, 0.05, 1.0)
+    # floor and cap, and a suspicious edge is never pressed
+    assert size_units(0.82, 0.03, 0.60) == 1.0
+    assert size_units(0.99, 0.05, 1.0) == MAX_UNITS
+    assert size_units(0.95, 0.25, 1.0) == 1.0
 
 
 def test_shared_gate_used_by_both_paths():

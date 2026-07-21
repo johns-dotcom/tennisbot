@@ -35,7 +35,7 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v4"  # v4: selectivity — only the calibrated band, sane edges
+POLICY_VERSION = "v5"  # v5: continuous confidence-driven decimal unit sizing
 
 # v4 selectivity (from the CLV/edge dig on 54 settled bets): the bot was betting
 # ~indiscriminately (54 in ~1.5 days) and the losers were concentrated in three
@@ -54,8 +54,22 @@ PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks RO
 PAPER_MIN_PRICE = 20
 CHALLENGER_MIN_PROB = 0.86
 
-# kept for sizing (2u/3u require a believable edge band, not an outlier)
+# kept for sizing (multi-unit requires a believable edge, not an outlier)
 EDGE_SANE_MAX = PAPER_MAX_EDGE
+
+# Confidence-driven decimal sizing (v5). Stake in [1.0, MAX_UNITS], one decimal.
+# Conviction = how far into the strong-favorite range the pick is, GATED by how
+# well the read is supported by data — the two are multiplied, so a multi-unit
+# stake needs BOTH a strong calibrated probability AND deep data. GAMMA > 1 and
+# a high saturation point keep multi-unit sparing: most bets sit near 1u and
+# only genuine standouts approach the cap.
+MAX_UNITS = 3.0
+SIZING_GAMMA = 1.7
+PROB_SATURATION = 0.97  # prob at which the stake reaches MAX_UNITS
+
+
+def _clip01(x: float) -> float:
+    return max(0.0, min(1.0, x))
 
 
 def tier_prob_floor(tier: str | None) -> float:
@@ -70,23 +84,20 @@ def policy_ok(prob: float, edge: float, price: int, tier: str | None) -> bool:
             and PAPER_MIN_EDGE <= edge <= PAPER_MAX_EDGE
             and PAPER_MIN_PRICE <= price <= PAPER_MAX_PRICE)
 
-# Unit sizing: 1u default; 2u strong conviction; 3u EXTREMELY sparse. Every
-# threshold must be met AND the edge must be believable. Never more than 3.
-UNITS_2 = {"prob": 0.75, "edge_lo": 0.05, "edge_hi": EDGE_SANE_MAX, "conf": 0.75}
-UNITS_3 = {"prob": 0.85, "edge_lo": 0.08, "edge_hi": EDGE_SANE_MAX, "conf": 0.88}
+def size_units(prob: float, edge: float, confidence: float) -> float:
+    """Continuous, confidence-driven stake in [1.0, MAX_UNITS] (one decimal).
 
-
-def size_units(prob: float, edge: float, confidence: float) -> int:
-    # a suspiciously large edge is a red flag, not conviction — stay at 1u
+    conviction = prob_score · conf_score, where prob_score is how far the pick
+    reaches into the strong-favorite range and conf_score is data depth beyond
+    the floor. Multiplicative → both must be high, so multi-unit stays sparing.
+    A suspicious (too-large) edge never presses the size."""
     if edge > EDGE_SANE_MAX:
-        return 1
-    if (prob >= UNITS_3["prob"] and UNITS_3["edge_lo"] <= edge <= UNITS_3["edge_hi"]
-            and confidence >= UNITS_3["conf"]):
-        return 3
-    if (prob >= UNITS_2["prob"] and UNITS_2["edge_lo"] <= edge <= UNITS_2["edge_hi"]
-            and confidence >= UNITS_2["conf"]):
-        return 2
-    return 1
+        return 1.0
+    prob_score = _clip01((prob - PAPER_MIN_PROB) / (PROB_SATURATION - PAPER_MIN_PROB))
+    conf_score = _clip01((confidence - PAPER_MIN_CONF) / (1.0 - PAPER_MIN_CONF))
+    conviction = prob_score * conf_score
+    units = 1.0 + (MAX_UNITS - 1.0) * conviction ** SIZING_GAMMA
+    return round(min(MAX_UNITS, max(1.0, units)), 1)
 
 
 @dataclass
@@ -96,7 +107,7 @@ class BetDecision:
     prob: float = 0.0
     edge: float = 0.0
     price_cents: int = 0
-    units: int = 1
+    units: float = 1.0
     reason: str = ""
 
 
@@ -125,7 +136,7 @@ def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
                        reason=f"prob {prob:.0%} ≥ {floor:.0%}{chal}, edge "
                               f"{edge * 100:.1f}% in [{PAPER_MIN_EDGE * 100:.0f}–"
                               f"{PAPER_MAX_EDGE * 100:.0f}]%"
-                              f"{f', {units}u conviction' if units > 1 else ''}")
+                              f"{f', {units:.1f}u conviction' if units > 1 else ''}")
 
 
 def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
@@ -142,7 +153,8 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
         market_ticker=market_ticker, player_id=player_id, side=decision.side,
         price_cents=decision.price_cents, model_prob=decision.prob,
         model_confidence=round(confidence, 3), edge=decision.edge, basis=basis,
-        units=max(1, min(3, decision.units)), tier=tier, state_at_placement=state,
+        units=round(max(1.0, min(MAX_UNITS, decision.units)), 1), tier=tier,
+        state_at_placement=state,
         reasoning={**(reasoning or {}), "policy_reason": decision.reason,
                    "policy_version": POLICY_VERSION}))
     db.commit()
