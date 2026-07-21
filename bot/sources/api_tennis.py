@@ -42,6 +42,7 @@ class ApiTennisSource(TennisDataSource):
         self.base = cfg.api_tennis_base
         self.horizon = timedelta(hours=cfg.schedule_horizon_hours)
         self.client = httpx.Client(timeout=60)
+        self._pk_cache: dict[tuple, int] = {}  # (tour, player_key) -> our player_id
 
     def _get(self, method: str, **params) -> list[dict]:
         r = self.client.get(self.base, params={"method": method, "APIkey": self.key, **params})
@@ -68,26 +69,36 @@ class ApiTennisSource(TennisDataSource):
 
     def _match_player(self, db: Session, matcher: PlayerMatcher, tour: str,
                       raw_name: str, api_key: str | None, context: dict) -> int | None:
-        # fast path: previously linked api_tennis_id
-        if api_key:
+        # in-run cache by api-tennis player key — a player appears in many
+        # fixtures across a 3-month backfill; resolve (incl. the expensive fuzzy)
+        # once, not per fixture
+        ck = (tour, str(api_key)) if api_key else None
+        if ck and ck in self._pk_cache:
+            return self._pk_cache[ck]
+        if api_key:  # persisted link from a prior run
             pid = db.execute(
-                select(Player.id).where(Player.tour == tour, Player.api_tennis_id == str(api_key))
-            ).scalar()
+                select(Player.id).where(Player.tour == tour,
+                                        Player.api_tennis_id == str(api_key))).scalar()
             if pid:
+                self._pk_cache[ck] = pid
                 return pid
-        res = matcher.match(db, raw_name, source=self.name, context=context)
-        if res.player_id and api_key:
-            db.get(Player, res.player_id).api_tennis_id = str(api_key)
-        if res.player_id is None and res.method == "none" and res.confidence == 0.0:
-            # genuinely new player (typical for ITF): create a provisional row
-            if context.get("reason") != "ambiguous":
-                p = Player(tour=tour, api_tennis_id=str(api_key) if api_key else None,
-                           full_name=raw_name, normalized_name=normalize_name(raw_name))
-                db.add(p)
-                db.flush()
-                log.info("provisional player created", name=raw_name, tour=tour)
-                return p.id
-        return res.player_id
+        # queue_on_miss=False: backfill creates a provisional on miss, so the
+        # per-miss review-queue query+insert (2 round-trips) is pure overhead
+        res = matcher.match(db, raw_name, source=self.name, context=context,
+                            queue_on_miss=False)
+        resolved = res.player_id
+        if resolved and api_key:
+            db.get(Player, resolved).api_tennis_id = str(api_key)
+        if resolved is None and res.method == "none" and res.confidence == 0.0 \
+                and context.get("reason") != "ambiguous":
+            p = Player(tour=tour, api_tennis_id=str(api_key) if api_key else None,
+                       full_name=raw_name, normalized_name=normalize_name(raw_name))
+            db.add(p)
+            db.flush()
+            resolved = p.id
+        if ck and resolved:
+            self._pk_cache[ck] = resolved
+        return resolved
 
     def _tournament(self, db: Session, tour: str, fixture: dict) -> int | None:
         tkey = str(fixture.get("tournament_key") or "")
@@ -240,9 +251,12 @@ class ApiTennisSource(TennisDataSource):
             for f in fixtures:
                 try:
                     self._upsert_fixture(db, matcher_by_tour, f, result)
+                    db.commit()  # per-fixture: no long transaction for Neon to drop
                 except Exception as e:
+                    db.rollback()
                     result.errors.append(f"event {f.get('event_key')}: {e}")
-            db.commit()
+            log.info("api-tennis window done", start=str(cur), stop=str(win_end),
+                     matches=result.matches_upserted)
             cur = win_end + timedelta(days=1)
 
         stmt = pg_insert(IngestState).values(
