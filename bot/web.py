@@ -1736,6 +1736,7 @@ point data · past year, widened to career if thin</span></div>
         for lbl, st in (("win % · won set 1", cond.win_given_set1_won),
                         ("win % · lost set 1", cond.win_given_set1_lost),
                         ("forces set 3 · lost set 1", cond.decider_given_set1_lost),
+                        ("wins set 3 · lost set 2", cond.set3_given_lost_set2),
                         ("tiebreaks", prof.clutch.tiebreak if prof.clutch else None)):
             if st is not None and not st.is_omitted:
                 cells.append(f'<div class="metric"><div class="k">{lbl}</div>'
@@ -1803,7 +1804,9 @@ past year {d.last365.wins}-{d.last365.losses}
 ({f"{d.last365.value:.0%}" if d.last365.value is not None else "—"}) ·
 sequence {dec_seq} ·
 days since last decider win:
-{d.days_since_decider_win if d.days_since_decider_win is not None else "—"}</p>
+{d.days_since_decider_win if d.days_since_decider_win is not None else "—"} ·
+last decider played:
+{f"{d.days_since_decider_played}d ago" if d.days_since_decider_played is not None else "—"}</p>
 </section>
 {cond_html}
 {serve_html}

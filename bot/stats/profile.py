@@ -103,6 +103,7 @@ class DecidingSetBlock:
     last_n_results: list[dict]  # newest first: {date, won}
     streak: int  # +N winning streak in deciders
     days_since_decider_win: int | None
+    days_since_decider_played: int | None  # rust — last time they were in a decider at all
     skunk_share_of_wins_365: Stat  # % of wins that were straight-sets
     skunk_share_of_wins_career: Stat
     last60_vs_prior: tuple[Stat, Stat]  # (last 60d, prior career)
@@ -135,6 +136,7 @@ def compute_deciding_sets(history: list[MatchRow], as_of: date, last_n: int = 7)
 
     last_win = next((m for m in deciders if m.won_decider), None)
     days_since = (as_of - last_win.match_date).days if last_win else None
+    days_played = (as_of - deciders[0].match_date).days if deciders else None
 
     def skunk_share(pool: list[MatchRow], window: str) -> Stat:
         wins = [m for m in pool if m.won]
@@ -151,6 +153,7 @@ def compute_deciding_sets(history: list[MatchRow], as_of: date, last_n: int = 7)
                         for m in deciders[:last_n]],
         streak=streak,
         days_since_decider_win=days_since,
+        days_since_decider_played=days_played,
         skunk_share_of_wins_365=skunk_share(_window(ms, as_of, 365), "last365"),
         skunk_share_of_wins_career=skunk_share(ms, "career"),
         last60_vs_prior=(dec_rate(d60, "last60"), dec_rate(prior, "prior")),
@@ -403,11 +406,13 @@ def compute_charting(rows: list[dict]) -> ChartingBlock:
 
 @dataclass
 class ConditionalBlock:
-    """Gameflow conditionals — win probability given how set 1 goes. The core
-    of 'if he takes set 1 it's over' / 'don't panic if he drops set 1'."""
-    win_given_set1_won: Stat      # P(win match | won set 1)
-    win_given_set1_lost: Stat     # P(win match | lost set 1)
-    decider_given_set1_lost: Stat  # P(reached a deciding set | lost set 1)
+    """Gameflow conditionals — win probability given how set 1 goes, plus the
+    set-2→set-3 recovery. 'if he takes set 1 it's over' / 'don't panic if he
+    drops set 1' / 'loses set 2 but still takes set 3'."""
+    win_given_set1_won: Stat        # P(win match | won set 1)
+    win_given_set1_lost: Stat       # P(win match | lost set 1)
+    decider_given_set1_lost: Stat   # P(reached a deciding set | lost set 1)
+    set3_given_lost_set2: Stat      # P(won set 3 | lost set 2 and reached set 3)
 
 
 def compute_conditional(history: list[MatchRow], as_of: date,
@@ -425,14 +430,21 @@ def compute_conditional(history: list[MatchRow], as_of: date,
         r = sum(1 for m in pool if m.reached_decider)
         return rate(r, len(pool) - r, window)
 
+    def set3_rate(pool, window):
+        played3 = [m for m in pool if any(n == 3 for n, _ in m.set_results)]
+        w = sum(1 for m in played3 if any(n == 3 and won for n, won in m.set_results))
+        return rate(w, len(played3) - w, window)
+
     def best(pool, fn):
         recent = [m for m in pool if m.match_date >= cutoff]
         return pick(min_sample, fn(recent, "last365"), fn(pool, "career"))
 
+    lost2 = [m for m in ms if any(n == 2 and not w for n, w in m.set_results)]
     return ConditionalBlock(
         win_given_set1_won=best(won1, winrate),
         win_given_set1_lost=best(lost1, winrate),
         decider_given_set1_lost=best(lost1, decider_rate),
+        set3_given_lost_set2=best(lost2, set3_rate),
     )
 
 
@@ -538,6 +550,7 @@ class PlayerProfile:
     set_rates: dict = field(default_factory=dict)
     conditional: ConditionalBlock | None = None
     schedule: ScheduleBlock | None = None
+    age: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -650,4 +663,5 @@ def build_profile(db: Session, player_id: int, as_of: date,
         set_rates=compute_set_rates(history, as_of),
         conditional=compute_conditional(history, as_of),
         schedule=compute_schedule(history, as_of),
+        age=round((as_of - player.dob).days / 365.25, 1) if player.dob else None,
     )

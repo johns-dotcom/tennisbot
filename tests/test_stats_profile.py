@@ -277,3 +277,23 @@ def test_style_matchup_empty_when_uncharted():
     from bot.stats.profile import style_matchup
 
     assert style_matchup(None, None, "A", "B") == []
+
+
+def test_conditional_set3_after_losing_set2():
+    from bot.stats.profile import compute_conditional
+    # 10 matches where player lost set 2 (won set 1, forced to set 3);
+    # won set 3 in 8 of them
+    hist = [mk(10 + i, i < 8, sets=((1, True), (2, False), (3, i < 8)))
+            for i in range(10)]
+    c = compute_conditional(hist, AS_OF, min_sample=5)
+    assert c.set3_given_lost_set2.wins == 8 and c.set3_given_lost_set2.losses == 2
+
+
+def test_days_since_decider_played():
+    from bot.stats.profile import compute_deciding_sets
+    # last decider was a loss 30 days ago; last decider WIN 60 days ago
+    hist = [mk(30, False, reached_decider=True, won_decider=False),
+            mk(60, True, reached_decider=True, won_decider=True)]
+    d = compute_deciding_sets(hist, AS_OF)
+    assert d.days_since_decider_played == 30   # most recent decider (a loss)
+    assert d.days_since_decider_win == 60       # most recent decider WIN

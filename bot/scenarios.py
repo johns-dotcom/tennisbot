@@ -206,16 +206,43 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
         if o_dec.streak <= -3:
             bits.append(f"{o_name} has lost {abs(o_dec.streak)} straight {lab}s.")
             salience += 0.1
+        # rust / decider inexperience — hasn't been in a decider in a while
+        if o_dec.days_since_decider_played and o_dec.days_since_decider_played >= 45:
+            bits.append(f"{o_name} hasn't played a {lab} in "
+                        f"{o_dec.days_since_decider_played} days — rusty and "
+                        f"untested if this goes long.")
+            salience += 0.08
 
-    # 4. fatigue
+    # 3b. set-2 → set-3 recovery
+    s23 = getattr(w_prof, "conditional", None)
+    if s23 and not s23.set3_given_lost_set2.is_omitted \
+            and s23.set3_given_lost_set2.value is not None \
+            and s23.set3_given_lost_set2.value >= 0.6:
+        v = s23.set3_given_lost_set2
+        bits.append(f"Even if {w_name} drops set 2, they take set 3 "
+                    f"{int(round(v.value * 100))}% of the time ({v.wins}-{v.losses}) "
+                    f"— resilient in the decider.")
+        salience += 0.06
+
+    # 4. fatigue (same-day is heavier than yesterday)
     if o_fat and o_fat.get("played"):
+        when = "earlier today" if o_fat.get("played_today") else "yesterday"
         dist = " and went the distance" if o_fat.get("went_distance") else ""
-        bits.append(f"{o_name} played yesterday{dist} — fatigue is live in the "
+        bits.append(f"{o_name} played {when}{dist} — fatigue is live in the "
                     f"later sets.")
-        salience += 0.15 if o_fat.get("went_distance") else 0.08
-    if w_fat and w_fat.get("played") and w_fat.get("went_distance"):
-        bits.append(f"(Caveat: {w_name} also went the distance yesterday.)")
-        salience -= 0.05
+        salience += (0.2 if o_fat.get("played_today") else 0.1) + \
+            (0.05 if o_fat.get("went_distance") else 0)
+    if w_fat and w_fat.get("played_today"):
+        bits.append(f"(Caveat: {w_name} also played earlier today.)")
+        salience -= 0.06
+
+    # 4b. age + decline — the '41 years old and falling off' read
+    o_age = getattr(o_prof, "age", None)
+    o_delta = o_prof.form.ytd_vs_career_delta
+    if o_age and o_age >= 34 and o_delta is not None and o_delta <= -0.08:
+        bits.append(f"{o_name} is {o_age:.0f} and fading — down "
+                    f"{abs(o_delta) * 100:.0f}% from career form this year.")
+        salience += 0.08
 
     # 5. risk rule — strategy convention, not a statistic
     bits.append(f"If {w_name} drops set 1, do not chase: the second entry only "
@@ -279,8 +306,10 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
 
 
 def _yesterday_played(db: Session, now: datetime) -> dict[int, dict]:
-    """player_id -> fatigue flags from yesterday's Kalshi schedule."""
-    lo, hi = now - timedelta(hours=40), now - timedelta(hours=8)
+    """player_id -> fatigue flags: played earlier today, or yesterday, and
+    whether that match went the distance."""
+    today_lo = now - timedelta(hours=8)   # earlier today (already finished-ish)
+    yday_lo, yday_hi = now - timedelta(hours=40), now - timedelta(hours=8)
     out: dict[int, dict] = {}
     for m in db.execute(select(KalshiMarket).where(
             KalshiMarket.player_a_id.is_not(None))).scalars().all():
@@ -291,16 +320,20 @@ def _yesterday_played(db: Session, now: datetime) -> dict[int, dict]:
             occ = datetime.fromisoformat(occ_raw.replace("Z", "+00:00"))
         except ValueError:
             continue
-        if lo <= occ <= hi:
-            went = None
-            fs = (m.raw or {}).get("_final_sets")
-            if fs is not None:
-                went = int(fs) >= int((m.raw or {}).get("_best_of", 3))
-            prev = out.get(m.player_a_id)
-            out[m.player_a_id] = {
-                "played": True,
-                "went_distance": bool(went) or bool(prev and prev.get("went_distance")),
-            }
+        today = today_lo <= occ <= now
+        yday = yday_lo <= occ <= yday_hi
+        if not (today or yday):
+            continue
+        went = None
+        fs = (m.raw or {}).get("_final_sets")
+        if fs is not None:
+            went = int(fs) >= int((m.raw or {}).get("_best_of", 3))
+        prev = out.get(m.player_a_id, {})
+        out[m.player_a_id] = {
+            "played": True,
+            "played_today": today or prev.get("played_today", False),
+            "went_distance": bool(went) or prev.get("went_distance", False),
+        }
     return out
 
 
