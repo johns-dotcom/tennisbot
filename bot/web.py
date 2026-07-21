@@ -57,19 +57,33 @@ a { color: var(--accent); text-underline-offset: 3px; }
 ::selection { background: rgba(255,86,60,.35); }
 
 header.nav { position: sticky; top: 0; z-index: 20; background: var(--bg);
-  display: flex; align-items: center; flex-wrap: wrap; gap: 12px 24px;
-  padding: 14px 20px; border-bottom: 2px solid var(--divider-strong); }
-.brand { font-weight: 800; font-size: 18px; letter-spacing: .02em; }
-.brand small { font-size: 10px; letter-spacing: .14em; font-weight: 400;
-  text-transform: uppercase; color: var(--muted); margin-left: 10px; }
-nav.links { display: flex; gap: 22px; margin-right: auto; flex-wrap: wrap; }
-nav.links a { padding: 6px 0; border-bottom: 2px solid transparent;
-  font-weight: 800; font-size: 12.5px; letter-spacing: .05em;
-  text-transform: uppercase; color: var(--muted); text-decoration: none; }
+  display: flex; align-items: center; flex-wrap: wrap; gap: 10px 20px;
+  padding: 12px 20px; border-bottom: 2px solid var(--divider-strong); }
+.brand { font-weight: 800; font-size: 18px; letter-spacing: .02em;
+  display: inline-flex; align-items: center; }
+.brand .tag { font-size: 9px; letter-spacing: .13em; font-weight: 700;
+  text-transform: uppercase; color: var(--muted); margin-left: 10px;
+  border: 1px solid var(--divider); border-radius: 999px; padding: 2px 8px; }
+nav.links { display: flex; align-items: center; margin-right: auto;
+  flex-wrap: wrap; }
+.navgroup { display: flex; gap: 18px; padding: 0 16px; }
+.navgroup:first-child { padding-left: 0; }
+.navgroup + .navgroup { border-left: 1px solid var(--divider); }
+nav.links a { padding: 5px 0; border-bottom: 2px solid transparent;
+  font-weight: 800; font-size: 12px; letter-spacing: .05em;
+  text-transform: uppercase; color: var(--muted); text-decoration: none;
+  transition: color .12s ease, border-color .12s ease; white-space: nowrap; }
 nav.links a:hover { color: var(--text); }
 nav.links a.active { color: var(--text); border-bottom-color: var(--accent); }
 .conn { font-size: 11px; color: var(--muted); display: inline-flex;
   align-items: center; gap: 7px; letter-spacing: .06em; }
+@media (max-width: 760px) {
+  header.nav { padding: 10px 14px; gap: 8px 14px; }
+  nav.links { order: 3; width: 100%; flex-wrap: nowrap; overflow-x: auto;
+    -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+  nav.links::-webkit-scrollbar { display: none; }
+  .navgroup { padding: 0 12px; }
+}
 .dot { width: 8px; height: 8px; display: inline-block; border-radius: 50%; }
 
 main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; }
@@ -311,24 +325,25 @@ historical data © Jeff Sackmann / Tennis Abstract (CC BY-NC-SA 4.0), personal
 research use · advisory only, nothing here is an order.</footer>"""
     if fragment:
         return body + footer
+    nav_groups = (
+        (("/", "home", "Overview"), ("/live", "live", "Live"),
+         ("/scenarios", "scenarios", "Scenarios")),
+        (("/testrun", "testrun", "Testrun"), ("/testrun/t2", "testrun-t2", "T2")),
+        (("/history", "history", "History"), ("/players", "players", "Database")),
+        (("/flags", "flags", "Flags"), ("/system", "system", "System")),
+    )
     navs = "".join(
-        f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
-        for href, key, label in (("/", "home", "Overview"),
-                                 ("/live", "live", "Live"),
-                                 ("/scenarios", "scenarios", "Scenarios"),
-                                 ("/testrun", "testrun", "Bot Testrun"),
-                                 ("/testrun/t2", "testrun-t2", "T2"),
-                                 ("/history", "history", "History"),
-                                 ("/players", "players", "Database"),
-                                 ("/flags", "flags", "Flags"),
-                                 ("/system", "system", "System")))
+        '<span class="navgroup">' + "".join(
+            f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
+            for href, key, label in group) + "</span>"
+        for group in nav_groups)
     dot, conn = _feed_status()
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{esc(title)} · DEUCE</title><style>{CSS}</style></head>
 <body>
 <header class="nav">
-  <span class="brand">DEUCE<small>Kalshi Terminal · advisory only — never trades</small></span>
+  <span class="brand">DEUCE<span class="tag">advisory only</span></span>
   <nav class="links">{navs}</nav>
   <button id="bell" class="conn mono" style="background:none;border:1px solid var(--divider);
    color:var(--muted);cursor:pointer;padding:4px 10px;font:inherit;font-size:11px"></button>
