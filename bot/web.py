@@ -481,6 +481,22 @@ engine still applies every gate before any advisory fires.</p>
 TP_LIMIT = 90  # take-profit limit price (cents) for the TP variant
 
 
+def _other_mode_tiles(bets, emap, label, WON):
+    """Two overview tiles summarizing the OTHER exit rule, so the top strip
+    shows both hold and take-profit side by side."""
+    st = [b for b, _ in bets if emap[b.id][0] in ("won", "lost", "took_profit")]
+    w = sum(1 for b in st if emap[b.id][0] in WON)
+    pc = sum(emap[b.id][1] or 0 for b in st)
+    color = "var(--good)" if pc > 0 else ("var(--accent)" if pc < 0 else "var(--text)")
+    return [
+        (f"{label.split()[0]} · record", f"{w}-{len(st) - w}" if st else "0-0",
+         label),
+        (f"{label.split()[0]} · profit",
+         f'<span style="color:{color}">{pc / 100:+.2f}</span>' if st else "—",
+         "same picks, other exit"),
+    ]
+
+
 def _tp_effective(b, result, touched90):
     """Take-profit-at-90 outcome for a paper bet, derived from the same pick.
     A limit sell at 90¢ fills whenever our side's bid reaches 90 — which any
@@ -603,7 +619,8 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         ("CLV", f'<span style="color:{clv_color}">{avg_clv:+.1f}¢</span>'
          if avg_clv is not None else "—",
          f"beat close {beat}/{len(clv_vals)}" if clv_vals else "vs match-start line"),
-    ])
+    ] + _other_mode_tiles(bets, tp_effs if not is_tp else hold_effs,
+                          "90¢ take-profit" if not is_tp else "hold to settlement", WON))
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
 <div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
 <div class="metric"><div class="k">advisory basis</div><div class="v mono">{bucket(lambda b: b.basis == 'advisory')}</div></div>
@@ -679,26 +696,32 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         pace = (f"Below target at {win_rate:.1%}: needs {need} straight winners "
                 f"to reach 70% — the tuning breakdown below says where to look.")
 
-    # cumulative timeline with policy-version markers
-    chron = sorted([b for b, _ in settled if b.settled_at],
-                   key=lambda b: b.settled_at)
-    cum, pts = 0, []
-    vmarks, last_ver = [], None
-    for b in chron:
-        cum += (effs[b.id][1] or 0)
-        pts.append((b.settled_at, cum / 100))
-        ver = (b.reasoning or {}).get("policy_version", "v1")
-        if ver != last_ver:
-            if last_ver is not None:
-                vmarks.append((b.settled_at, ver))
-            last_ver = ver
-    timeline = timeline_svg(pts, "$", vmarks)  # one contract settles at $1
+    # cumulative timeline — both exit rules overlaid, policy-version markers
+    def cum_of(emap):
+        chron = sorted([b for b, _ in bets if b.settled_at
+                        and emap[b.id][0] in ("won", "lost", "took_profit")],
+                       key=lambda b: b.settled_at)
+        cum, series, vm, last = 0, [], [], None
+        for b in chron:
+            cum += (emap[b.id][1] or 0)
+            series.append((b.settled_at, cum / 100))
+            ver = (b.reasoning or {}).get("policy_version", "v1")
+            if ver != last:
+                if last is not None:
+                    vm.append((b.settled_at, ver))
+                last = ver
+        return series, vm
+
+    pts, vmarks = cum_of(hold_effs)
+    tp_pts, _ = cum_of(tp_effs)
+    timeline = timeline_svg(pts, "$", vmarks, points2=tp_pts,
+                            label="hold to settlement", label2="90¢ take-profit")
     timeline_html = f"""<section class="block"><div class="blockhead">
 <h4>Cumulative P&amp;L</h4><span class="aside">{esc(pace)}</span></div>
 <div class="rule"></div>{timeline or
     '<p class="prose">Chart appears after the first two settlements.</p>'}
-<p class="sub2">Dashed markers = policy version changes; records before and
-after a tune are never blended silently.</p></section>"""
+<p class="sub2">Both exit rules on the same picks · dashed markers = policy
+version changes; records before and after a tune are never blended silently.</p></section>"""
 
     # --- Watching: matches the policy is currently evaluating ---
     from bot.models import Scenario
