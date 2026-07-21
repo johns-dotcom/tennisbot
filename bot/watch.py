@@ -555,6 +555,22 @@ class WatchService:
                             if row.close_yes_cents is None:
                                 row.close_yes_cents = _closing_line(
                                     db, ticker, (row.raw or {}).get("occurrence_datetime"))
+                    # self-heal YES↔competitor orientation: `result` is now the
+                    # authoritative truth, so flip any score-log the live
+                    # surname-prefix guess had backwards (task #14).
+                    if result in ("yes", "no"):
+                        try:
+                            from bot.mapping_fix import reconcile_settled_orientation
+
+                            with db_session() as db:
+                                fix = reconcile_settled_orientation(db, ticker=ticker)
+                            if fix["score_logs_flipped"] or fix["matches_flipped"]:
+                                log.info("orientation self-healed", ticker=ticker,
+                                         **{k: fix[k] for k in
+                                            ("score_logs_flipped", "matches_flipped")})
+                        except Exception as e:
+                            log.warning("orientation reconcile failed",
+                                        ticker=ticker, error=str(e))
                     log.info("market settled", ticker=ticker, result=result,
                              final_sets=final_sets)
                 from bot.paper import settle_open_bets
