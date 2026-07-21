@@ -1117,6 +1117,16 @@ def timeline_svg(points: list[tuple[datetime, float]], unit: str,
             f'fill="rgba(243,242,242,.45)">0{unit}</text>') if lo < 0 < hi or lo == 0 else ""
     ymax_lbl = (f'<text x="{PL - 8}" y="{y(hi) + 4:.0f}" text-anchor="end" font-size="10" '
                 f'fill="rgba(243,242,242,.45)">{hi:+.0f}{unit}</text>')
+    ymin_lbl = (f'<text x="{PL - 8}" y="{y(lo) + 4:.0f}" text-anchor="end" font-size="10" '
+                f'fill="rgba(243,242,242,.45)">{lo:+.0f}{unit}</text>') if lo < 0 else ""
+    # x-axis: first and last dates, so the run's span is legible
+    d0 = min(p[0] for p in allpts)
+    d1 = max(p[0] for p in allpts)
+    fmt = lambda d: d.strftime("%b %d").replace(" 0", " ")
+    xaxis = (f'<text x="{PL}" y="{H - 4}" font-size="10" '
+             f'fill="rgba(243,242,242,.45)">{fmt(d0)}</text>'
+             f'<text x="{W - PR}" y="{H - 4}" text-anchor="end" font-size="10" '
+             f'fill="rgba(243,242,242,.45)">{fmt(d1)}</text>')
     vlines = "".join(
         f'<g><title>{esc(lbl)}</title>'
         f'<line x1="{x(ts.timestamp()):.0f}" y1="{PT_}" x2="{x(ts.timestamp()):.0f}" '
@@ -1133,7 +1143,7 @@ def timeline_svg(points: list[tuple[datetime, float]], unit: str,
     return f"""<div class="tw"><svg viewBox="0 0 {W} {H}" role="img"
  aria-label="cumulative {esc(unit)} over time"
  style="width:100%;min-width:640px;display:block">
-{zero}{ymax_lbl}{vlines}{second}
+{zero}{ymax_lbl}{ymin_lbl}{xaxis}{vlines}{second}
 {draw(points, "var(--accent)", 2)}
 </svg></div>{legend}"""
 
