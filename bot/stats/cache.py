@@ -34,6 +34,10 @@ def refresh_stats_cache(db: Session, as_of: date | None = None,
             "trajectory": asdict(profile.trajectory),
             "surfaces": [asdict(s) for s in profile.surfaces],
             "matches_in_db": profile.matches_in_db,
+            # set rates + conditionals feed the percentile-within-field signal
+            # ("86% set-2 win rate — top 1% of the field")
+            "set_rates": {n: asdict(s) for n, s in (profile.set_rates or {}).items()},
+            "conditional": asdict(profile.conditional) if profile.conditional else None,
         }
         db.execute(pg_insert(PlayerStatsCache).values(
             player_id=pid, as_of=as_of, payload=payload,

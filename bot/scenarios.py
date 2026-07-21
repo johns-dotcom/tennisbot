@@ -101,6 +101,44 @@ def _supporting_analysis(prof_watch, prof_opp, hist_watch, hist_opp,
     return text, payload
 
 
+MIN_FIELD = 30  # need this many peers before a percentile means anything
+
+
+def load_tour_distributions(db: Session) -> dict:
+    """Sorted per-tour distributions of set rates + win-after-a-set, read from
+    the stats cache, for percentile-within-field context ('top 1% of ITF')."""
+    from sqlalchemy import text as sqltext
+    rows = db.execute(sqltext("""
+        SELECT DISTINCT ON (c.player_id) p.tour, c.payload
+        FROM player_stats_cache c JOIN players p ON p.id = c.player_id
+        ORDER BY c.player_id, c.as_of DESC""")).all()
+    dist: dict[str, dict[str, list]] = {}
+    for tour, payload in rows:
+        d = dist.setdefault(tour, {"set1": [], "set2": [], "set3": [], "won_a_set": []})
+        sr = (payload or {}).get("set_rates") or {}
+        for n, key in ((1, "set1"), (2, "set2"), (3, "set3")):
+            s = sr.get(str(n)) or sr.get(n)
+            if s and s.get("value") is not None and (s.get("n") or 0) >= 8:
+                d[key].append(s["value"])
+        cond = (payload or {}).get("conditional") or {}
+        w = cond.get("win_given_won_a_set")
+        if w and w.get("value") is not None and (w.get("n") or 0) >= 8:
+            d["won_a_set"].append(w["value"])
+    for t in dist:
+        for k in dist[t]:
+            dist[t][k].sort()
+    return dist
+
+
+def _pct_rank(sorted_vals: list, v) -> float | None:
+    """Fraction of the field strictly below v (0..1); None if the field is too
+    small to be meaningful."""
+    if v is None or len(sorted_vals) < MIN_FIELD:
+        return None
+    import bisect
+    return bisect.bisect_left(sorted_vals, v) / len(sorted_vals)
+
+
 def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                    name_a: str, name_b: str, id_a: int, id_b: int,
                    prof_a, prof_b, hist_a, hist_b,
@@ -109,7 +147,8 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                    model_confidence: float = 1.0,
                    fatigue_a: dict | None = None,
                    fatigue_b: dict | None = None,
-                   event_label: str = "") -> Candidate | None:
+                   event_label: str = "",
+                   pctl: dict | None = None) -> Candidate | None:
     """One sequenced gameflow plan for the match, from the watch side's view.
 
     Pure logic — testable without a DB.
@@ -163,6 +202,32 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
         salience += (s1w - s1o) / 100 * 0.8
     else:
         bits.append(f"{w_name} is the play at {p_w:.0%} on the model.")
+
+    # 1b. percentile within the field — "86% set-2 win rate, top 1% of the field"
+    if pctl:
+        best_rank = None  # (rank, set_number, stat)
+        for n, key in ((1, "set1"), (2, "set2"), (3, "set3")):
+            s = w_rates.get(n)
+            if s and s.value is not None and not _is_thin(s):
+                r = _pct_rank(pctl.get(key, []), s.value)
+                if r is not None and (best_rank is None or r > best_rank[0]):
+                    best_rank = (r, n, s)
+        if best_rank and best_rank[0] >= 0.85:
+            r, n, s = best_rank
+            top = max(1, round((1 - r) * 100))
+            bits.append(f"{w_name}'s set {n} win rate ({int(round(s.value * 100))}%) "
+                        f"is elite — top {top}% of the field.")
+            salience += (r - 0.85) * 0.6
+        # opponent weakness the same way (bottom of the field)
+        for n, key in ((3, "set3"), (2, "set2"), (1, "set1")):
+            s = o_rates.get(n)
+            if s and s.value is not None and not _is_thin(s):
+                r = _pct_rank(pctl.get(key, []), s.value)
+                if r is not None and r <= 0.15:
+                    bits.append(f"{o_name}'s set {n} ({int(round(s.value * 100))}%) is "
+                                f"bottom {max(1, round(r * 100))}% of the field.")
+                    salience += (0.15 - r) * 0.5
+                    break
 
     # 2. set-2 leverage
     s2o = _pct(o_rates.get(2))
@@ -451,6 +516,7 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
     model = SetElo()
     model.fit_from_db(db)
     fatigue = _yesterday_played(db, now)
+    distributions = load_tour_distributions(db)  # percentile-within-field context
 
     as_of = for_day + timedelta(days=1)
     candidates: list[Candidate] = []
@@ -487,6 +553,8 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
         try:
             prof_a, hist_a, rates_a = pdata(a.player_a_id)
             prof_b, hist_b, rates_b = pdata(b.player_a_id)
+            from bot.models import Player as _P
+            _tour = db.get(_P, a.player_a_id).tour
             cand = build_gameflow(
                 ticker_a=a.ticker, ticker_b=b.ticker, event_ticker=ev_ticker,
                 name_a=(a.raw or {}).get("yes_sub_title", "A"),

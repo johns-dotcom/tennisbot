@@ -117,3 +117,12 @@ def test_gameflow_low_confidence_caveat():
     assert "size accordingly" in c.narrative
     high = build(model_confidence=0.9)
     assert "size accordingly" not in high.narrative
+
+
+def test_pct_rank_and_field_floor():
+    from bot.scenarios import _pct_rank, MIN_FIELD
+    field = [i / 100 for i in range(0, 100)]  # 100 evenly-spaced values 0..0.99
+    assert _pct_rank(field, 0.86) == 0.86       # 86 values below 0.86
+    assert _pct_rank(field, 0.99) == 0.99
+    assert _pct_rank([0.5] * 10, 0.9) is None    # field < MIN_FIELD → no percentile
+    assert _pct_rank(field, None) is None
