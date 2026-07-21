@@ -81,6 +81,13 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   gap: 2px; background: var(--divider); border: 2px solid var(--divider);
   margin-bottom: 26px; }
 .stat { background: var(--surface); padding: 16px; }
+.filterbar { display: flex; flex-wrap: wrap; gap: 6px; align-items: center;
+  margin-bottom: 14px; }
+.fchip { background: var(--surface); border: 1px solid var(--divider);
+  color: var(--muted); font: inherit; font-size: 12px; padding: 4px 11px;
+  border-radius: 4px; cursor: pointer; letter-spacing: .02em; }
+.fchip:hover { color: var(--text); }
+.fchip.on { border-color: var(--accent); color: var(--text); }
 .stat .l { font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
   color: var(--muted); margin-bottom: 10px; }
 .stat .v { font-weight: 800; font-size: 27px; letter-spacing: -.02em; line-height: 1; }
@@ -232,6 +239,26 @@ function bindWatch(){
   function pc(){if(c)c.textContent=d.open?'▾ hide':'▸ show';} pc();
   d.addEventListener('toggle',function(){localStorage.setItem(key,d.open?'1':'0');pc();});
  });}
+function lfState(){try{return JSON.parse(localStorage.getItem('deuce_lf'))||{}}catch(e){return {}}}
+function applyLiveFilters(){
+ var s=lfState(), tours=s.tours||[], shown=0, total=0;
+ document.querySelectorAll('.livecard').forEach(function(c){
+  total++;
+  var okT=tours.length===0||tours.indexOf(c.dataset.tour)>=0;
+  var okP=!s.play||c.dataset.play==='1';
+  var okG=!s.trig||c.dataset.trig==='hit'||c.dataset.trig==='near';
+  var ok=okT&&okP&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
+ document.querySelectorAll('.fchip').forEach(function(ch){var f=ch.dataset.f,on;
+  if(f==='play')on=!!s.play; else if(f==='trig')on=!!s.trig; else on=tours.indexOf(f)>=0;
+  ch.classList.toggle('on',on);});
+ var vc=document.getElementById('livecount'); if(vc)vc.textContent=shown;}
+function bindFilters(){
+ document.querySelectorAll('.fchip').forEach(function(ch){if(ch._b)return;ch._b=true;
+  ch.addEventListener('click',function(){var s=lfState(),f=ch.dataset.f;
+   if(f==='play')s.play=!s.play; else if(f==='trig')s.trig=!s.trig;
+   else{s.tours=s.tours||[];var i=s.tours.indexOf(f);if(i>=0)s.tours.splice(i,1);else s.tours.push(f);}
+   localStorage.setItem('deuce_lf',JSON.stringify(s));applyLiveFilters();});});
+ applyLiveFilters();}
 function typing(){var a=document.activeElement;
  return a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName);}
 async function refreshMain(){
@@ -239,7 +266,7 @@ async function refreshMain(){
  try{var r=await fetch(location.pathname+location.search,{headers:{'X-Fragment':'1'}});
   if(r.ok){var h=await r.text(); var m=document.querySelector('main');
    if(!typing() && h && h.length>50 && h!==m.innerHTML){var y=window.scrollY;
-    m.innerHTML=h; window.scrollTo(0,y); bindWatch();}
+    m.innerHTML=h; window.scrollTo(0,y); bindWatch(); bindFilters();}
   }}catch(e){} rel();}
 var seen=null;
 function notify(title, body){
@@ -257,7 +284,7 @@ document.addEventListener('DOMContentLoaded',function(){
  rel(); setInterval(rel,5000);
  setInterval(refreshMain,7000);
  setInterval(pollEvents,10000); pollEvents();
- bindWatch();
+ bindWatch(); bindFilters();
  var bell=document.getElementById('bell');
  function paint(){bell.textContent=Notification.permission==='granted'?'🔔 alerts on':'🔕 enable alerts';}
  if(!('Notification' in window)){bell.style.display='none';return;} paint();
@@ -1382,6 +1409,21 @@ LIVE_WINDOW_BEFORE = timedelta(minutes=10)
 LIVE_WINDOW_AFTER = timedelta(hours=6)
 UPCOMING_HORIZON = timedelta(hours=12)
 
+# live-board filter chips: tours (multi-select) + two toggles. Kept in sync with
+# series_label so the data-tour attribute matches a chip exactly.
+_TOUR_CHIPS = ["ATP", "WTA", "CHALLENGER", "ITF M", "ITF W"]
+_TRIG_RANK = {"hit": 0, "near": 1, "armed": 2, "none": 3}  # most-actionable first
+
+
+def _trig_class(est, is_live: bool) -> str:
+    """How close a live match is to the v1 decider trigger (1-1 in Bo3)."""
+    s = est.state if est else None
+    if s == "1-1":
+        return "hit"
+    if s in ("1-0", "0-1", "2-1", "1-2"):  # one set from a decider
+        return "near"
+    return "armed" if is_live else "none"
+
 
 def _latest_quotes(db, tickers: list[str]) -> dict[str, tuple]:
     if not tickers:
@@ -1461,6 +1503,14 @@ async def live(request: web.Request) -> web.Response:
                 Advisory.market_ticker.in_(all_tickers),
                 Advisory.status.in_(["sent", "pending"]))).scalars().all()) \
             if all_tickers else set()
+
+        # re-order the live board: closest-to-trigger first (the actionable ones
+        # float to the top on a busy slate), then by scheduled time
+        def _ev_est(ev):
+            return next((states.get(m.ticker) for m in ev["sides"]
+                         if states.get(m.ticker)), None)
+        live_evs.sort(key=lambda e: (_TRIG_RANK[_trig_class(_ev_est(e[1]), True)],
+                                     e[1]["occ"]))
         from sqlalchemy import text as sqltext
 
         scorelines = {}
@@ -1518,9 +1568,13 @@ async def live(request: web.Request) -> web.Response:
             wmid = (wq[0] + wq[1]) / 2 if wq and wq[0] is not None else None
             plan_row = (f'<div class="sub2">plan: '
                         f'{trigger_html(sc, est.state if est else None, is_live, wmid)}</div>')
-        return f"""<div class="card">
+        tour = series_label.get(ev["series"], "?")
+        has_play = any(m.ticker in advised for m in sides)
+        trig = _trig_class(est, is_live)
+        return f"""<div class="card livecard" data-tour="{esc(tour)}" \
+data-play="{1 if has_play else 0}" data-trig="{trig}">
 <div style="display:flex;align-items:center;justify-content:space-between">
-<span class="kicker" style="margin:0">{series_label.get(ev['series'], '?')}</span>
+<span class="kicker" style="margin:0">{tour}</span>
 <span>{st} {play}</span></div>
 <a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
 <div>{''.join(rows_html)}</div></a>
@@ -1553,9 +1607,25 @@ async def live(request: web.Request) -> web.Response:
     live_cards = "".join(match_card(t, e, True) for t, e in live_evs)
     soon_cards = "".join(match_card(t, e, False) for t, e in soon_evs)
     done_cards = "".join(done_card(t, e) for t, e in done_evs[:12])
+
+    # filter bar — only offer tour chips for tours actually on the board
+    present = [series_label.get(e[1]["series"], "?") for e in live_evs]
+    tour_chips = "".join(
+        f'<button class="fchip" data-f="{esc(t)}">{esc(t)}</button>'
+        for t in _TOUR_CHIPS if t in present)
+    near_n = sum(1 for _, e in live_evs
+                 if _trig_class(next((states.get(m.ticker) for m in e["sides"]
+                                      if states.get(m.ticker)), None), True)
+                 in ("hit", "near"))
+    filter_bar = (f'<div class="filterbar">{tour_chips}'
+                  f'<button class="fchip" data-f="play">▲ plays only</button>'
+                  f'<button class="fchip" data-f="trig">◎ near trigger ({near_n})</button>'
+                  f'<span class="sub2" style="margin-left:auto">showing '
+                  f'<span id="livecount">{len(live_evs)}</span> of {len(live_evs)}</span>'
+                  f'</div>') if live_evs else ""
     body = pagehead("Match Board", "Live Now",
                     f"{len(live_evs)} live · {len(soon_evs)} next 12h") + f"""
-<section class="block">
+<section class="block">{filter_bar}
 <div class="cards">{live_cards or
     '<div class="card"><div class="empty">No tennis in the playing window right now.</div></div>'}
 </div></section>
