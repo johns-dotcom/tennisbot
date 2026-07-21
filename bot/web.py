@@ -1434,6 +1434,28 @@ def _trig_class(est, is_live: bool) -> str:
     return "armed" if is_live else "none"
 
 
+def _raw_cents(raw: dict, key: str):
+    try:
+        return round(float(raw.get(key)) * 100)
+    except (TypeError, ValueError):
+        return None
+
+
+def _odds_cents(m, quotes: dict) -> tuple[int | None, bool]:
+    """Best available Kalshi price (cents) for a market's YES side, and whether
+    it is a fresh streamed quote. Falls back to the discovery snapshot (raw
+    bid/ask, then last trade) so live odds always render, even between ticks."""
+    q = quotes.get(m.ticker)
+    if q and q[0] is not None and q[1] is not None:
+        return round((q[0] + q[1]) / 2), True
+    raw = m.raw or {}
+    yb, ya = _raw_cents(raw, "yes_bid_dollars"), _raw_cents(raw, "yes_ask_dollars")
+    if yb is not None and ya is not None:
+        return round((yb + ya) / 2), False
+    lp = _raw_cents(raw, "last_price_dollars")
+    return (lp, False) if lp is not None else (None, False)
+
+
 def _latest_quotes(db, tickers: list[str]) -> dict[str, tuple]:
     if not tickers:
         return {}
@@ -1502,7 +1524,10 @@ async def live(request: web.Request) -> web.Response:
         done_evs.sort(key=lambda e: e[1]["occ"], reverse=True)
 
         all_tickers = [m.ticker for _, ev in live_evs for m in ev["sides"]]
-        quotes = _latest_quotes(db, all_tickers)
+        # quotes for upcoming games too, so their live Kalshi odds also render
+        quote_tickers = all_tickers + [m.ticker for _, ev in soon_evs
+                                       for m in ev["sides"]]
+        quotes = _latest_quotes(db, quote_tickers)
         states = {s.market_ticker: s for s in db.execute(
             select(LiveMatchState).where(
                 LiveMatchState.market_ticker.in_(all_tickers))).scalars().all()} \
@@ -1547,12 +1572,23 @@ async def live(request: web.Request) -> web.Response:
         sides = sorted(ev["sides"], key=lambda m: m.ticker)
         est = next((states.get(m.ticker) for m in sides if states.get(m.ticker)), None)
         rows_html = []
+        prices = [_odds_cents(m, quotes)[0] for m in sides[:2]]
+        favc = max((p for p in prices if p is not None), default=None)
         for m in sides[:2]:
             name = (m.raw or {}).get("yes_sub_title") or m.ticker.rsplit("-", 1)[-1]
-            q = quotes.get(m.ticker)
-            px = f"{(q[0] + q[1]) / 2:.0f}¢" if q and q[0] is not None and q[1] is not None else "—"
+            cents, live_q = _odds_cents(m, quotes)
+            if cents is None:
+                px = '<span class="px mono">—</span>'
+            else:
+                dot = ('<span style="color:var(--good)" title="live quote">●</span> '
+                       if live_q else "")
+                style = 'color:var(--text);font-weight:800' if cents == favc \
+                    else 'color:var(--muted)'
+                tip = "Kalshi price = implied win %" + ("" if live_q else " (last snapshot)")
+                px = (f'<span class="px mono" style="{style}" title="{tip}">'
+                      f'{dot}{cents}¢</span>')
             rows_html.append(f'<div class="playerrow"><span class="nm">{esc(name)}</span>'
-                             f'<span class="px mono">{px}</span></div>')
+                             f'{px}</div>')
         if est is not None:
             if est.stale:
                 st = tag("accent", "⛔", f"{est.state} stale")
@@ -1573,8 +1609,8 @@ async def live(request: web.Request) -> web.Response:
         plan_row = ""
         sc = plans.get(ev_ticker)
         if sc is not None:
-            wq = quotes.get(sc.market_ticker)
-            wmid = (wq[0] + wq[1]) / 2 if wq and wq[0] is not None else None
+            wm = next((m for m in sides if m.ticker == sc.market_ticker), None)
+            wmid = _odds_cents(wm, quotes)[0] if wm else None
             plan_row = (f'<div class="sub2">plan: '
                         f'{trigger_html(sc, est.state if est else None, is_live, wmid)}</div>')
         tour = series_label.get(ev["series"], "?")
@@ -1646,9 +1682,11 @@ data-play="{1 if has_play else 0}" data-trig="{trig}">
 </div></section>
 {f'<section class="block"><div class="blockhead"><h4>Recently finished</h4></div><div class="rule"></div><div class="cards">{done_cards}</div></section>' if done_cards else ''}
 <p class="prose">Every match the bot watches appears here whether or not a play
-fired. Prices are the latest streamed mids; set states come from the estimator
-(≈ inferred from odds movement, ✓ confirmed by the delayed score). Matches leave
-the board as soon as their market settles or closes on Kalshi.</p>"""
+fired. Each player's number is the <strong>live Kalshi price</strong> (cents =
+implied win %); a green ● marks a fresh streamed quote, otherwise it's the last
+snapshot. Set states come from the estimator (≈ inferred from odds movement,
+✓ confirmed by the delayed score). Matches leave the board as soon as their
+market settles or closes on Kalshi.</p>"""
     return respond(request, "Live", "live", body)
 
 
