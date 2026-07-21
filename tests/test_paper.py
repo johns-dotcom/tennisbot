@@ -69,6 +69,28 @@ def test_unit_sizing_three_is_extreme_and_capped():
 
     assert size_units(0.85, 0.12, 0.90) == 3
     assert size_units(0.85, 0.12, 0.80) == 2  # one threshold short of 3u
-    assert size_units(0.99, 0.30, 0.99) == 3  # never above 3
-    d = decide_bet(p_yes=0.85, confidence=0.9, yes_ask=73, yes_bid=71)
+    d = decide_bet(p_yes=0.85, confidence=0.9, yes_ask=73, yes_bid=71)  # edge 0.12
     assert d.place and d.units == 3 and "3u" in d.reason
+
+
+def test_v2_large_edge_never_upsizes():
+    # quality over quantity: a huge edge is model error / stale quote, not
+    # conviction — it caps at 1u rather than pressing to 2u/3u
+    from bot.paper import EDGE_SANE_MAX, size_units
+
+    assert size_units(0.99, 0.25, 0.99) == 1
+    assert size_units(0.90, EDGE_SANE_MAX + 0.01, 0.95) == 1
+    assert size_units(0.90, EDGE_SANE_MAX, 0.95) == 3  # right at the sane edge → allowed
+
+
+def test_v2_kayo_nishimura_case_not_three_units():
+    # the flagged bet: 90% model vs a 65c ask = +25% edge. Old policy sized 3u;
+    # v2 places just 1u (edge outside the believable band).
+    d = decide_bet(p_yes=0.90, confidence=1.0, yes_ask=65, yes_bid=63)
+    assert d.place and d.units == 1
+
+
+def test_v2_absurd_edge_is_skipped_entirely():
+    # edge > EDGE_SUSPECT (30%) looks like a data problem → no bet
+    d = decide_bet(p_yes=0.95, confidence=1.0, yes_ask=55, yes_bid=53)
+    assert not d.place and "implausibly large" in d.reason

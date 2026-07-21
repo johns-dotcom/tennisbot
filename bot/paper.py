@@ -5,13 +5,16 @@ matches get no bet), and its settled record is the tuning signal. Target:
 ≥ 70% winners after month 1; until then the policy below is what gets
 iterated on, using the per-bucket breakdowns on the /testrun page.
 
-Policy v1 ("selective favorite value"): a 70% RECORD (not ROI) requires
-picking mostly winners, so bets skew to model favorites — but only when the
-market is paying more than the model thinks it should:
+Policy v2 ("selective favorite value, quality over quantity"): a 70% RECORD
+(not ROI) requires picking mostly winners, so bets skew to model favorites —
+but only when the market is paying more than the model thinks it should:
   - model prob for the chosen side ≥ PAPER_MIN_PROB
   - edge vs the executable ask ≥ PAPER_MIN_EDGE
   - model confidence ≥ PAPER_MIN_CONF (data depth on both players)
   - sane executable price, one bet per event, ever
+Sizing treats an implausibly large edge as a caution flag, not conviction: a
+big edge caps at 1u and an absurd one (> EDGE_SUSPECT) is skipped entirely —
+2u/3u are reserved for well-supported favorites with a believable edge.
 
 Nothing here touches an order. CLAUDE.md rule 1 holds: this table is fiction
 kept honest by settlement against real results.
@@ -32,7 +35,7 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v1"
+POLICY_VERSION = "v2"
 
 PAPER_MIN_PROB = 0.68
 PAPER_MIN_EDGE = 0.03
@@ -40,17 +43,30 @@ PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20
 
-# Unit sizing: 1u default; 2u strong conviction; 3u EXTREMELY sparse — every
-# threshold must be extreme simultaneously. Never more than 3.
-UNITS_2 = {"prob": 0.75, "edge": 0.06, "conf": 0.75}
-UNITS_3 = {"prob": 0.82, "edge": 0.10, "conf": 0.85}
+# Quality over quantity (v2): an implausibly large edge at a mid price is far
+# more likely model overconfidence or a stale/thin quote than genuine value, so
+# a big edge is a CAUTION flag, not a reason to press.
+#   - edge above EDGE_SANE_MAX  → never upsize past 1u (don't chase model error)
+#   - edge above EDGE_SUSPECT   → don't bet at all (looks like a data problem)
+# Real conviction (2u/3u) is reserved for well-supported favorites whose edge is
+# in a believable band, not for outliers.
+EDGE_SANE_MAX = 0.15
+EDGE_SUSPECT = 0.30
+
+# Unit sizing: 1u default; 2u strong conviction; 3u EXTREMELY sparse. Every
+# threshold must be met AND the edge must be believable. Never more than 3.
+UNITS_2 = {"prob": 0.75, "edge_lo": 0.05, "edge_hi": EDGE_SANE_MAX, "conf": 0.75}
+UNITS_3 = {"prob": 0.85, "edge_lo": 0.08, "edge_hi": EDGE_SANE_MAX, "conf": 0.88}
 
 
 def size_units(prob: float, edge: float, confidence: float) -> int:
-    if (prob >= UNITS_3["prob"] and edge >= UNITS_3["edge"]
+    # a suspiciously large edge is a red flag, not conviction — stay at 1u
+    if edge > EDGE_SANE_MAX:
+        return 1
+    if (prob >= UNITS_3["prob"] and UNITS_3["edge_lo"] <= edge <= UNITS_3["edge_hi"]
             and confidence >= UNITS_3["conf"]):
         return 3
-    if (prob >= UNITS_2["prob"] and edge >= UNITS_2["edge"]
+    if (prob >= UNITS_2["prob"] and UNITS_2["edge_lo"] <= edge <= UNITS_2["edge_hi"]
             and confidence >= UNITS_2["conf"]):
         return 2
     return 1
@@ -86,6 +102,14 @@ def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
     if best is None:
         return BetDecision(False, reason="no side clears prob+edge gates")
     side, prob, price, edge = best
+    # quality over quantity: a monstrous edge at a live price is almost always a
+    # stale/thin quote or model error, not free money — pass rather than pile in
+    if edge > EDGE_SUSPECT:
+        return BetDecision(False, side=side, prob=round(prob, 3), edge=round(edge, 3),
+                           price_cents=price,
+                           reason=f"edge {edge * 100:.0f}% implausibly large "
+                                  f"(> {EDGE_SUSPECT * 100:.0f}%) — likely a stale "
+                                  f"quote or model error, skipped")
     units = size_units(prob, edge, confidence)
     return BetDecision(True, side=side, prob=round(prob, 3), edge=round(edge, 3),
                        price_cents=price, units=units,

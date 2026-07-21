@@ -88,6 +88,19 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   border-radius: 4px; cursor: pointer; letter-spacing: .02em; }
 .fchip:hover { color: var(--text); }
 .fchip.on { border-color: var(--accent); color: var(--text); }
+.vsgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 2px; background: var(--divider); border: 2px solid var(--divider);
+  margin-bottom: 26px; }
+.vscol { background: var(--surface); padding: 16px 18px; }
+.vshead { display: flex; align-items: baseline; justify-content: space-between;
+  font-size: 13px; font-weight: 800; letter-spacing: .08em; text-transform: uppercase;
+  margin-bottom: 8px; }
+.vshead span { font-weight: 400; letter-spacing: 0; text-transform: none;
+  color: var(--muted); font-size: 12px; }
+.vsrow { display: flex; justify-content: space-between; align-items: baseline;
+  padding: 7px 0; border-top: 1px solid var(--divider); }
+.vsrow .k { color: var(--muted); font-size: 13px; }
+.vsrow .v { font-size: 18px; font-weight: 800; }
 .stat .l { font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
   color: var(--muted); margin-bottom: 10px; }
 .stat .v { font-weight: 800; font-size: 27px; letter-spacing: -.02em; line-height: 1; }
@@ -739,25 +752,41 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
     avg_clv = sum(clv_vals) / len(clv_vals) if clv_vals else None
     clv_color = ("var(--good)" if avg_clv and avg_clv > 0 else
                  "var(--accent)" if avg_clv and avg_clv < 0 else "var(--text)")
-    strip = statstrip([
-        ("Record", f"{wins}-{n - wins}" if n else "0-0", f"{len(open_bets)} open"),
-        ("Win rate", f'<span style="color:{target_color}">{target_txt}</span>',
-         "target 70% by month 1"),
-        ("Profit ($)", f'<span style="color:{pcolor}">{dol(pnl):+.2f}</span>' if n else "—",
-         "$10 per unit"),
-        ("Profit (units)", f'<span style="color:{pcolor}">{profit_units:+.2f}u</span>' if n else "—",
-         "profit ÷ stake, unit-weighted"),
-        ("ROI", f"{pnl / staked:+.1%}" if staked else "—", f"{days}d running"),
+    # side-by-side scoreboard: every metric for BOTH exit rules, same picks
+    nfin = len(finished)
+
+    def _mode_col(label: str, sub: str, w, l, pc, un, roi) -> str:
+        tot = w + l
+        pcol = "var(--good)" if pc > 0 else "var(--accent)" if pc < 0 else "var(--text)"
+        wr = f"{w / tot:.0%}" if tot else "—"
+        wrc = ("var(--good)" if tot and w / tot >= 0.70 else
+               "var(--warning)" if tot and w / tot >= 0.60 else "var(--text)")
+
+        def r(k, v):
+            return (f'<div class="vsrow"><span class="k">{k}</span>'
+                    f'<span class="v mono">{v}</span></div>')
+        return (f'<div class="vscol"><div class="vshead">{label}'
+                f'<span>{esc(sub)}</span></div>'
+                + r("Record", f"{w}-{l}")
+                + r("Win rate", f'<span style="color:{wrc}">{wr}</span>')
+                + r("Profit", f'<span style="color:{pcol}">${dol(pc):+.2f}</span>')
+                + r("Units", f'<span style="color:{pcol}">{un:+.2f}u</span>')
+                + r("ROI", f"{roi:+.1%}" if roi is not None else "—")
+                + '</div>')
+    scoreboard = (f'<div class="vsgrid">'
+                  f'{_mode_col("Hold", "ride to settlement (100¢/0¢)", *mode_stats(False))}'
+                  f'{_mode_col("90¢ Take-Profit", "limit exit at 90¢", *mode_stats(True))}'
+                  f'</div>')
+    shared = statstrip([
+        ("Settled", str(nfin), "same picks · both exits"),
+        ("Open", str(len(open_bets)), "awaiting result"),
         ("CLV", f'<span style="color:{clv_color}">{avg_clv:+.1f}¢</span>'
          if avg_clv is not None else "—",
-         f"beat close {beat}/{len(clv_vals)}" if clv_vals else "vs match-start line"),
-    ] + (lambda ow, ol, opc, oun, _r: [
-        (("90¢" if not is_tp else "Hold") + " · record",
-         f"{ow}-{ol}", "same picks, other exit"),
-        (("90¢" if not is_tp else "Hold") + " · profit",
-         f'<span style="color:{"var(--good)" if opc > 0 else "var(--accent)" if opc < 0 else "var(--text)"}">{dol(opc):+.2f}</span>'
-         if (ow + ol) else "—", "on the same finished matches"),
-    ])(*mode_stats(not is_tp)), cols=4)
+         f"entry vs close · beat {beat}/{len(clv_vals)}" if clv_vals
+         else "vs match-start line"),
+        ("Running", f"{days}d", "since first bet · target 70%"),
+    ], cols=4)
+    strip = scoreboard + shared
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
 <div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
 <div class="metric"><div class="k">advisory basis</div><div class="v mono">{bucket(lambda b: b.basis == 'advisory')}</div></div>
@@ -809,8 +838,10 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
             match = (b.reasoning or {}).get("match", b.event_ticker)
             out.append(f"""<tr>
 <td class="mono sub2">{pt(b.created_at)}</td>
-<td><span class="pname">{esc(player)}</span><br><span class="sub2">{esc(match)}</span>
-· {kalshi_link(b.market_ticker)}
+<td><a href="/match/{esc(b.event_ticker)}" style="color:inherit;text-decoration:none">
+<span class="pname" style="border-bottom:1px dotted var(--muted)">{esc(player)}</span></a>
+<br><span class="sub2">{esc(match)}</span> · {kalshi_link(b.market_ticker)}
+· <a class="sub2" href="/match/{esc(b.event_ticker)}">full analysis →</a>
 {why(b, player)}</td>
 <td class="mono">{b.price_cents}¢</td>
 <td class="mono" style="font-weight:800">{b.units or 1}u</td>
@@ -959,25 +990,15 @@ justify-content:space-between;gap:12px">
     # Like-for-like: only matches that have FINISHED (result known), with both
     # exit rules derived from that same result. Identical denominators — the
     # only differences are exit outcomes (reversal salvages), not timing.
-    from bot.track import advisory_outcome
-
-    def cstats(tp: bool):  # reuses the page-level cmp_out / finished / mode_stats
-        return mode_stats(tp)
-
-    nfin = len(finished)
     tp_live = sum(1 for b, _ in bets if results.get(b.market_ticker) is None
                   and (lambda t: (b.side == "yes" and (t[0] or 0) >= TP_LIMIT)
                        or (b.side == "no" and (t[1] or 0) >= TP_LIMIT))(
                       touched.get(b.market_ticker, (None, None))))
     comparison_html = ""
     if nfin:
-        hw, hl, hpc, hun, hroi = cstats(False)
-        tw, tl, tpc, tun, troi = cstats(True)
-        roi = lambda v: f"{v:+.1%}" if v is not None else "—"
-        wr = lambda w, t: f"{w / t:.0%}" if t else "—"
-
         # per-match decomposition: TP salvages reversals (+90¢ each) and caps
-        # clean winners (−10¢ each) — this is exactly why the two differ
+        # clean winners (−10¢ each) — exactly why the two exits differ. Full
+        # metrics for both live in the scoreboard up top; this explains the gap.
         salv_n = salv = cap_n = cap = 0
         for b, _ in finished:
             d = cmp_out(b, True) - cmp_out(b, False)
@@ -986,40 +1007,19 @@ justify-content:space-between;gap:12px">
             elif d < 0:
                 cap_n += 1; cap += d
         net = salv + cap
-
-        def drow(label, hv, tv, dv, dcolor=None):
-            dc = dcolor or ("var(--good)" if dv.startswith("+") and dv != "+0"
-                            else "var(--accent)" if dv.startswith("-") else "var(--muted)")
-            return (f"<tr><td class='sub2'>{label}</td>"
-                    f"<td class='mono' style='text-align:right'>{hv}</td>"
-                    f"<td class='mono' style='text-align:right'>{tv}</td>"
-                    f"<td class='mono' style='text-align:right;color:{dc}'>{dv}</td></tr>")
-
-        d_pnl = tpc - hpc
-        d_un = tun - hun
-        table = f"""<table class="t" style="max-width:560px">
-<tr><th>metric</th><th style="text-align:right">Hold</th>
-<th style="text-align:right">Take-Profit</th><th style="text-align:right">Δ</th></tr>
-{drow("record", f"{hw}-{hl}", f"{tw}-{tl}", f"{tw - hw:+d}W", "var(--muted)")}
-{drow("win rate", wr(hw, hw + hl), wr(tw, tw + tl), f"{(tw/(tw+tl) if (tw+tl) else 0) - (hw/(hw+hl) if (hw+hl) else 0):+.0%}")}
-{drow("profit ($)", f"{dol(hpc):+.2f}", f"{dol(tpc):+.2f}", f"{dol(d_pnl):+.2f}")}
-{drow("profit (units)", f"{hun:+.2f}u", f"{tun:+.2f}u", f"{d_un:+.2f}u")}
-{drow("ROI", roi(hroi), roi(troi), f"{(troi - hroi):+.1%}" if hroi is not None and troi is not None else "—")}
-</table>"""
         verdict = ("Take-profit is ahead" if net > 0 else "Hold is ahead"
                    if net < 0 else "Dead even")
         comparison_html = f"""<section class="block"><div class="blockhead">
-<h4>Hold vs Take-Profit</h4><span class="aside">same {nfin} finished matches · identical picks</span></div>
+<h4>Why the two exits differ</h4><span class="aside">same {nfin} finished matches · identical picks</span></div>
 <div class="rule"></div>
-<div class="tw">{table}</div>
-<p class="prose" style="margin-top:10px"><strong>{verdict}</strong> by
-{dol(abs(net)):+.2f} on these {nfin} matches. Why they differ: take-profit
-<strong>salvaged {salv_n}</strong> lead(s) that reversed (+{salv / 100:.2f}, the
+<p class="prose" style="margin-top:6px"><strong>{verdict}</strong> by
+${dol(abs(net)):.2f} on these {nfin} matches. Take-profit
+<strong>salvaged {salv_n}</strong> lead(s) that reversed (+${dol(salv):.2f} — the
 limit banked ~90¢ before the collapse) and <strong>capped {cap_n}</strong> clean
-winner(s) at 90¢ ({cap / 100:.2f}, giving up ~10¢ each vs holding to 100¢).
+winner(s) at 90¢ (${dol(cap):.2f}, giving up ~10¢ each vs holding to 100¢).
 TP wins this trade-off only when it salvages at least one reversal per nine
-winners it caps — here {salv_n} vs {cap_n}. Both curves are plotted together in
-the Cumulative P&amp;L chart above.</p>
+winners it caps — here {salv_n} vs {cap_n}. Both curves are on the Cumulative
+P&amp;L chart above.</p>
 {f'<p class="sub2">(TP has also realized {tp_live} live position(s) on matches still in play — held out here for a like-for-like record.)</p>' if tp_live else ''}
 </section>"""
 
