@@ -508,7 +508,9 @@ async def testrun(request: web.Request) -> web.Response:
 
 
 async def testrun_tp(request: web.Request) -> web.Response:
-    return await _testrun_view(request, "tp")
+    # both exits now live on one page (hold headline + 90¢ comparison); keep the
+    # old URL working
+    raise web.HTTPFound("/testrun")
 
 
 async def _testrun_view(request: web.Request, mode: str) -> web.Response:
@@ -904,23 +906,18 @@ the Cumulative P&amp;L chart above.</p>
 {f'<p class="sub2">(TP has also realized {tp_live} live position(s) on matches still in play — held out here for a like-for-like record.)</p>' if tp_live else ''}
 </section>"""
 
-    title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
-    active = "testrun"  # TP is a sibling variant under the same nav tab
-    other = ('<a href="/testrun">← hold-to-settlement variant</a>' if is_tp
-             else '<a href="/testrun-tp">90¢ take-profit variant →</a>')
-    exit_note = (f"""<p class="prose" style="margin:0 0 18px">Same picks and
-sizing as the base testrun — the <strong>only</strong> difference is the exit: a
-limit sell at <strong>{TP_LIMIT}¢</strong> takes profit early. A winner banks
-{TP_LIMIT}¢ instead of riding to 100¢; crucially, a match that leads then
-collapses still fills the limit on the spike, turning a would-be full loss into
-a locked-in gain. Compare against the {other}.</p>"""
-                 if is_tp else
-                 f"""<p class="prose" style="margin:0 0 18px">The bot places
+    title = "Bot Testrun"
+    active = "testrun"
+    exit_note = f"""<p class="prose" style="margin:0 0 18px">The bot places
 <strong>imaginary</strong> one-contract bets for itself — selectively; most
-matches get no bet. Held to settlement (100¢/0¢). Settled results are the tuning
-data: the policy iterates until the record holds above 70%. Nothing here is, or
-ever becomes, a real order. See the {other}.</p>""")
-    status_th = "exit" if is_tp else "status"
+matches get no bet. The headline record holds every bet to settlement
+(100¢/0¢); the <strong>{TP_LIMIT}¢ take-profit</strong> variant below runs the
+<em>same</em> picks with a limit sell at {TP_LIMIT}¢ — banking {TP_LIMIT}¢ on
+winners but salvaging leads that later collapse. Both exits are tracked and
+compared on this one page. Settled results are the tuning data: the policy
+iterates until the record holds above 70%. Nothing here is, or ever becomes, a
+real order.</p>"""
+    status_th = "status"
     body = pagehead("Strategy Lab", title,
                     f'{n} settled · <a href="/track">advisory track record →</a>') \
         + strip + exit_note + watching_html + timeline_html + f"""
