@@ -224,12 +224,14 @@ function rel(){document.querySelectorAll('.rel').forEach(function(e){
  else s=Math.round(a/86400)+'d';
  e.textContent=d>0?('in '+s):(s+' ago');});}
 function bindWatch(){
- var w=document.getElementById('watching');
- if(!w) return;
- if(localStorage.getItem('watch_open')==='0') w.removeAttribute('open');
- var cc=document.getElementById('watch-caret');
- function pc(){if(cc)cc.textContent=w.open?'▾ hide':'▸ show';} pc();
- w.addEventListener('toggle',function(){localStorage.setItem('watch_open',w.open?'1':'0');pc();});}
+ document.querySelectorAll('details.coll').forEach(function(d){
+  if(d._bound) return; d._bound=true;
+  var key=d.dataset.key;
+  if(localStorage.getItem(key)==='1') d.setAttribute('open',''); else d.removeAttribute('open');
+  var c=d.querySelector('.coll-caret');
+  function pc(){if(c)c.textContent=d.open?'▾ hide':'▸ show';} pc();
+  d.addEventListener('toggle',function(){localStorage.setItem(key,d.open?'1':'0');pc();});
+ });}
 function typing(){var a=document.activeElement;
  return a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName);}
 async function refreshMain(){
@@ -775,13 +777,13 @@ version changes; records before and after a tune are never blended silently.</p>
 <td>{verdict}</td></tr>"""))
     watch_rows.sort(key=lambda r: (r[0] or now))
     clears = sum(1 for _, h in watch_rows if "clears —" in h)
-    watching_html = f"""<section class="block"><details id="watching" open>
+    watching_html = f"""<section class="block"><details class="coll" data-key="watch_open">
 <summary style="cursor:pointer;list-style:none;display:flex;align-items:baseline;
 justify-content:space-between;gap:12px">
 <span><span style="font-family:var(--font);font-weight:800;font-size:19px">Watching</span>
 <span class="sub2" style="margin-left:8px">{len(watch_rows)} evaluating ·
 {clears} clearing gates now</span></span>
-<span class="sub2" id="watch-caret">▾ hide</span></summary>
+<span class="sub2 coll-caret">▸ show</span></summary>
 <div class="rule" style="margin-top:8px"></div>
 <div class="tw"><table class="t"><tr><th>starts</th><th>watch side</th>
 <th>model</th><th>price</th><th>policy verdict</th></tr>
@@ -798,7 +800,7 @@ model — most of these will pass without one. ✓ = clears every gate now;
                   f"every gate. Disciplined silence: it stays flat until price "
                   f"meets model, not because nothing is happening.")
 
-    def bets_section(label, aside, basis) -> str:
+    def bets_section(label, aside, basis, key) -> str:
         opens = [x for x in open_bets if x[0].basis == basis]
         setts = [x for x in settled if x[0].basis == basis]
         w = sum(1 for b, _ in setts if effs[b.id][0] in WON)
@@ -806,14 +808,18 @@ model — most of these will pass without one. ✓ = clears every gate now;
         rowsel = rows_html(opens) + rows_html(setts)
         empty = (f'<tr><td colspan="10" class="empty">No {esc(label.lower())} '
                  f'settled yet. {empty_note if basis == "prematch" else "In-play bets fire only when a live advisory clears the policy mid-match."}</td></tr>')
-        return f"""<section class="block"><div class="blockhead">
-<h4>{label}</h4><span class="aside">{esc(aside)} · {rec} settled · {len(opens)} open</span></div>
-<div class="rule"></div><div class="tw">
+        return f"""<section class="block"><details class="coll" data-key="{key}">
+<summary style="cursor:pointer;list-style:none;display:flex;align-items:baseline;
+justify-content:space-between;gap:12px">
+<span><span style="font-family:var(--font);font-weight:800;font-size:19px">{label}</span>
+<span class="sub2" style="margin-left:8px">{esc(aside)} · {rec} settled · {len(opens)} open</span></span>
+<span class="sub2 coll-caret">▸ show</span></summary>
+<div class="rule" style="margin-top:8px"></div><div class="tw">
 <table class="t"><tr><th>placed</th><th>pick</th><th>price</th><th>units</th><th>model</th>
 <th>edge</th><th>tier</th><th>{status_th}</th><th style="text-align:right">CLV</th>
 <th style="text-align:right">P&amp;L</th></tr>
 {rowsel or empty}
-</table></div></section>"""
+</table></div></details></section>"""
 
     # --- Hold vs Take-Profit comparison ---
     # Like-for-like: only matches that have FINISHED (result known), with both
@@ -869,24 +875,54 @@ model — most of these will pass without one. ✓ = clears every gate now;
         overlay = timeline_svg(cseries(False), "$", [], points2=cseries(True),
                                label="hold to settlement", label2="90¢ take-profit")
         roi = lambda v: f"{v:+.1%}" if v is not None else "—"
+        wr = lambda w, t: f"{w / t:.0%}" if t else "—"
+
+        # per-match decomposition: TP salvages reversals (+90¢ each) and caps
+        # clean winners (−10¢ each) — this is exactly why the two differ
+        salv_n = salv = cap_n = cap = 0
+        for b, _ in finished:
+            d = cmp_out(b, True) - cmp_out(b, False)
+            if d > 0:
+                salv_n += 1; salv += d
+            elif d < 0:
+                cap_n += 1; cap += d
+        net = salv + cap
+
+        def drow(label, hv, tv, dv, dcolor=None):
+            dc = dcolor or ("var(--good)" if dv.startswith("+") and dv != "+0"
+                            else "var(--accent)" if dv.startswith("-") else "var(--muted)")
+            return (f"<tr><td class='sub2'>{label}</td>"
+                    f"<td class='mono' style='text-align:right'>{hv}</td>"
+                    f"<td class='mono' style='text-align:right'>{tv}</td>"
+                    f"<td class='mono' style='text-align:right;color:{dc}'>{dv}</td></tr>")
+
+        d_pnl = tpc - hpc
+        d_un = tun - hun
+        table = f"""<table class="t" style="max-width:560px">
+<tr><th>metric</th><th style="text-align:right">Hold</th>
+<th style="text-align:right">Take-Profit</th><th style="text-align:right">Δ</th></tr>
+{drow("record", f"{hw}-{hl}", f"{tw}-{tl}", f"{tw - hw:+d}W", "var(--muted)")}
+{drow("win rate", wr(hw, hw + hl), wr(tw, tw + tl), f"{(tw/(tw+tl) if (tw+tl) else 0) - (hw/(hw+hl) if (hw+hl) else 0):+.0%}")}
+{drow("profit ($)", f"{hpc / 100:+.2f}", f"{tpc / 100:+.2f}", f"{d_pnl / 100:+.2f}")}
+{drow("profit (units)", f"{hun:+.2f}u", f"{tun:+.2f}u", f"{d_un:+.2f}u")}
+{drow("ROI", roi(hroi), roi(troi), f"{(troi - hroi):+.1%}" if hroi is not None and troi is not None else "—")}
+</table>"""
+        verdict = ("Take-profit is ahead" if net > 0 else "Hold is ahead"
+                   if net < 0 else "Dead even")
         comparison_html = f"""<section class="block"><div class="blockhead">
-<h4>Hold vs Take-Profit</h4><span class="aside">same {nfin} finished matches · two exit rules</span></div>
+<h4>Hold vs Take-Profit</h4><span class="aside">same {nfin} finished matches · identical picks</span></div>
 <div class="rule"></div>
-<div class="metric-grid" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr))">
-<div class="metric"><div class="k">hold · record</div><div class="v mono">{hw}-{hl}</div></div>
-<div class="metric"><div class="k">hold · $</div><div class="v mono">{hpc / 100:+.2f}</div></div>
-<div class="metric"><div class="k">hold · units</div><div class="v mono">{hun:+.2f}u</div></div>
-<div class="metric"><div class="k">hold · ROI</div><div class="v mono">{roi(hroi)}</div></div>
-<div class="metric"><div class="k">TP · record</div><div class="v mono">{tw}-{tl}</div></div>
-<div class="metric"><div class="k">TP · $</div><div class="v mono">{tpc / 100:+.2f}</div></div>
-<div class="metric"><div class="k">TP · units</div><div class="v mono">{tun:+.2f}u</div></div>
-<div class="metric"><div class="k">TP · ROI</div><div class="v mono">{roi(troi)}</div></div>
-</div>
+<div class="tw">{table}</div>
+<p class="prose" style="margin-top:10px"><strong>{verdict}</strong> by
+{abs(net) / 100:+.2f} on these {nfin} matches. Why they differ: take-profit
+<strong>salvaged {salv_n}</strong> lead(s) that reversed (+{salv / 100:.2f}, the
+limit banked ~90¢ before the collapse) and <strong>capped {cap_n}</strong> clean
+winner(s) at 90¢ ({cap / 100:.2f}, giving up ~10¢ each vs holding to 100¢).
+TP wins this trade-off only when it salvages at least one reversal per nine
+winners it caps — here {salv_n} vs {cap_n}.</p>
 <div style="margin-top:12px">{overlay}</div>
-<p class="sub2" style="margin-top:6px">Identical picks, both scored on the same
-{nfin} finished matches — so any record difference is take-profit salvaging a
-lead that reversed, not a timing artifact. TP gives up 10¢ per clean winner but
-banks reversals.{f' (TP has also realized {tp_live} live position(s) on matches still in play — shown in the bets table, held out here for a like-for-like record.)' if tp_live else ''}</p></section>"""
+{f'<p class="sub2">(TP has also realized {tp_live} live position(s) on matches still in play — held out here for a like-for-like record.)</p>' if tp_live else ''}
+</section>"""
 
     title = "Testrun · Take-Profit" if is_tp else "Bot Testrun"
     active = "testrun"  # TP is a sibling variant under the same nav tab
@@ -913,9 +949,9 @@ ever becomes, a real order. See the {other}.</p>""")
 <span class="aside">where the record comes from — the improvement signal</span></div>
 <div class="rule"></div>{breakdown}</section>
 {bets_section("Pre-game bets", "placed before the match, off the model's "
-              "opening read", "prematch")}
+              "opening read", "prematch", "pre_open")}
 {bets_section("Live-game bets", "fired in-play when an advisory cleared the "
-              "policy mid-match", "advisory")}"""
+              "policy mid-match", "advisory", "live_open")}"""
     return respond(request, title, active, body)
 
 
