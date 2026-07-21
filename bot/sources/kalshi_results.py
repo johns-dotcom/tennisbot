@@ -176,9 +176,10 @@ class KalshiResultsSource(TennisDataSource):
             db.flush()
             return p.id
 
-        wid, lid = player_id(w_name), player_id(l_name)
-
-        # milestone → date, tournament, best_of, per-set score
+        # --- all network I/O FIRST, before any DB transaction is opened ---
+        # milestone → date, tournament, best_of, per-set score. Holding a
+        # connection open across these HTTP calls is what let Neon drop it
+        # mid-transaction (#9); do the slow work while nothing is checked out.
         ms = self.client.milestones_for_event(ev_ticker)
         details, mdate, tname, best_of = {}, None, None, 3
         if ms:
@@ -197,6 +198,15 @@ class KalshiResultsSource(TennisDataSource):
             mdate = datetime.fromisoformat(ct.replace("Z", "+00:00")).date() \
                 if ct else date.today()
 
+        w_surname = w_name.split()[-1]
+        is_c1 = winner_is_competitor1(
+            details, w_surname,
+            (winner_m.get("title") or "").replace("Will ", "").split(" win")[0])
+        sets, ww, wl, outcome = ([], None, None, "completed") if is_c1 is None \
+            else parse_kalshi_sets(details, is_c1)
+
+        # --- now the DB writes, in one short burst (no network in between) ---
+        wid, lid = player_id(w_name), player_id(l_name)
         tid = None
         if tname:
             from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -209,13 +219,6 @@ class KalshiResultsSource(TennisDataSource):
             tid = db.execute(select(Tournament.id).where(
                 Tournament.tour == tour, Tournament.source == self.name,
                 Tournament.source_key == tname[:64])).scalar()
-
-        w_surname = w_name.split()[-1]
-        is_c1 = winner_is_competitor1(
-            details, w_surname,
-            (winner_m.get("title") or "").replace("Will ", "").split(" win")[0])
-        sets, ww, wl, outcome = ([], None, None, "completed") if is_c1 is None \
-            else parse_kalshi_sets(details, is_c1)
 
         match = Match(
             tour=tour, source=self.name, source_key=skey, tournament_id=tid,
