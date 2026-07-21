@@ -341,13 +341,17 @@ def _summary(db) -> dict:
     }
 
 
-def statstrip(items: list[tuple[str, str, str]]) -> str:
+def statstrip(items: list[tuple[str, str, str]], cols: int | None = None) -> str:
     cells = []
     for label, value, sub in items:
         sub_html = f'<div class="s">{esc(sub)}</div>' if sub else ""
         cells.append(f'<div class="stat"><div class="l">{esc(label)}</div>'
                      f'<div class="v mono">{value}</div>{sub_html}</div>')
-    return f'<div class="statstrip">{"".join(cells)}</div>'
+    # a fixed column count fills every cell (no dangling gray grid cells when the
+    # tile count doesn't divide evenly into the auto-fit row); default is auto-fit
+    style = (f' style="grid-template-columns:repeat({cols},1fr)"'
+             if cols else "")
+    return f'<div class="statstrip"{style}>{"".join(cells)}</div>'
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +721,7 @@ async def _testrun_view(request: web.Request, mode: str) -> web.Response:
         (("90¢" if not is_tp else "Hold") + " · profit",
          f'<span style="color:{"var(--good)" if opc > 0 else "var(--accent)" if opc < 0 else "var(--text)"}">{opc / 100:+.2f}</span>'
          if (ow + ol) else "—", "on the same finished matches"),
-    ])(*mode_stats(not is_tp)))
+    ])(*mode_stats(not is_tp)), cols=4)
     breakdown = f"""<div class="metric-grid" style="grid-template-columns:repeat(6,1fr)">
 <div class="metric"><div class="k">prematch basis</div><div class="v mono">{bucket(lambda b: b.basis == 'prematch')}</div></div>
 <div class="metric"><div class="k">advisory basis</div><div class="v mono">{bucket(lambda b: b.basis == 'advisory')}</div></div>
