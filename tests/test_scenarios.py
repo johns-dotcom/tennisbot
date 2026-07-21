@@ -83,7 +83,33 @@ def test_gameflow_decider_caveat_when_record_contradicts_pick():
 
 def test_gameflow_supportive_decider_framing():
     c = build()
-    assert "the distance favors Adams" in c.narrative
+    # Adams' decider edge rests on a 3-1 record (n=4): honest prose hedges the
+    # directional read rather than asserting the distance "favors" him.
+    assert "the distance leans toward Adams" in c.narrative
+    assert "thin decider samples" in c.narrative
+
+
+def test_rate_n_flags_thin_and_widened_samples():
+    from bot.scenarios import _rate_n
+    from bot.stats.fallback import Stat, rate
+    # solid recent sample — no flag
+    solid = rate(34, 16, "last365")
+    assert _rate_n(solid) == "68% (34-16, past year)"
+    # thin sample — flagged inline
+    thin = rate(3, 1, "last365")
+    assert "thin sample" in _rate_n(thin)
+    # widened to career (recent too thin) — flagged, not silently passed off
+    widened = Stat(value=0.6, n=25, window="career", method="widened",
+                   wins=15, losses=10)
+    assert "recent sample too thin" in _rate_n(widened)
+
+
+def test_strongest_set_not_crowned_on_thin_sample():
+    from bot.scenarios import _is_thin
+    from bot.stats.fallback import rate
+    assert _is_thin(rate(2, 1, "last365")) is True     # n=3
+    assert _is_thin(rate(34, 16, "last365")) is False  # n=50
+    assert _is_thin(rate(0, 0, "last365")) is False    # omitted, not "thin"
 
 
 def test_gameflow_low_confidence_caveat():

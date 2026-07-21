@@ -29,6 +29,7 @@ log = get_logger("scenarios")
 HORIZON_H = 48
 TOP_N = 30
 MIN_SET_RATE_GAP = 0.08  # set-1 edge worth calling out
+THIN_SAMPLE = 10  # a rate on fewer decisions than this is an early read, not a trend
 SWEET_LO, SWEET_HI = 0.50, 0.85  # model-prob band where markets actually move
 SERIES_TIER = {"KXATPMATCH": "A", "KXWTAMATCH": "A", "KXWTAGAME": "A",
                "KXATPCHALLENGERMATCH": "C"}
@@ -66,11 +67,24 @@ def _wp(window: str) -> str:
     return "recent"
 
 
+def _is_thin(stat) -> bool:
+    """A cited rate resting on fewer than THIN_SAMPLE decisions — honest prose
+    must not read a 4-0 as if it were a 40-0 (CLAUDE.md rule 4)."""
+    return stat is not None and not stat.is_omitted and (stat.n or 0) < THIN_SAMPLE
+
+
 def _rate_n(stat) -> str | None:
-    """'68% (34-16, past year)' — every cited rate carries its sample."""
+    """'68% (34-16, past year)' — every cited rate carries its sample, and a
+    thin sample (or one we had to widen off recent form) is flagged inline so
+    the number is never read as more solid than it is."""
     if stat is None or stat.value is None:
         return None
-    return f"{int(round(stat.value * 100))}% ({stat.wins}-{stat.losses}, {_wp(stat.window)})"
+    win = _wp(stat.window)
+    if _is_thin(stat):
+        win += ", thin sample"
+    elif stat.method == "widened":
+        win = "career — recent sample too thin"
+    return f"{int(round(stat.value * 100))}% ({stat.wins}-{stat.losses}, {win})"
 
 
 def _supporting_analysis(prof_watch, prof_opp, hist_watch, hist_opp,
@@ -138,7 +152,9 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
     s1w, s1o = _pct(w_rates.get(1)), _pct(o_rates.get(1))
     w_all = {n: _pct(s) for n, s in w_rates.items() if _pct(s) is not None}
     if s1w is not None and s1o is not None and s1w - s1o >= MIN_SET_RATE_GAP * 100:
-        strongest = (max(w_all, key=w_all.get) == 1) if w_all else False
+        # only crown a "strongest set" on a sample solid enough to mean it
+        strongest = (max(w_all, key=w_all.get) == 1
+                     and not _is_thin(w_rates.get(1))) if w_all else False
         bits.append(f"{w_name} is the play. Set 1 is "
                     f"{'their strongest set — ' if strongest else 'the opening edge: '}"
                     f"{_rate_n(w_rates.get(1))} vs {_rate_n(o_rates.get(1))} for "
@@ -189,10 +205,14 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
         dw, do = (da, db_) if w_tick == ticker_a else (db_, da)
         recs = (f"{w_name} is {dw.wins}-{dw.losses} in {lab}s ({_wp(dw.window)}) "
                 f"against {o_name}'s {do.wins}-{do.losses} ({_wp(do.window)})")
+        # thin decider records are noisy — soften the directional read
+        dec_thin = _is_thin(dw) or _is_thin(do)
+        favors = ("leans toward" if dec_thin else "favors")
+        thin_note = " (thin decider samples — read it lightly)" if dec_thin else ""
         if dw.value >= do.value + 0.05:
-            bits.append(f"If it reaches {lab}: {recs} — the distance favors "
-                        f"{w_name}, and the model makes it {p_dec:.0%} once the "
-                        f"decider starts.")
+            bits.append(f"If it reaches {lab}: {recs} — the distance {favors} "
+                        f"{w_name}{thin_note}, and the model makes it {p_dec:.0%} once "
+                        f"the decider starts.")
         elif dw.value <= do.value - 0.05:
             bits.append(f"The caveat: {recs}, so the edge thins if this goes the "
                         f"distance — the model still reads {p_dec:.0%} in a "
