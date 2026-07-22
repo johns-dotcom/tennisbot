@@ -217,6 +217,70 @@ def conf_label(conf: float | None) -> str:
     return confidence_label(conf)
 
 
+# IOC (3-letter) → flag emoji for the common tennis nations; unknown → no flag
+_FLAG = {
+    "USA": "🇺🇸", "FRA": "🇫🇷", "ESP": "🇪🇸", "ITA": "🇮🇹", "GER": "🇩🇪", "GBR": "🇬🇧",
+    "AUS": "🇦🇺", "ARG": "🇦🇷", "RUS": "🇷🇺", "SRB": "🇷🇸", "SUI": "🇨🇭", "CAN": "🇨🇦",
+    "JPN": "🇯🇵", "CZE": "🇨🇿", "CRO": "🇭🇷", "AUT": "🇦🇹", "BEL": "🇧🇪", "NED": "🇳🇱",
+    "POL": "🇵🇱", "BRA": "🇧🇷", "CHN": "🇨🇳", "KOR": "🇰🇷", "GRE": "🇬🇷", "NOR": "🇳🇴",
+    "DEN": "🇩🇰", "SWE": "🇸🇪", "POR": "🇵🇹", "CHI": "🇨🇱", "COL": "🇨🇴", "KAZ": "🇰🇿",
+    "BUL": "🇧🇬", "SVK": "🇸🇰", "HUN": "🇭🇺", "RSA": "🇿🇦", "IND": "🇮🇳", "TPE": "🇹🇼",
+    "UKR": "🇺🇦", "ROU": "🇷🇴", "FIN": "🇫🇮", "SLO": "🇸🇮", "BLR": "🇧🇾", "LAT": "🇱🇻",
+    "LTU": "🇱🇹", "EST": "🇪🇪", "MDA": "🇲🇩", "BIH": "🇧🇦", "GEO": "🇬🇪", "TUN": "🇹🇳",
+    "EGY": "🇪🇬", "MAR": "🇲🇦", "ISR": "🇮🇱", "TUR": "🇹🇷", "THA": "🇹🇭", "MEX": "🇲🇽",
+    "NZL": "🇳🇿", "IRL": "🇮🇪", "ECU": "🇪🇨", "PER": "🇵🇪", "URU": "🇺🇾", "BOL": "🇧🇴",
+    "DOM": "🇩🇴", "PAR": "🇵🇾", "VEN": "🇻🇪", "HKG": "🇭🇰", "INA": "🇮🇩", "PHI": "🇵🇭",
+}
+
+
+def _flag(ioc: str | None) -> str:
+    return _FLAG.get((ioc or "").upper(), "")
+
+
+def score_grid(sl, a_name: str, b_name: str, a_ioc: str | None,
+               b_ioc: str | None) -> str:
+    """Kalshi-style live scoreline: two rows (flag · name · per-set columns ·
+    boxed current set). sl = (scoreline a-perspective, sets_a, sets_b). The set
+    leader is bold, the trailer dimmed; the last (in-progress) column is boxed."""
+    scoreline = (sl[0] or "").strip()
+    if not scoreline:
+        return ""
+    cols = []  # (a_val, b_val) per set/segment
+    for seg in scoreline.split():
+        head = seg.split("(")[0]
+        if "-" not in head:
+            continue
+        av, bv = head.split("-", 1)
+        cols.append((av, bv, "(" in seg))
+    if not cols:
+        return ""
+    last = len(cols) - 1
+
+    def cell(val, other, boxed):
+        try:
+            lead = int(val) > int(other)
+        except ValueError:
+            lead = False
+        style = ("font-weight:800;color:var(--text)" if lead
+                 else "color:var(--muted)")
+        box = ("border:1px solid var(--divider);border-radius:4px;"
+               "min-width:26px;text-align:center;" if boxed else "min-width:20px;text-align:center;")
+        return f'<span class="mono" style="{style};{box}padding:1px 4px">{esc(val)}</span>'
+
+    def row(name, ioc, idx):
+        cells = "".join(cell(c[idx], c[1 - idx], i == last) for i, c in enumerate(cols))
+        fl = _flag(ioc)
+        return (f'<div style="display:flex;align-items:center;gap:8px">'
+                f'<span style="width:1.4em">{fl}</span>'
+                f'<span class="nm" style="flex:1">{esc(name)}</span>'
+                f'<span style="display:flex;gap:5px">{cells}</span></div>')
+
+    return (f'<div style="margin:2px 0 4px">'
+            f'<div class="sub2" style="color:var(--accent);font-weight:800;'
+            f'letter-spacing:.08em;margin-bottom:4px">● LIVE</div>'
+            f'{row(a_name, a_ioc, 0)}{row(b_name, b_ioc, 1)}</div>')
+
+
 def conf_meter(conf: float | None) -> str:
     """A 5-segment confidence meter — the named band, the value, and filled
     segments up to that band, coloured by tier."""
@@ -323,6 +387,8 @@ function applyLiveFilters(){
   var okF=!s.trigfired||c.dataset.trigfired==='1';
   var okG=!s.trig||c.dataset.trig==='hit'||c.dataset.trig==='near';
   var ok=okT&&okP&&okS&&okF&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
+ // never let a stale filter hide every live match — fall back to showing all
+ if(shown===0&&total>0){document.querySelectorAll('.livecard').forEach(function(c){c.style.display='';});shown=total;}
  document.querySelectorAll('.fchip').forEach(function(ch){var f=ch.dataset.f,on;
   if(f==='play')on=!!s.play; else if(f==='trig')on=!!s.trig;
   else if(f==='trigfired')on=!!s.trigfired;
@@ -2062,6 +2128,14 @@ async def live(request: web.Request) -> web.Response:
                 FROM match_score_log WHERE market_ticker = ANY(:t)
                 ORDER BY market_ticker, ts DESC"""), {"t": all_tickers}).all():
                 scorelines[r[0]] = (r[1], r[2], r[3])
+        # player nationality (for the Kalshi-style flag) on the live sides
+        ioc_by_pid = {}
+        live_pids = [m.player_a_id for _, ev in live_evs for m in ev["sides"]
+                     if m.player_a_id]
+        if live_pids:
+            for pid, ioc in db.execute(select(Player.id, Player.ioc).where(
+                    Player.id.in_(live_pids))).all():
+                ioc_by_pid[pid] = ioc
         from bot.models import Scenario
 
         plans = {}
@@ -2123,9 +2197,18 @@ async def live(request: web.Request) -> web.Response:
                      "LIVE" if is_live else "PRE")
         play = tag("outline", "▲", "advisory") if any(m.ticker in advised for m in sides) else ""
         score_row = ""
-        sl = next((scorelines.get(m.ticker) for m in sides if scorelines.get(m.ticker)),
-                  None)
-        if sl and sl[0]:
+        # Kalshi-style live scoreline for live matches (per-set columns + flags),
+        # a-perspective of whichever side has a recorded scoreline
+        sm = next((m for m in sides if scorelines.get(m.ticker)), None)
+        if is_live and sm is not None and scorelines[sm.ticker][0]:
+            other = next((m for m in sides if m.ticker != sm.ticker), None)
+            a_nm = (sm.raw or {}).get("yes_sub_title") or "Player A"
+            b_nm = (other.raw or {}).get("yes_sub_title") if other else "Player B"
+            score_row = score_grid(scorelines[sm.ticker], a_nm, b_nm,
+                                   ioc_by_pid.get(sm.player_a_id),
+                                   ioc_by_pid.get(other.player_a_id) if other else None)
+        elif sm is not None and scorelines[sm.ticker][0]:
+            sl = scorelines[sm.ticker]
             score_row = (f'<div class="mono" style="font-size:15px;font-weight:800">'
                          f'{esc(sl[0])} <span class="sub2">· {sl[1]}-{sl[2]} sets</span></div>')
         # a scenario = this match is on the bot's watchlist (the /scenarios page);
