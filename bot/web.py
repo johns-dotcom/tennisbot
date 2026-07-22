@@ -261,11 +261,14 @@ def score_grid(sl, a_name: str, b_name: str, a_ioc: str | None,
             lead = int(val) > int(other)
         except ValueError:
             lead = False
+        # the boxed (current-game) column carries POINTS: 0/15/30/40 and 50=AD.
+        # Set columns carry games/tiebreak points and render as-is.
+        disp = "AD" if (boxed and val == "50") else val
         style = ("font-weight:800;color:var(--text)" if lead
                  else "color:var(--muted)")
         box = ("border:1px solid var(--divider);border-radius:4px;"
                "min-width:26px;text-align:center;" if boxed else "min-width:20px;text-align:center;")
-        return f'<span class="mono" style="{style};{box}padding:1px 4px">{esc(val)}</span>'
+        return f'<span class="mono" style="{style};{box}padding:1px 4px">{esc(disp)}</span>'
 
     def row(name, ioc, idx):
         cells = "".join(cell(c[idx], c[1 - idx], i == last) for i, c in enumerate(cols))
@@ -928,7 +931,84 @@ def postgame_analysis(pick: str, opp: str, side: str, result: str | None,
 async def testrun(request: web.Request) -> web.Response:
     bot = request.match_info.get("bot", "pre")
     bot = {"t1": "pre", "t2": "preSI"}.get(bot, bot)  # legacy 2-bot ids
+    if bot == "leaderboard":
+        return await bots_leaderboard(request)
     return await _testrun_view(request, bot=bot)
+
+
+async def bots_leaderboard(request: web.Request) -> web.Response:
+    """All six bots side by side — record, win rate, ROI, CLV, units — so the
+    winning strategy is visible without clicking through each page."""
+    from bot.models import KalshiMarket, PaperBet
+    from bot.track import advisory_outcome, clv_cents
+    from bot.t2 import BOTS
+
+    with db_session() as db:
+        rows = db.execute(
+            select(PaperBet, KalshiMarket.result, KalshiMarket.close_yes_cents)
+            .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)).all()
+    per = {b: {"w": 0, "l": 0, "open": 0, "pnl": 0, "stake": 0, "clv": [],
+               "un": 0.0} for b in BOTS}
+    for b, res, close in rows:
+        if b.bot not in per:
+            continue
+        d = per[b.bot]
+        o = advisory_outcome(b.side, res)
+        u = b.units or 1.0
+        if o == "won":
+            d["w"] += 1; d["pnl"] += (100 - b.price_cents) * u; d["un"] += (100 - b.price_cents) * u / b.price_cents
+        elif o == "lost":
+            d["l"] += 1; d["pnl"] -= b.price_cents * u; d["un"] -= u
+        else:
+            d["open"] += 1; continue
+        d["stake"] += b.price_cents * u
+        c = clv_cents(b.side, b.price_cents, close)
+        if c is not None:
+            d["clv"].append(c)
+
+    def rowhtml(bid):
+        m = BOTS[bid]
+        d = per[bid]
+        n = d["w"] + d["l"]
+        wr = d["w"] / n if n else None
+        roi = d["pnl"] / d["stake"] if d["stake"] else None
+        clv = sum(d["clv"]) / len(d["clv"]) if d["clv"] else None
+        wrc = ("var(--good)" if wr and wr >= 0.7 else
+               "var(--warning)" if wr and wr >= 0.6 else "var(--text)")
+        pcol = ("var(--good)" if d["pnl"] > 0 else
+                "var(--accent)" if d["pnl"] < 0 else "var(--muted)")
+        clvc = ("var(--good)" if clv and clv > 0 else
+                "var(--accent)" if clv and clv < 0 else "var(--muted)")
+        wr_s = f"{wr:.0%}" if wr is not None else "—"
+        profit_s = f"${dol(d['pnl']):+.2f}" if n else "—"
+        units_s = f"{d['un']:+.1f}u" if n else "—"
+        roi_s = f"{roi:+.1%}" if roi is not None else "—"
+        clv_s = f"{clv:+.1f}¢" if clv is not None else "—"
+        learns = " · learns" if m["si"] else ""
+        return (f'<tr><td><a href="/testrun/{bid}"><strong>{esc(m["label"])}</strong></a>'
+                f'<span class="sub2">{learns}</span></td>'
+                f'<td class="mono">{d["w"]}-{d["l"]}</td>'
+                f'<td class="mono" style="color:{wrc}">{wr_s}</td>'
+                f'<td class="mono" style="color:{pcol};font-weight:800">{profit_s}</td>'
+                f'<td class="mono" style="color:{pcol}">{units_s}</td>'
+                f'<td class="mono">{roi_s}</td>'
+                f'<td class="mono" style="color:{clvc}">{clv_s}</td>'
+                f'<td class="mono sub2">{d["open"]}</td></tr>')
+
+    # order: most settled bets first
+    order = sorted(BOTS, key=lambda b: -(per[b]["w"] + per[b]["l"]))
+    body = pagehead("Strategy Lab", "Bots — Leaderboard",
+                    "all six side by side · hold-to-settlement basis") + f"""
+<p class="prose" style="margin:0 0 16px">Six bots on the same model, differing by
+<strong>when</strong> they bet (pre-game · live · top-5 daily) and <strong>how</strong>
+they tune (fixed vs self-improving). Records are hold-to-settlement; CLV is entry
+vs the closing line. Click a name for its full page.</p>
+<div class="tw"><table class="t">
+<tr><th>bot</th><th>record</th><th>win rate</th><th>profit</th><th>units</th>
+<th>ROI</th><th>CLV</th><th>open</th></tr>
+{''.join(rowhtml(b) for b in order)}
+</table></div>"""
+    return respond(request, "Bots Leaderboard", "testrun", body)
 
 
 async def testrun_tp(request: web.Request) -> web.Response:
@@ -1368,9 +1448,11 @@ P&amp;L chart above.</p>
             f'</table></div></section>')
 
     from bot.t2 import BOTS as _BOTS
-    switcher = '<div class="filterbar" style="margin-bottom:18px">' + "".join(
-        f'<a class="fchip{" on" if bid == bot else ""}" href="/testrun/{bid}">'
-        f'{esc(m["label"])}</a>' for bid, m in _BOTS.items()) + '</div>'
+    switcher = ('<div class="filterbar" style="margin-bottom:18px">'
+                + '<a class="fchip" href="/testrun/leaderboard">★ Leaderboard</a>'
+                + "".join(
+                    f'<a class="fchip{" on" if bid == bot else ""}" href="/testrun/{bid}">'
+                    f'{esc(m["label"])}</a>' for bid, m in _BOTS.items()) + '</div>')
 
     title = f"Testrun · {meta['label']}"
     active = "testrun"
