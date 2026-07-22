@@ -1950,10 +1950,12 @@ async def live(request: web.Request) -> web.Response:
         # scores live matches every ~25s), so a game recorded this recently means
         # play is under way; no recent scoring past the start grace ⇒ finished.
         from sqlalchemy import text as _sqltext
-        fresh = {r[0]: r[1] for r in db.execute(_sqltext(
+        # last score per match over the recent past: within FRESH_LIVE ⇒ actively
+        # live; any row at all ⇒ the match has STARTED (so it's never "upcoming").
+        recent = {r[0]: r[1] for r in db.execute(_sqltext(
             "SELECT market_ticker, max(ts) FROM match_score_log "
-            "WHERE ts > now() - interval '90 minutes' GROUP BY market_ticker")).all()}
-        FRESH_LIVE = timedelta(minutes=45)
+            "WHERE ts > now() - interval '18 hours' GROUP BY market_ticker")).all()}
+        FRESH_LIVE = timedelta(minutes=90)
 
         # A match is DONE only on an authoritative signal — settled result, the
         # market having left Kalshi's open set (discovery-gone), or a definitely-
@@ -1976,16 +1978,17 @@ async def live(request: web.Request) -> web.Response:
                 if now - occ <= timedelta(hours=18):
                     done_evs.append((ev_ticker, ev))
                 continue
-            # actually live: recent scoring, an explicit live status, or just
-            # started (grace for a match not yet scored). NOT merely 'occ is in
-            # the past and the market is still open' — that let finished games
-            # linger.
-            score_fresh = any(m.ticker in fresh and now - fresh[m.ticker] <= FRESH_LIVE
+            # started = any game recorded; fresh = scored within FRESH_LIVE
+            started = any(m.ticker in recent for m in ev["sides"])
+            score_fresh = any(m.ticker in recent and now - recent[m.ticker] <= FRESH_LIVE
                               for m in ev["sides"])
+            ev["started"] = started
             if (status in LIVE or score_fresh
                     or occ - LIVE_WINDOW_BEFORE <= now <= occ + timedelta(hours=2)):
                 live_evs.append((ev_ticker, ev))
-            elif now < occ <= now + UPCOMING_HORIZON:
+            elif not started and now < occ <= now + UPCOMING_HORIZON:
+                # only genuinely upcoming matches — a started match (any score,
+                # or occ already past) is never shown as "Starting soon"
                 soon_evs.append((ev_ticker, ev))
         live_evs.sort(key=lambda e: e[1]["occ"])
         soon_evs.sort(key=lambda e: e[1]["occ"])
@@ -2117,7 +2120,15 @@ async def live(request: web.Request) -> web.Response:
         tour = series_label.get(ev["series"], "?")
         has_play = any(m.ticker in advised for m in sides)
         trig = _trig_class(est, is_live)
-        return f"""<div class="card livecard{' trig-live' if trig_fired else ''}" \
+        # 'livecard' class only on the live section — the filter bar counts/filters
+        # those, not the "starting soon" cards
+        klass = ("card livecard" if is_live else "card") + (" trig-live" if trig_fired else "")
+        # timing label: live matches with a future scheduled time started early
+        if is_live:
+            when = f"started {pt(ev['occ'])}" if ev["occ"] <= now else "live now (early start)"
+        else:
+            when = f"starts {pt(ev['occ'])}"
+        return f"""<div class="{klass}" \
 data-tour="{esc(tour)}" data-play="{1 if has_play else 0}" \
 data-scenario="{1 if sc is not None else 0}" \
 data-trigfired="{1 if trig_fired else 0}" data-trig="{trig}">
@@ -2129,7 +2140,7 @@ data-trigfired="{1 if trig_fired else 0}" data-trig="{trig}">
 <div>{''.join(rows_html)}</div></a>
 {score_row}
 {plan_row}
-<div class="sub2 mono">{'started' if is_live else 'starts'} {pt(ev['occ'])}
+<div class="sub2 mono">{when}
 · <a href="/match/{esc(ev_ticker)}" class="sub2">match data →</a>
 · {kalshi_link(sides[0].ticker)}</div>
 </div>"""
