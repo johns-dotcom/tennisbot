@@ -236,6 +236,13 @@ def tag(kind: str, icon: str, label: str) -> str:
     return f'<span class="tag tag-{kind}">{icon} {esc(label)}</span>'
 
 
+def player_age(dob) -> str:
+    """Whole-year age from a date-of-birth, '—' if unknown."""
+    if not dob:
+        return "—"
+    return f"{int((datetime.now(timezone.utc).date() - dob).days / 365.25)}"
+
+
 def conf_label(conf: float | None) -> str:
     from bot.prob.confidence import confidence_label
     return confidence_label(conf)
@@ -2807,6 +2814,7 @@ async def players(request: web.Request) -> web.Response:
 <td class="mono sub2">{esc(p.ioc or '—')}</td>
 <td class="mono">{w}-{l}</td>
 <td class="mono sub2">{esc(ls) if ls else '—'}</td>
+<td class="mono sub2">{player_age(p.dob)}</td>
 <td class="mono sub2">{esc(p.hand or '—')}</td></tr>"""
         for p, w, l, ls in plist)
 
@@ -2834,7 +2842,7 @@ async def players(request: web.Request) -> web.Response:
 <button class="tag tag-outline" type="submit" style="cursor:pointer;padding:9px 16px">Apply</button>
 </form>
 <div class="tw"><table class="t">
-<tr><th>player</th><th>tour</th><th>country</th><th>record</th><th>last match</th><th>hand</th></tr>
+<tr><th>player</th><th>tour</th><th>country</th><th>record</th><th>last match</th><th>age</th><th>hand</th></tr>
 {rows or '<tr><td colspan="6" class="empty">No players match these filters.</td></tr>'}
 </table></div>
 <p class="prose" style="margin-top:12px">137,000+ players indexed from 2022 on.
@@ -3149,7 +3157,8 @@ async def match_detail(request: web.Request) -> web.Response:
         return f"""<div class="card">
 <a href="/player/{p.id}" style="text-decoration:none">
 <div class="title">{esc(p.full_name)}</div></a>
-<div class="sub2">{p.tour.upper()} · {esc(p.ioc or '')} ·
+<div class="sub2">{p.tour.upper()} · {esc(p.ioc or '')}
+{f"· {player_age(p.dob)}y" if p.dob else ""} ·
 {prof.matches_in_db} matches in DB</div>
 <div class="metric-grid" style="grid-template-columns:repeat(3,1fr)">{cells}</div>
 <div class="prose">Past year {f.win_rate_365.wins}-{f.win_rate_365.losses} ·
