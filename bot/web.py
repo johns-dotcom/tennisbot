@@ -104,6 +104,10 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
 .fchip.on { border-color: var(--accent); color: var(--text); }
 .planrow { margin-top: 6px; font-size: 12.5px; display: flex; flex-wrap: wrap;
   align-items: center; gap: 7px; }
+.trig-live { border-color: var(--warning); box-shadow: 0 0 0 1px var(--warning); }
+.trig-banner { background: var(--warning); color: #0a0a0a; font-weight: 800;
+  font-size: 11px; letter-spacing: .04em; padding: 6px 10px; border-radius: 5px;
+  margin: -2px 0 8px; }
 .scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
 .scard { transition: border-color .12s ease; }
@@ -284,10 +288,12 @@ function applyLiveFilters(){
   var okT=tours.length===0||tours.indexOf(c.dataset.tour)>=0;
   var okP=!s.play||c.dataset.play==='1';
   var okS=!s.scenario||c.dataset.scenario==='1';
+  var okF=!s.trigfired||c.dataset.trigfired==='1';
   var okG=!s.trig||c.dataset.trig==='hit'||c.dataset.trig==='near';
-  var ok=okT&&okP&&okS&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
+  var ok=okT&&okP&&okS&&okF&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
  document.querySelectorAll('.fchip').forEach(function(ch){var f=ch.dataset.f,on;
   if(f==='play')on=!!s.play; else if(f==='trig')on=!!s.trig;
+  else if(f==='trigfired')on=!!s.trigfired;
   else if(f==='scenario')on=!!s.scenario; else on=tours.indexOf(f)>=0;
   ch.classList.toggle('on',on);});
  var vc=document.getElementById('livecount'); if(vc)vc.textContent=shown;}
@@ -295,6 +301,7 @@ function bindFilters(){
  document.querySelectorAll('.fchip').forEach(function(ch){if(ch._b)return;ch._b=true;
   ch.addEventListener('click',function(){var s=lfState(),f=ch.dataset.f;
    if(f==='play')s.play=!s.play; else if(f==='trig')s.trig=!s.trig;
+   else if(f==='trigfired')s.trigfired=!s.trigfired;
    else if(f==='scenario')s.scenario=!s.scenario;
    else{s.tours=s.tours||[];var i=s.tours.indexOf(f);if(i>=0)s.tours.splice(i,1);else s.tours.push(f);}
    localStorage.setItem('deuce_lf',JSON.stringify(s));applyLiveFilters();});});
@@ -1924,6 +1931,19 @@ async def live(request: web.Request) -> web.Response:
                     .order_by(Scenario.created_for)).scalars():
                 plans[sc.event_ticker] = sc
 
+        # a scenario whose trigger has FIRED (live match reached the decider) is
+        # the single most actionable card — float those to the very top
+        def _scen_fired(ev_ticker, ev):
+            sc = plans.get(ev_ticker)
+            e = _ev_est(ev)
+            if sc is None or e is None or e.stale:
+                return False
+            bo = int((ev["sides"][0].raw or {}).get("_best_of", 3) or 3)
+            return e.state == f"{bo // 2}-{bo // 2}"
+        live_evs.sort(key=lambda e: (
+            0 if _scen_fired(e[0], e[1]) else 1,
+            _TRIG_RANK[_trig_class(_ev_est(e[1]), True)], e[1]["occ"]))
+
     series_label = {"KXATPMATCH": "ATP", "KXWTAMATCH": "WTA", "KXWTAGAME": "WTA",
                     "KXATPCHALLENGERMATCH": "CHALLENGER", "KXITFMATCH": "ITF M",
                     "KXITFWMATCH": "ITF W"}
@@ -1966,25 +1986,36 @@ async def live(request: web.Request) -> web.Response:
         if sl and sl[0]:
             score_row = (f'<div class="mono" style="font-size:15px;font-weight:800">'
                          f'{esc(sl[0])} <span class="sub2">· {sl[1]}-{sl[2]} sets</span></div>')
-        # a scenario = this match is on the bot's watchlist (the /scenarios page)
+        # a scenario = this match is on the bot's watchlist (the /scenarios page);
+        # its trigger FIRES when the live match reaches the decider state
         sc = plans.get(ev_ticker)
         scen_badge = tag("accent", "◆", "scenario") if sc is not None else ""
-        plan_row = ""
+        plan_row = banner = ""
+        trig_fired = False
         if sc is not None:
             wm = next((m for m in sides if m.ticker == sc.market_ticker), None)
-            wname = ((wm.raw or {}).get("yes_sub_title") if wm else "") or "the pick"
+            wname = (((wm.raw or {}).get("yes_sub_title") if wm else "") or "the pick").split()[-1]
             wmid = _odds_cents(wm, quotes)[0] if wm else None
+            bo = int((sides[0].raw or {}).get("_best_of", 3) or 3)
+            decider_state = f"{bo // 2}-{bo // 2}"
+            trig_fired = (est is not None and not est.stale
+                          and est.state == decider_state)
+            if trig_fired:
+                banner = (f'<div class="trig-banner">◎ SCENARIO TRIGGERED · '
+                          f'watch {esc(wname)} — reached the decider ({esc(est.state)})</div>')
             plan_row = (
                 f'<div class="planrow"><span class="scen-flag">◆ PLAY</span> '
-                f'<strong>{esc(wname.split()[-1])}</strong> '
+                f'<strong>{esc(wname)}</strong> '
                 f'{trigger_html(sc, est.state if est else None, is_live, wmid)} '
                 f'<a href="/scenario/{sc.id}" class="sub2">full scenario →</a></div>')
         tour = series_label.get(ev["series"], "?")
         has_play = any(m.ticker in advised for m in sides)
         trig = _trig_class(est, is_live)
-        return f"""<div class="card livecard" data-tour="{esc(tour)}" \
-data-play="{1 if has_play else 0}" data-scenario="{1 if sc is not None else 0}" \
-data-trig="{trig}">
+        return f"""<div class="card livecard{' trig-live' if trig_fired else ''}" \
+data-tour="{esc(tour)}" data-play="{1 if has_play else 0}" \
+data-scenario="{1 if sc is not None else 0}" \
+data-trigfired="{1 if trig_fired else 0}" data-trig="{trig}">
+{banner}
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{tour}</span>
 <span>{st} {scen_badge} {play}</span></div>
@@ -2030,10 +2061,12 @@ data-trig="{trig}">
                                       if states.get(m.ticker)), None), True)
                  in ("hit", "near"))
     scen_n = sum(1 for t, _ in live_evs if t in plans)
+    fired_n = sum(1 for t, e in live_evs if _scen_fired(t, e))
     filter_bar = (f'<div class="filterbar">{tour_chips}'
+                  f'<button class="fchip" data-f="trigfired">◎ triggered now ({fired_n})</button>'
                   f'<button class="fchip" data-f="scenario">◆ scenario ({scen_n})</button>'
                   f'<button class="fchip" data-f="play">▲ advisory fired</button>'
-                  f'<button class="fchip" data-f="trig">◎ near trigger ({near_n})</button>'
+                  f'<button class="fchip" data-f="trig">near trigger ({near_n})</button>'
                   f'<span class="sub2" style="margin-left:auto">showing '
                   f'<span id="livecount">{len(live_evs)}</span> of {len(live_evs)}</span>'
                   f'</div>') if live_evs else ""
