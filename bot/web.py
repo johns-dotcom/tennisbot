@@ -2343,7 +2343,11 @@ async def live(request: web.Request) -> web.Response:
         # final scoreline.
         ENDED = {"finished", "complete", "ended", "closed", "cancelled", "canceled",
                  "walkover", "wov", "abandoned", "retired", "postponed"}
-        LIVE = {"live", "inprogress", "in_progress", "in progress", "interrupted"}
+        # 'live'/'s'(started) are confirmed in-play by cross-referencing scores;
+        # 'P' is NOT here — it's ~75% finished matches, so it would flood the
+        # board with completed games. Set-in-progress codes count as live too.
+        LIVE = {"live", "s", "started", "inprogress", "in_progress", "in progress",
+                "interrupted", "1st_set", "2nd_set", "3rd_set", "4th_set", "5th_set"}
 
         def _rec(ev):  # (latest ts, total_games, is_final) across the event's sides
             best = None
@@ -2364,19 +2368,23 @@ async def live(request: web.Request) -> web.Response:
                             if (m.raw or {}).get("_live_status")), "") or "").lower()
             r = _rec(ev)
             is_final = bool(r and r[2])
-            if settled or gone or status in ENDED or is_final:
-                if now - occ <= timedelta(hours=18):
-                    done_evs.append((ev_ticker, ev))
-                continue
             games = r[1] if r else 0
             fresh = bool(r and now - r[0] <= FRESH_LIVE)
-            playing = games > 0 and fresh
+            playing = games > 0 and fresh and not is_final
             ev["started"] = games > 0
-            if status in LIVE or playing:
+            # ORDER MATTERS: a fresh in-play score (games advancing right now) is
+            # the strongest 'live' signal and OVERRIDES a settled/gone/ended flag
+            # — those flags can lag (stale last_seen, unset status) while the
+            # match is demonstrably being scored. Only when NOT actively scoring
+            # do we trust the end signals.
+            if playing or status in LIVE:
                 live_evs.append((ev_ticker, ev))
-            elif not playing and (now - timedelta(hours=2) <= occ <= now + UPCOMING_HORIZON):
-                # scheduled or awaiting start (tennis runs late) — shown as
-                # upcoming, never falsely "live"
+            elif settled or is_final or gone or status in ENDED:
+                if now - occ <= timedelta(hours=18):
+                    done_evs.append((ev_ticker, ev))
+            elif now - timedelta(hours=2) <= occ <= now + UPCOMING_HORIZON:
+                # scheduled or awaiting start (tennis runs late) — upcoming,
+                # never falsely "live"
                 soon_evs.append((ev_ticker, ev))
         live_evs.sort(key=lambda e: e[1]["occ"])
         soon_evs.sort(key=lambda e: e[1]["occ"])
