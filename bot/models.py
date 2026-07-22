@@ -279,7 +279,7 @@ class PaperBet(Base):
     __tablename__ = "paper_bets"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-    bot: Mapped[str] = mapped_column(String(8), default="t1", index=True)  # 't1' fixed | 't2' self-improving
+    bot: Mapped[str] = mapped_column(String(8), default="pre", index=True)  # pre|preSI|live|liveSI
     event_ticker: Mapped[str] = mapped_column(String(96))
     market_ticker: Mapped[str] = mapped_column(String(96))
     player_id: Mapped[int | None] = mapped_column(ForeignKey("players.id"))

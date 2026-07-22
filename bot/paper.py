@@ -168,7 +168,7 @@ def decide_bet(p_yes: float, confidence: float, yes_ask: int | None,
 def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
               player_id: int | None, decision: BetDecision, confidence: float,
               basis: str, tier: str | None, state: str = "0-0",
-              reasoning: dict | None = None, bot: str = "t1",
+              reasoning: dict | None = None, bot: str = "pre",
               policy_version: str = POLICY_VERSION) -> bool:
     """One bet per event per bot. Returns True if placed."""
     exists = db.execute(select(PaperBet.id).where(

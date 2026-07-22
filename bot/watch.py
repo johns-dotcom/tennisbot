@@ -415,13 +415,22 @@ class WatchService:
         matches get none — the policy in bot/paper.py decides."""
         from bot.paper import decide_bet, place_bet
         from bot.prob.model import MatchState
-        from bot.t2 import iter_bot_policies
+        from bot.t2 import iter_bot_policies, place_top5_bets
 
         while not self.stop.is_set():
             if self.advisory_hook is None or not self.watched:
                 await asyncio.sleep(10)
                 continue
             now = utcnow()
+            # Top-5 daily bots: back the day's strongest scenarios (idempotent,
+            # capped per day) — independent of the near-start candidate scan below
+            try:
+                with db_session() as db:
+                    n = place_top5_bets(db)
+                if n:
+                    log.info("top-5 daily bets placed", count=n)
+            except Exception as e:
+                log.warning("top-5 placement failed", error=str(e))
             candidates: dict[str, dict] = {}
             for ticker, info in self.watched.items():
                 occ_raw = info.get("occurrence") or ""
@@ -454,7 +463,7 @@ class WatchService:
                     ctx["player_a_id"], ctx["player_b_id"], None, ctx["tier"],
                     MatchState(0, 0, ctx["best_of"]))
                 with db_session() as db:
-                    for bot, policy in iter_bot_policies(db):
+                    for bot, policy in iter_bot_policies(db, "prematch"):
                         decision = decide_bet(pred.p_a, pred.confidence, ya, yb,
                                               tier=ctx.get("tier"), policy=policy)
                         if not decision.place:
@@ -581,17 +590,18 @@ class WatchService:
 
                 with db_session() as db:
                     settle_open_bets(db)
-                # T2 learns from freshly-settled results
+                # the self-improving bots learn from freshly-settled results
                 try:
-                    from bot.t2 import t2_self_improve
+                    from bot.t2 import self_improve_all
 
                     with db_session() as db:
-                        r = t2_self_improve(db)
-                    if r.get("changed"):
-                        log.info("T2 policy updated", version=r.get("version"),
-                                 rationale=r.get("rationale"))
+                        for bid, r in self_improve_all(db).items():
+                            if r.get("changed"):
+                                log.info("bot policy updated", bot=bid,
+                                         version=r.get("version"),
+                                         rationale=r.get("rationale"))
                 except Exception as e:
-                    log.warning("T2 self-improve failed", error=str(e))
+                    log.warning("self-improve failed", error=str(e))
             except Exception as e:
                 log.error("settlement loop error", error=str(e))
             try:

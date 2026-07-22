@@ -273,9 +273,9 @@ class AdvisoryEngine:
         if not ctx.get("event_ticker"):
             return
         with self.db_session() as db:
-            # each bot evaluates the advisory under its own policy (T1 fixed,
-            # T2 self-improving) — shared policy_ok so they can't drift
-            for bot, policy in iter_bot_policies(db):
+            # the two LIVE bots (fixed + self-improving) evaluate the advisory
+            # under their own policy — shared policy_ok so they can't drift
+            for bot, policy in iter_bot_policies(db, "advisory"):
                 if not policy_ok(prob, edge, price, ctx.get("tier"), policy):
                     continue
                 decision = BetDecision(
