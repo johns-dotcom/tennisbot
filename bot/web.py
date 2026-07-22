@@ -636,6 +636,14 @@ async def scenario_detail(request: web.Request) -> web.Response:
             "SELECT scoreline, sets_a, sets_b FROM match_score_log "
             "WHERE market_ticker = :t ORDER BY ts DESC LIMIT 1"),
             {"t": sc.market_ticker}).first()
+        # both sides' live Kalshi odds + a short game log for full match context
+        mkts = db.execute(select(KalshiMarket).where(
+            KalshiMarket.event_ticker == sc.event_ticker)
+            .order_by(KalshiMarket.ticker)).scalars().all()
+        quotes = _latest_quotes(db, [m.ticker for m in mkts]) if mkts else {}
+        gamelog = db.execute(sqltext(
+            "SELECT scoreline, ts FROM match_score_log WHERE market_ticker = :t "
+            "ORDER BY ts DESC LIMIT 6"), {"t": sc.market_ticker}).all()
 
     f = sc.facts or {}
     conf = f.get("model_confidence")
@@ -670,21 +678,41 @@ async def scenario_detail(request: web.Request) -> web.Response:
                   f'<div class="rule"></div>{setrows}{dec}</section>'
                   if setrows or dec else "")
 
+    # live odds for both sides + game log
+    odds_html = ""
+    for m in mkts[:2]:
+        nm = (m.raw or {}).get("yes_sub_title") or m.ticker.rsplit("-", 1)[-1]
+        cents, live_q = _odds_cents(m, quotes)
+        dot = '<span style="color:var(--good)">●</span> ' if live_q else ""
+        odds_html += (f'<div class="vsrow"><span class="k">{esc(nm.split()[-1])}</span>'
+                      f'<span class="v mono">{dot}{cents}¢</span></div>'
+                      if cents is not None else "")
+    log_html = ""
+    if gamelog:
+        rows = "".join(f'<div class="vsrow"><span class="k mono">{esc(r[0])}</span>'
+                       f'<span class="sub2">{pt(r[1])}</span></div>' for r in gamelog)
+        log_html = (f'<div class="vshead" style="margin-top:12px">Game log'
+                    f'<span>most recent first</span></div>{rows}')
     live_html = ""
-    if sl and sl[0]:
+    if (sl and sl[0]) or odds_html:
         state = st.state if st else None
-        live_html = (f'<section class="block"><div class="blockhead"><h4>Live now</h4>'
-                     f'<span class="aside">{esc(state or "in play")}</span></div>'
-                     f'<div class="rule"></div><div class="mono" '
-                     f'style="font-size:16px;font-weight:800">{esc(sl[0])} '
-                     f'<span class="sub2">· {sl[1]}-{sl[2]} sets</span></div></section>')
+        score = (f'<div class="mono" style="font-size:17px;font-weight:800;margin-bottom:8px">'
+                 f'{esc(sl[0])} <span class="sub2">· {sl[1]}-{sl[2]} sets</span></div>'
+                 if sl and sl[0] else "")
+        live_html = (f'<section class="block"><div class="blockhead"><h4>Live match</h4>'
+                     f'<span class="aside">{esc(state or "current odds")}</span></div>'
+                     f'<div class="rule"></div>{score}'
+                     f'<div class="vshead">Kalshi odds<span>implied win %</span></div>'
+                     f'{odds_html or "<div class=sub2>no live price</div>"}{log_html}</section>')
 
     match_label = f.get("match") or sc.event_ticker
     body = pagehead("Scenario", esc(match_label),
                     f'<a href="/scenarios">← all scenarios</a>') + f"""
-<p class="prose" style="margin:0 0 16px">Watch <strong>{esc(player)}</strong>
+<p class="prose" style="margin:0 0 14px">Watch <strong>{esc(player)}</strong>
 · {esc(f.get('event_label') or '')} · scheduled {pt(sc.scheduled_start)} ·
-{kalshi_link(sc.market_ticker)} · <a href="/match/{esc(sc.event_ticker)}">full match data →</a></p>
+{kalshi_link(sc.market_ticker)}</p>
+<a href="/match/{esc(sc.event_ticker)}" class="fchip" style="display:inline-block;
+margin:0 0 18px;border-color:var(--accent);color:var(--text)">📊 full match data, charts &amp; game-by-game →</a>
 {strip}{live_html}
 <section class="block"><div class="blockhead"><h4>The read</h4>
 <span class="aside">deterministic — every number traces to the fact block</span></div>
@@ -1788,6 +1816,9 @@ UPCOMING_HORIZON = timedelta(hours=12)
 # series_label so the data-tour attribute matches a chip exactly.
 _TOUR_CHIPS = ["ATP", "WTA", "CHALLENGER", "ITF M", "ITF W"]
 _TRIG_RANK = {"hit": 0, "near": 1, "armed": 2, "none": 3}  # most-actionable first
+# a decider trigger is only an ACTIONABLE play if the decider read favors the
+# watch pick — otherwise reaching 1-1 is just a coin flip, not a signal
+TRIG_FAVOR = 0.55
 
 
 def _trig_class(est, is_live: bool) -> str:
@@ -1959,7 +1990,8 @@ async def live(request: web.Request) -> web.Response:
             if sc is None or e is None or e.stale:
                 return False
             bo = int((ev["sides"][0].raw or {}).get("_best_of", 3) or 3)
-            return e.state == f"{bo // 2}-{bo // 2}"
+            return (e.state == f"{bo // 2}-{bo // 2}"
+                    and sc.model_prob_at_state >= TRIG_FAVOR)
         live_evs.sort(key=lambda e: (
             0 if _scen_fired(e[0], e[1]) else 1,
             _TRIG_RANK[_trig_class(_ev_est(e[1]), True)], e[1]["occ"]))
@@ -2018,11 +2050,15 @@ async def live(request: web.Request) -> web.Response:
             wmid = _odds_cents(wm, quotes)[0] if wm else None
             bo = int((sides[0].raw or {}).get("_best_of", 3) or 3)
             decider_state = f"{bo // 2}-{bo // 2}"
+            # only an actionable trigger if the decider read favors the pick —
+            # not merely because the match reached the decider
             trig_fired = (est is not None and not est.stale
-                          and est.state == decider_state)
+                          and est.state == decider_state
+                          and sc.model_prob_at_state >= TRIG_FAVOR)
             if trig_fired:
                 banner = (f'<div class="trig-banner">◎ SCENARIO TRIGGERED · '
-                          f'watch {esc(wname)} — reached the decider ({esc(est.state)})</div>')
+                          f'{esc(wname)} in the decider at '
+                          f'{sc.model_prob_at_state:.0%} — the read is live</div>')
             plan_row = (
                 f'<div class="planrow"><span class="scen-flag">◆ PLAY</span> '
                 f'<strong>{esc(wname)}</strong> '
