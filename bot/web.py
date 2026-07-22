@@ -1833,25 +1833,32 @@ async def live(request: web.Request) -> web.Response:
         global_last_seen = max((m.last_seen_at for m in markets
                                 if m.last_seen_at), default=None)
         discovery_alive = global_last_seen is not None and global_last_seen >= seen_cutoff
-        ENDED = {"finished", "complete", "ended", "closed", "cancelled", "P"}
+        # A match is DONE only on an authoritative signal — settled result, the
+        # market having left Kalshi's open set (discovery-gone), or a definitely-
+        # terminal status word. The milestone feed also emits opaque codes
+        # ('P','S','SCH'…) that must NOT hide a match (that bug dropped ~120 live
+        # games): anything started-and-still-open counts as live.
+        ENDED = {"finished", "complete", "ended", "closed", "cancelled", "canceled",
+                 "walkover", "wov", "abandoned", "retired", "postponed"}
+        LIVE = {"live", "inprogress", "in_progress", "in progress", "interrupted"}
         live_evs, soon_evs, done_evs = [], [], []
         for ev_ticker, ev in events.items():
+            occ = ev["occ"]
             settled = any(m.result for m in ev["sides"])
             last_seen = max((m.last_seen_at for m in ev["sides"]
                              if m.last_seen_at), default=None)
             gone = discovery_alive and last_seen is not None and last_seen < seen_cutoff
-            # authoritative: the milestone sweep's actual match status
-            status = next(((m.raw or {}).get("_live_status") for m in ev["sides"]
-                           if (m.raw or {}).get("_live_status")), None)
+            status = (next(((m.raw or {}).get("_live_status") for m in ev["sides"]
+                            if (m.raw or {}).get("_live_status")), "") or "").lower()
             if settled or gone or status in ENDED:
-                if now - ev["occ"] <= timedelta(hours=18):
+                if now - occ <= timedelta(hours=18):
                     done_evs.append((ev_ticker, ev))
                 continue
-            if status == "live":
+            if (status in LIVE
+                    or occ - LIVE_WINDOW_BEFORE <= now <= occ + LIVE_WINDOW_AFTER
+                    or now - timedelta(hours=12) <= occ <= now):  # started, still open
                 live_evs.append((ev_ticker, ev))
-            elif ev["occ"] - LIVE_WINDOW_BEFORE <= now <= ev["occ"] + LIVE_WINDOW_AFTER:
-                live_evs.append((ev_ticker, ev))
-            elif now < ev["occ"] <= now + UPCOMING_HORIZON:
+            elif now < occ <= now + UPCOMING_HORIZON:
                 soon_evs.append((ev_ticker, ev))
         live_evs.sort(key=lambda e: e[1]["occ"])
         soon_evs.sort(key=lambda e: e[1]["occ"])
