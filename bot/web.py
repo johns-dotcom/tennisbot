@@ -116,6 +116,16 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
 .scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
 .cmeter { display: inline-flex; align-items: center; gap: 8px; }
+.readlist { list-style: none; margin: 0; padding: 0; }
+.readlist li { position: relative; padding: 7px 0 7px 18px; font-size: 13.5px;
+  line-height: 1.55; color: rgba(243,242,242,.82);
+  border-top: 1px solid var(--divider); }
+.readlist li:first-child { border-top: none; }
+.readlist li::before { content: "›"; position: absolute; left: 2px;
+  color: var(--accent); font-weight: 800; }
+#refreshdot { width: 6px; height: 6px; border-radius: 50%; background: var(--divider);
+  display: inline-block; margin-left: 8px; transition: background .2s ease; }
+#refreshdot.on { background: var(--good); }
 @media (max-width: 760px) {
   main { padding: 18px 14px 48px; }
   h2 { font-size: 24px; }
@@ -229,6 +239,22 @@ def tag(kind: str, icon: str, label: str) -> str:
 def conf_label(conf: float | None) -> str:
     from bot.prob.confidence import confidence_label
     return confidence_label(conf)
+
+
+def read_list(narrative: str) -> str:
+    """Turn a run-on gameflow narrative into skimmable, labelled lines. The
+    generator writes the read as a sequence of sentences (entry thesis, set-2
+    leverage, decider, fatigue, caveat…); split them so each is its own point
+    instead of a wall of prose. Display-only — the stored narrative is unchanged."""
+    import re
+    if not narrative:
+        return '<p class="sub2">no read generated</p>'
+    # split on sentence boundaries but keep decimals/percentages intact
+    parts = re.split(r'(?<=[.!?])\s+(?=[A-Z(“"])', narrative.strip())
+    parts = [p.strip() for p in parts if p.strip()]
+    items = "".join(f'<li>{esc(p)}</li>' for p in parts)
+    return (f'<ul class="readlist">{items}</ul>' if items
+            else f'<p class="prose">{esc(narrative)}</p>')
 
 
 # IOC (3-letter) → flag emoji for the common tennis nations; unknown → no flag
@@ -429,7 +455,10 @@ async function refreshMain(){
   if(r.ok){var h=await r.text(); var m=document.querySelector('main');
    if(!typing() && h && h.length>50 && h!==m.innerHTML){var y=window.scrollY;
     m.innerHTML=h; window.scrollTo(0,y); bindWatch(); bindFilters();}
+   pulse();
   }}catch(e){} rel();}
+function pulse(){var d=document.getElementById('refreshdot');
+ if(d){d.classList.add('on');setTimeout(function(){d.classList.remove('on');},600);}}
 var seen=null;
 function notify(title, body){
  if(Notification.permission==='granted') new Notification(title,{body:body,silent:false});}
@@ -482,7 +511,8 @@ research use · advisory only, nothing here is an order.</footer>"""
   <nav class="links">{navs}</nav>
   <button id="bell" class="conn mono" style="background:none;border:1px solid var(--divider);
    color:var(--muted);cursor:pointer;padding:4px 10px;font:inherit;font-size:11px"></button>
-  <span class="conn mono"><span class="dot" style="background:{dot}"></span>{conn}</span>
+  <span class="conn mono"><span class="dot" style="background:{dot}"></span>{conn}
+  <span id="refreshdot" title="live · refreshes every 7s"></span></span>
 </header>
 <main>
 {page(title, active, body, fragment=True)}
@@ -855,7 +885,7 @@ margin:0 0 18px;border-color:var(--accent);color:var(--text)">📊 full match da
 {strip}{live_html}
 <section class="block"><div class="blockhead"><h4>The read</h4>
 <span class="aside">deterministic — every number traces to the fact block</span></div>
-<div class="rule"></div><div class="prose">{esc(sc.narrative)}</div></section>
+<div class="rule"></div>{read_list(sc.narrative)}</section>
 {rates_html}"""
     return respond(request, f"Scenario · {match_label}", "scenarios", body)
 
@@ -3138,7 +3168,7 @@ streak {("W" + str(f.streak)) if f.streak > 0 else ("L" + str(abs(f.streak))) if
 <h4>Gameflow plan</h4><span class="aside">generated {sc.created_for}</span></div>
 <div class="rule"></div>
 <p style="margin:0 0 10px">{trig}</p>
-<div class="prose">{esc(sc.narrative)}</div></section>"""
+{read_list(sc.narrative)}</section>"""
     yes_name = (a.raw or {}).get("yes_sub_title", "side A")
     chart_html = price_chart_svg(chart_points, marks, f"{yes_name} to win")
 
