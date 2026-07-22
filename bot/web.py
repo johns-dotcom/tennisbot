@@ -115,6 +115,7 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   margin: -2px 0 8px; }
 .scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
+.cmeter { display: inline-flex; align-items: center; gap: 8px; }
 .scard { transition: border-color .12s ease; }
 .scard:hover { border-color: var(--accent); }
 .scard-best { border-color: var(--warning); box-shadow: inset 0 0 0 1px var(--warning); }
@@ -209,6 +210,31 @@ def pt(ts: datetime | None) -> str:
 
 def tag(kind: str, icon: str, label: str) -> str:
     return f'<span class="tag tag-{kind}">{icon} {esc(label)}</span>'
+
+
+def conf_label(conf: float | None) -> str:
+    from bot.prob.confidence import confidence_label
+    return confidence_label(conf)
+
+
+def conf_meter(conf: float | None) -> str:
+    """A 5-segment confidence meter — the named band, the value, and filled
+    segments up to that band, coloured by tier."""
+    from bot.prob.confidence import CONFIDENCE_BANDS, confidence_band
+    b = confidence_band(conf)
+    # bands are ordered high→low; segment i (1..5) is filled if conf reaches it
+    order = list(reversed(CONFIDENCE_BANDS))  # Minimal→Strong
+    fill = sum(1 for band in order if (conf or 0.0) >= band.lo)
+    col = {"good": "var(--good)", "neutral": "var(--muted)",
+           "warn": "var(--warning)", "critical": "var(--accent)"}[b.tier]
+    segs = "".join(
+        f'<span style="flex:1;height:6px;border-radius:2px;background:'
+        f'{col if i < fill else "var(--divider)"}"></span>'
+        for i in range(5))
+    return (f'<span class="cmeter" title="{esc(b.note)}">'
+            f'<span style="display:flex;gap:3px;width:64px">{segs}</span>'
+            f'<span class="sub2" style="color:{col};font-weight:800">{esc(b.label)}</span>'
+            f'<span class="sub2">{(conf or 0.0):.0%}</span></span>')
 
 
 def kalshi_url(ticker: str) -> str:
@@ -647,10 +673,13 @@ async def scenario_detail(request: web.Request) -> web.Response:
 
     f = sc.facts or {}
     conf = f.get("model_confidence")
+    from bot.prob.confidence import confidence_band
+    cb = confidence_band(conf)
     strip = statstrip([
         ("Prematch", f"{sc.prematch_prob:.0%}", "model, pre-play"),
         ("In a decider", f"{sc.model_prob_at_state:.0%}", "if it goes the distance"),
-        ("Model conf", f"{conf:.0%}" if conf is not None else "—", "data depth"),
+        ("Confidence", f'<span class="tag tag-{cb.tier}" style="font-size:13px">{cb.label}</span>',
+         f"{(conf or 0):.0%} data depth — {cb.note}"),
         ("Salience", f"{sc.salience:.2f}", "why it ranked"),
     ], cols=4)
 
@@ -1356,9 +1385,17 @@ only, since the target is a winning record); edge between
 <strong>{policy.min_edge:.0%}</strong> and <strong>{policy.max_edge:.0%}</strong>
 (a bigger gap than {policy.max_edge:.0%} is treated as a stale/thin quote and
 skipped); executable price {policy.min_price}–{policy.max_price}¢; model confidence
-≥ <strong>{policy.min_conf:.0%}</strong> (enough match data on <em>both</em>
-players); Challenger-tier matches demand a stronger favorite
+≥ <strong>{policy.min_conf:.0%}</strong> (<strong>Fair</strong> or better on the
+confidence scale — enough match history on <em>both</em> players); Challenger-tier
+matches demand a stronger favorite
 (≥ <strong>{policy.challenger_min_prob:.0%}</strong>). One bet per match, ever.</p>
+<p><strong>Confidence scale.</strong> Confidence is <em>data depth</em> (how much
+history the model has on the two players), not certainty:
+<span class="tag tag-critical">Minimal</span>
+<span class="tag tag-warn">Low</span>
+<span class="tag tag-neutral">Fair</span>
+<span class="tag tag-good">Good</span>
+<span class="tag tag-good">Strong</span> — the bot bets only at Fair+.</p>
 <p><strong>4 · Size by conviction.</strong> $10 per unit, {1.0:.1f}–{MAX_UNITS:.1f}u.
 The stake grows only when the model is <em>both</em> very confident <em>and</em> the
 read rests on deep data — so multi-unit bets are rare and most sit near 1u.</p>

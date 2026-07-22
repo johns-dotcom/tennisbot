@@ -69,7 +69,8 @@ def test_gameflow_cites_samples_and_confidence():
     # every set rate cited with its W-L sample and window
     assert re.search(r"\d+% \(\d+-\d+, (past year|career)\)", n), n
     assert "(past year)" in n or "(career)" in n  # decider records windowed
-    assert "model confidence 80%" in n
+    # confidence is named on the scale (0.8 → "Good") with the value as data depth
+    assert "confidence: Good, 80% data depth" in n
     assert c.facts["model_confidence"] == 0.8
 
 

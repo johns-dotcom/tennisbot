@@ -423,12 +423,16 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
         bits.append(note)
         salience += 0.1
 
-    # 6. model read with confidence — always the closing line before support
-    conf_note = ""
-    if model_confidence < 0.6:
-        conf_note = (" — limited history on at least one side, size accordingly")
+    # 6. model read with confidence — always the closing line before support.
+    # Confidence is DATA DEPTH (history on both players), not certainty — name
+    # the band so a "100%" never reads as "sure thing".
+    from bot.prob.confidence import confidence_band
+    cband = confidence_band(model_confidence)
+    conf_note = (" — limited history on at least one side, size accordingly"
+                 if model_confidence < 0.6 else "")
     bits.append(f"Model read: {w_name} {p_w:.0%} prematch, {p_dec:.0%} in a "
-                f"decider (model confidence {model_confidence:.0%}{conf_note}).")
+                f"decider (confidence: {cband.label}, {model_confidence:.0%} data "
+                f"depth{conf_note}).")
 
     # 7. supporting depth (form / H2H / common opponents / trajectory)
     support_text, support = _supporting_analysis(
