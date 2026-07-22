@@ -69,7 +69,7 @@ def run_backtest(db: Session, date_from: date, date_to: date) -> BacktestReport:
             else:
                 report.n_skipped_low_confidence += 1
         model.apply_match(row["winner_id"], row["loser_id"], row["surface"],
-                          row["tier"], row["set_results"])
+                          row["tier"], row["set_results"], day=row.get("date"))
 
     if preds:
         report.n_scored = len(preds)

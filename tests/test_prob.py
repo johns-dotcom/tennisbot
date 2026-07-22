@@ -72,12 +72,38 @@ def test_unseen_players_default_even_zero_confidence():
     assert pred.confidence == 0.0
 
 
-def test_confidence_grows_with_data():
+def test_confidence_grows_with_recent_activity():
+    import datetime as _dt
     m = SetElo()
-    for _ in range(30):
-        m.update_set(1, 2, None, None)
+    base = _dt.date(2026, 1, 1)
+    # 30 recent matches (3 sets each) → high confidence
+    for i in range(30):
+        m.apply_match(1, 2, None, None, [True, False, True],
+                      day=base + _dt.timedelta(days=i * 2))
     p = m.predict(1, 2, None, None, MatchState())
     assert 0.4 < p.confidence <= 1.0
+
+
+def test_stale_rating_has_low_confidence():
+    import datetime as _dt
+    m = SetElo()
+    # player 1 played a lot LONG ago, then a returnee's handful of recent matches;
+    # player 3 has been steadily active recently
+    for i in range(40):
+        m.apply_match(1, 2, None, None, [True, False, True],
+                      day=_dt.date(2024, 1, 1) + _dt.timedelta(days=i * 3))
+    for i in range(3):  # returnee: only 3 matches in 2026 after a long gap
+        m.apply_match(1, 2, None, None, [True, False, True],
+                      day=_dt.date(2026, 7, 1) + _dt.timedelta(days=i))
+    for i in range(30):  # steadily active opponent 3
+        m.apply_match(3, 4, None, None, [True, True],
+                      day=_dt.date(2026, 3, 1) + _dt.timedelta(days=i * 3))
+    stale = m.predict(1, 3, None, None, MatchState()).confidence
+    active = m.predict(3, 4, None, None, MatchState()).confidence
+    # the returnee (huge lifetime sets, thin recent) drags confidence down
+    assert stale < active
+    assert m.ratings[1].sets_seen > m.ratings[3].sets_seen  # lifetime: returnee has more
+    assert m.ratings[1].recent < m.ratings[3].recent        # recent: far less
 
 
 def test_apply_match_set_results_order():

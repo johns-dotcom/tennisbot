@@ -35,7 +35,7 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v8"  # v8: tightened from the first live run's own results
+POLICY_VERSION = "v9"  # v9: recency-aware model confidence (stale ratings discounted)
 
 # v8 — fit to 78 settled bets across the fixed-scale run (the bots' own data):
 #   * By probability band the bet population is badly overconfident BELOW ~82%

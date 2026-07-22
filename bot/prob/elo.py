@@ -28,6 +28,11 @@ TIER_K_MULT = {"G": 1.2, "F": 1.1, "M": 1.1, "A": 1.0, "C": 0.9}
 DEFAULT_TIER_MULT = 0.8  # ITF/Futures and everything else
 PROVISIONAL_1, PROVISIONAL_2 = 30, 100  # set-count thresholds for K boosts
 CONFIDENCE_FULL_SETS = 60  # sets seen for full rating confidence
+# recency-aware confidence (v9): confidence is now RECENT activity, not lifetime.
+# A ~150-day half-life; ~45 decayed sets ⇒ full confidence (a normally-active
+# player clears it; a returnee / long-inactive player does not).
+RECENCY_HALFLIFE_DAYS = 150
+CONFIDENCE_RECENT_FULL = 45
 # Global calibration for the raw Elo expectation, fitted by walk-forward log
 # loss against realized outcomes only (never price — CLAUDE.md rule 2), via
 # bot.prob.calibrate. The prior 1.65 (fit on 2023-24) over-sharpened the tail:
@@ -42,11 +47,26 @@ class _Rating:
     overall: float = BASE_RATING
     by_surface: dict[str, float] = field(default_factory=dict)
     sets_seen: int = 0
+    recent: float = 0.0          # time-decayed set count → RECENCY-aware confidence
+    last_day: date | None = None
 
     def blended(self, surface: str | None) -> float:
         if surface and surface in self.by_surface:
             return (1 - SURFACE_BLEND) * self.overall + SURFACE_BLEND * self.by_surface[surface]
         return self.overall
+
+    def touch(self, day: date | None, sets: int) -> None:
+        """Add `sets` of activity on `day`, decaying prior activity by its age.
+        A player who's played little recently (a returnee like Kokkinakis: huge
+        lifetime sets_seen but few in 2026) ends with low `recent` → low
+        confidence, even though the rating itself is high."""
+        if day is not None and self.last_day is not None:
+            dd = (day - self.last_day).days
+            if dd > 0:
+                self.recent *= 0.5 ** (dd / RECENCY_HALFLIFE_DAYS)
+        self.recent += sets
+        if day is not None:
+            self.last_day = day
 
 
 def _expected(ra: float, rb: float) -> float:
@@ -92,13 +112,18 @@ class SetElo(WinProbabilityModel):
         rl.sets_seen += 1
 
     def apply_match(self, winner_id: int, loser_id: int, surface: str | None,
-                    tier: str | None, set_results: list[bool]) -> None:
+                    tier: str | None, set_results: list[bool],
+                    day: date | None = None) -> None:
         """set_results: per completed set, True if won by the MATCH winner."""
         for won_by_match_winner in set_results:
             if won_by_match_winner:
                 self.update_set(winner_id, loser_id, surface, tier)
             else:
                 self.update_set(loser_id, winner_id, surface, tier)
+        # recency activity: one touch per match, on its date
+        ns = len(set_results) or 1
+        self._get(winner_id).touch(day, ns)
+        self._get(loser_id).touch(day, ns)
 
     def fit_from_db(self, db: Session, through: date | None = None) -> int:
         """Replay history in chronological order. Returns matches applied."""
@@ -106,7 +131,7 @@ class SetElo(WinProbabilityModel):
         n = 0
         for row in rows:
             self.apply_match(row["winner_id"], row["loser_id"], row["surface"],
-                             row["tier"], row["set_results"])
+                             row["tier"], row["set_results"], day=row.get("date"))
             n += 1
         self.trained_through = through or (rows[-1]["date"] if rows else None)
         log.info("elo fitted", matches=n, through=str(self.trained_through))
@@ -159,5 +184,7 @@ class SetElo(WinProbabilityModel):
         z = PLATT_A * math.log(raw / (1 - raw))
         p_prematch = 1 / (1 + math.exp(-z))
         p = condition_on_state(p_prematch, match_state)
-        confidence = min(ra.sets_seen, rb.sets_seen) / CONFIDENCE_FULL_SETS
+        # confidence = RECENT activity (v9), so a high but stale rating (a
+        # returnee) no longer reads as high confidence
+        confidence = min(ra.recent, rb.recent) / CONFIDENCE_RECENT_FULL
         return Prediction(p_a=p, confidence=min(1.0, confidence))
