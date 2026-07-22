@@ -27,7 +27,9 @@ from bot.prob.state_adjust import condition_on_state
 log = get_logger("scenarios")
 
 HORIZON_H = 48
-TOP_N = 30
+TOP_N = 500  # keep analysis for every analyzable match (the compute already
+# happens for all; this only bounds storage). Salience still ranks them, so the
+# /scenarios BEST flag and the live board surface the strongest.
 MIN_SET_RATE_GAP = 0.08  # set-1 edge worth calling out
 THIN_SAMPLE = 10  # a rate on fewer decisions than this is an early read, not a trend
 SWEET_LO, SWEET_HI = 0.50, 0.85  # model-prob band where markets actually move
