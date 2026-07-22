@@ -2861,6 +2861,44 @@ strength; double faults are a live wobble signal.</p></section>"""
 <p class="sub2" style="margin-top:6px">Every game the bot observed via Kalshi's
 score feed, newest first — its own scoring database, independent of the
 odds-based estimator.</p></section>"""
+    # --- Model read vs raw form: makes SOS-driven disagreements legible ---
+    # (raw win rate flatters players who beat weak fields; the model weights
+    # opponent quality, so a lower win rate against a stronger field can still
+    # be the better player — show both side by side).
+    def _mr_cell(pl, prof):
+        f, sch = prof.form, prof.schedule
+        car = f.win_rate_career
+        wr = f"{car.value:.0%} <span class='sub2'>({car.wins}-{car.losses})</span>" \
+            if car and car.value is not None else "—"
+        r365 = f.win_rate_365
+        recent = f"{r365.value:.0%}" if r365 and r365.value is not None else "—"
+        if sch and sch.avg_opp_rank:
+            field = (f'<span class="tag tag-'
+                     f'{"good" if sch.field in ("elite","strong") else "warn" if sch.field=="weak" else "neutral"}">'
+                     f'{esc(sch.field)}</span> avg opp rank ~{int(sch.avg_opp_rank)}')
+        else:
+            field = '<span class="sub2">field strength unknown</span>'
+        return (f'<div class="vscol"><div class="vshead">{esc(pl.full_name)}'
+                f'{" · lefty" if pl.hand=="L" else ""}</div>'
+                f'<div class="vsrow"><span class="k">career win rate</span><span class="v mono">{wr}</span></div>'
+                f'<div class="vsrow"><span class="k">last 12 months</span><span class="v mono">{recent}</span></div>'
+                f'<div class="vsrow"><span class="k">strength of schedule</span>'
+                f'<span class="v" style="font-size:13px">{field}</span></div></div>')
+    model_line = ""
+    if sc is not None:
+        wname = esc((sc.facts or {}).get("match", "").split(" vs ")[0] or "the pick")
+        fav = pa.full_name if sc.player_id == pa.id else pb.full_name
+        model_line = (f'<p class="prose" style="margin-top:6px">The model favours '
+                      f'<strong>{esc(fav)}</strong> at <strong>{sc.prematch_prob:.0%}</strong>. '
+                      f"When that disagrees with raw win rate, it's weighting "
+                      f"<em>who</em> each player beat: a lower win rate against a "
+                      f"stronger field can still be the better player.</p>")
+    model_read_html = (f'<section class="block"><div class="blockhead">'
+                       f'<h4>Model read vs raw form</h4>'
+                       f'<span class="aside">why the pick can differ from win rate</span></div>'
+                       f'<div class="rule"></div>{model_line}'
+                       f'<div class="vsgrid">{_mr_cell(pa, prof_a)}{_mr_cell(pb, prof_b)}</div></section>')
+
     body = pagehead("Match", (a.title or "").split(":")[0].replace("Will ", "")
                     or event_ticker,
                     f"{px(a)} / {px(b)}{state_txt}") + f"""
@@ -2868,6 +2906,7 @@ odds-based estimator.</p></section>"""
 {profile_col(pa, prof_a, sr_a)}
 {profile_col(pb, prof_b, sr_b)}
 </div>
+{model_read_html}
 <section class="block"><div class="blockhead"><h4>Head to head</h4></div>
 <div class="rule"></div>
 <p class="prose">{esc(pa.full_name)} vs {esc(pb.full_name)}: {h2h_txt}
