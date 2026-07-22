@@ -16,7 +16,7 @@ class Settings(BaseSettings):
     # research only; never redistribute the data).
     sackmann_atp_repo: str = "Kadantte/tennis_atp"
     sackmann_wta_repo: str = "VictorSquidWei/tennis_wta"
-    backfill_start_year: int = 2022  # >3 years of history
+    backfill_start_year: int = 2010  # deep history — career-long records for the active field
     api_tennis_key: str = ""
     api_tennis_base: str = "https://api.api-tennis.com/tennis/"
     schedule_horizon_hours: int = 48
