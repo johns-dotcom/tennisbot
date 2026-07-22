@@ -116,6 +116,20 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
 .scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
 .cmeter { display: inline-flex; align-items: center; gap: 8px; }
+@media (max-width: 760px) {
+  main { padding: 18px 14px 48px; }
+  h2 { font-size: 24px; }
+  .pagehead { align-items: flex-start; }
+  /* wide bet/feed tables scroll inside their own container, not the page */
+  .tw { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+  table.t { min-width: 620px; }
+  /* multi-tile grids collapse to two-up on phones */
+  .statstrip { grid-template-columns: repeat(2, 1fr) !important; }
+  .vsgrid { grid-template-columns: 1fr !important; }
+  .metric-grid { grid-template-columns: repeat(2, 1fr) !important; }
+  .cards { grid-template-columns: 1fr !important; }
+  .stat .v { font-size: 23px; }
+}
 .scard { transition: border-color .12s ease; }
 .scard:hover { border-color: var(--accent); }
 .scard-best { border-color: var(--warning); box-shadow: inset 0 0 0 1px var(--warning); }
@@ -558,6 +572,19 @@ async def home(request: web.Request) -> web.Response:
             .join(Player, Player.id == Scenario.player_id, isouter=True)
             .where(Scenario.scheduled_start > now)
             .order_by(Scenario.scheduled_start).limit(3)).all()
+        # command-center extras: today's best plays + bot activity
+        from bot.models import PaperBet
+        from sqlalchemy import func as _func
+        latest_day = db.execute(select(_func.max(Scenario.created_for))).scalar()
+        best_plays = db.execute(
+            select(Scenario, Player.full_name)
+            .join(Player, Player.id == Scenario.player_id, isouter=True)
+            .where(Scenario.created_for == latest_day)
+            .order_by(Scenario.salience.desc()).limit(4)).all() if latest_day else []
+        bet_open = db.execute(select(_func.count(PaperBet.id)).where(
+            PaperBet.status == "open")).scalar()
+        bet_settled = db.execute(select(_func.count(PaperBet.id)).where(
+            PaperBet.status.in_(("won", "lost", "void")))).scalar()
 
     live_events: dict[str, list] = {}
     for m in live_mkts:
@@ -572,14 +599,28 @@ async def home(request: web.Request) -> web.Response:
         f'href="/match/{esc(sc.event_ticker)}">○ {esc((sc.facts or {}).get("match", sc.event_ticker))} '
         f'· {pt(sc.scheduled_start)}</a>'
         for sc, _p in next_plans)
+    best_cards = "".join(
+        f'<a class="tag tag-warn" style="text-decoration:none" href="/scenario/{sc.id}">'
+        f'★ {esc(pl.split()[-1] if pl else "pick")} · {sc.prematch_prob:.0%} '
+        f'<span class="sub2">({sc.salience:.2f})</span></a>'
+        for sc, pl in best_plays)
     overview = f"""<section class="block"><div class="blockhead">
 <h4>Right now</h4><span class="aside"><a href="/live">full board →</a></span></div>
 <div class="rule"></div>
 <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<span class="sub2" style="min-width:74px">live:</span>
 {live_cards or '<span class="sub2">no matches live</span>'}</div>
-<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:8px">
-<span class="sub2">next plans:</span>
-{plan_cards or '<span class="sub2">none scheduled</span>'}</div></section>"""
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+<span class="sub2" style="min-width:74px">best plays:</span>
+{best_cards or '<span class="sub2">none today</span>'}
+<a class="sub2" href="/scenarios">all scenarios →</a></div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+<span class="sub2" style="min-width:74px">next up:</span>
+{plan_cards or '<span class="sub2">none scheduled</span>'}</div>
+<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px">
+<span class="sub2" style="min-width:74px">bots:</span>
+<a class="tag tag-neutral" style="text-decoration:none" href="/testrun/leaderboard">
+6 bots · {bet_settled} settled · {bet_open} open · leaderboard →</a></div></section>"""
     hr = f"{s['hit_rate']:.0%}" if s["hit_rate"] is not None else "—"
     lead = f"{s['avg_lead']:.0f}s" if s["avg_lead"] is not None else "—"
     strip = statstrip([
