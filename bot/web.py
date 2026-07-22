@@ -108,6 +108,10 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
 .scard { transition: border-color .12s ease; }
 .scard:hover { border-color: var(--accent); }
+.scard-best { border-color: var(--warning); box-shadow: inset 0 0 0 1px var(--warning); }
+.best-flag { background: var(--warning); color: #0a0a0a; font-weight: 800;
+  font-size: 9px; letter-spacing: .1em; padding: 2px 6px; border-radius: 4px;
+  margin-right: 8px; vertical-align: middle; }
 .vsgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 2px; background: var(--divider); border: 2px solid var(--divider);
   margin-bottom: 26px; }
@@ -523,6 +527,14 @@ async def scenarios(request: web.Request) -> web.Response:
                 LiveMatchState.market_ticker.in_(tickers))).scalars()} \
             if tickers else {}
 
+    # "best" = a genuine standout. Salience is a stable sum of edge components
+    # (set-1 gap, decider edge, fatigue, percentile…); ≥ 1.0 is a strong setup.
+    # Always flag at least the single top-ranked so there's a pick of the day.
+    BEST_SALIENCE = 1.0
+    top_id = rows[0][0].id if rows else None
+    best_ids = {sc.id for sc, _ in rows
+                if sc.salience >= BEST_SALIENCE or sc.id == top_id}
+
     def card(sc, player) -> str:
         f = sc.facts or {}
         match_label = f.get("match") or sc.event_ticker
@@ -533,10 +545,12 @@ async def scenarios(request: web.Request) -> web.Response:
         live_tag = (f'<span class="scen-flag">● LIVE</span> '
                     f'<span class="sub2">{esc(st.state)}</span>'
                     if st is not None and not st.stale else "")
-        return f"""<a class="card scard" href="/scenario/{sc.id}"
+        best = sc.id in best_ids
+        best_badge = '<span class="best-flag">★ BEST</span>' if best else ""
+        return f"""<a class="card scard{' scard-best' if best else ''}" href="/scenario/{sc.id}"
 style="text-decoration:none;color:inherit;display:block">
 <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
-<span class="kicker" style="margin:0">{esc(f.get('event_label') or 'gameflow plan')}</span>
+<span class="kicker" style="margin:0">{best_badge}{esc(f.get('event_label') or 'gameflow plan')}</span>
 {tag('outline', '◆', f'{sc.salience:.2f}')}</div>
 <div class="title">{esc(match_label)} <span class="sub2">→</span></div>
 <div class="sub2 mono">watch <strong style="color:var(--text)">{esc(player)}</strong>
@@ -546,22 +560,25 @@ style="text-decoration:none;color:inherit;display:block">
 <span class="sub2">full scenario →</span></div>
 </a>"""
 
+    # (is_best, sort-key, html) so best float to the top of each section
     live_cards, soon_cards = [], []
     for sc, player in rows:
         st = states.get(sc.market_ticker)
         start = sc.scheduled_start
+        best = sc.id in best_ids
         is_live = (st is not None and not st.stale) or (
             start is not None and now - timedelta(hours=3) <= start <= now + timedelta(minutes=15))
+        entry = (0 if best else 1, start or now, card(sc, player))
         if is_live:
-            live_cards.append((start or now, card(sc, player)))
+            live_cards.append(entry)
         elif start is not None and now + timedelta(minutes=15) < start <= now + timedelta(hours=24):
-            soon_cards.append((start, card(sc, player)))
+            soon_cards.append(entry)
         # else: stale (finished) or beyond 24h — dropped
-    live_cards.sort(key=lambda x: x[0])
-    soon_cards.sort(key=lambda x: x[0])
+    live_cards.sort(key=lambda x: (x[0], x[1]))
+    soon_cards.sort(key=lambda x: (x[0], x[1]))
 
     def section(title, aside, cards):
-        inner = "".join(c for _, c in cards) or \
+        inner = "".join(c for *_, c in cards) or \
             f'<div class="card"><div class="empty">{esc(aside)}</div></div>'
         return (f'<section class="block"><div class="blockhead"><h4>{title}</h4>'
                 f'<span class="aside">{len(cards)}</span></div>'
@@ -571,7 +588,9 @@ style="text-decoration:none;color:inherit;display:block">
                     f"generated {latest_day}" if latest_day else "") + f"""
 <p class="prose" style="margin:0 0 18px">Pre-computed before play: if a match
 reaches the named situation, the model already knows which side is live. Each is
-its own page — click through for the full read. Regenerated continuously by the
+its own page — click through for the full read. <span class="best-flag">★ BEST</span>
+marks the standout setups (highest salience — the composite of set-1 gap, decider
+edge, fatigue and field-percentile signals). Regenerated continuously by the
 worker and the daily ingest; the engine still applies every gate before any
 advisory fires.</p>
 {section("Live now", "No scenario matches are live right now.", live_cards)}
