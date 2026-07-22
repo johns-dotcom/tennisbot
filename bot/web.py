@@ -1825,7 +1825,7 @@ async def history(request: web.Request) -> web.Response:
 
 
 async def track(request: web.Request) -> web.Response:
-    from bot.track import advisory_outcome, advisory_pnl_cents
+    from bot.track import advisory_outcome, advisory_pnl_cents, clv_cents
 
     with db_session() as db:
         rows = db.execute(
@@ -1836,6 +1836,49 @@ async def track(request: web.Request) -> web.Response:
             .where(Advisory.status == "sent")
             .order_by(Advisory.created_at.desc()).limit(200)
         ).all()
+        # full settled set (chronological) for the calibration + CLV charts
+        chart_rows = db.execute(
+            select(Advisory.model_prob, Advisory.fact_block,
+                   Advisory.executable_price_cents, Advisory.created_at,
+                   KalshiMarket.result, KalshiMarket.close_yes_cents)
+            .join(KalshiMarket, KalshiMarket.ticker == Advisory.market_ticker)
+            .where(Advisory.status == "sent", KalshiMarket.result.in_(("yes", "no")))
+            .order_by(Advisory.created_at)).all()
+
+    # calibration bands + cumulative-average CLV
+    cal = {}  # band index → [sum_pred, wins, n]
+    clv_series, clv_run, clv_k = [], [], 0
+    clv_sum = 0
+    for mp, fb, price, created, result, close in chart_rows:
+        side = (fb or {}).get("side", "yes")
+        o = advisory_outcome(side, result)
+        if o not in ("won", "lost"):
+            continue
+        b = min(int(mp * 10), 9)
+        d = cal.setdefault(b, [0.0, 0, 0])
+        d[0] += mp; d[1] += (o == "won"); d[2] += 1
+        c = clv_cents(side, price, close)
+        if c is not None:
+            clv_k += 1; clv_sum += c
+            clv_run.append((created, clv_sum / clv_k))
+    bands = [(d[0] / d[2], d[1] / d[2], d[2], 0) for b, d in sorted(cal.items())
+             if d[2] >= 3]
+    # downsample the CLV run to ~150 points for a light path
+    if clv_run:
+        step = max(1, len(clv_run) // 150)
+        clv_series = clv_run[::step] + [clv_run[-1]]
+    cal_chart = calibration_svg(bands)
+    clv_chart = clv_line_svg(clv_series)
+    model_perf = (f'<section class="block"><div class="blockhead">'
+                  f'<h4>Model performance</h4><span class="aside">the edge question '
+                  f'— {len(clv_run)} settled advisories</span></div><div class="rule"></div>'
+                  f'<div class="vsgrid"><div class="vscol">'
+                  f'<div class="vshead">Calibration<span>predicted vs actual</span></div>'
+                  f'{cal_chart or "<p class=sub2>not enough settled advisories yet</p>"}</div>'
+                  f'<div class="vscol"><div class="vshead">Closing-line value'
+                  f'<span>cumulative avg</span></div>'
+                  f'{clv_chart or "<p class=sub2>not enough closing lines yet</p>"}</div>'
+                  f'</div></section>') if chart_rows else ""
 
     settled, pnl_total, stake_total = [], 0, 0
     buckets = {"all": [0, 0], "probation": [0, 0], "confirmed": [0, 0]}
@@ -1884,7 +1927,7 @@ async def track(request: web.Request) -> web.Response:
          f"confirmed {rec(buckets['confirmed'])}"),
     ])
     body = pagehead("History", "Track Record",
-                    f"{n} settled of {len(rows)} sent") + strip + f"""
+                    f"{n} settled of {len(rows)} sent") + strip + model_perf + f"""
 <section class="block"><div class="blockhead"><h4>Every advisory, scored</h4>
 <span class="aside">outcomes settle from Kalshi results, checked every 30 min</span></div>
 <div class="rule"></div><div class="tw">
@@ -2060,6 +2103,85 @@ def histogram_svg(buckets: list[tuple[str, int]], accent_note: str = "") -> str:
     return (f'<div class="tw"><svg viewBox="0 0 {W} {H}" role="img" '
             f'aria-label="distribution{esc(accent_note)}" '
             f'style="width:100%;max-width:620px;display:block">{"".join(bars)}</svg></div>')
+
+
+def calibration_svg(bands: list[tuple[float, float, float, int]]) -> str:
+    """Reliability plot: model probability (x) vs actual win rate (y), with the
+    y=x perfect-calibration diagonal. Each band is a dot sized by sample count;
+    on the diagonal = calibrated, below = overconfident. bands: (mean_pred,
+    actual, n, _) filtered to n>0. Single series → title carries identity."""
+    pts = [(mp, ac, n) for mp, ac, n, *_ in bands if n]
+    if not pts:
+        return ""
+    W = H = 300
+    PL, PR, PT, PB = 40, 14, 14, 34
+    def x(v): return PL + v * (W - PL - PR)
+    def y(v): return PT + (1 - v) * (H - PT - PB)
+    grid = "".join(
+        f'<line x1="{x(g):.0f}" y1="{PT}" x2="{x(g):.0f}" y2="{H-PB}" '
+        f'stroke="var(--divider)" stroke-width="1"/>'
+        f'<line x1="{PL}" y1="{y(g):.0f}" x2="{W-PR}" y2="{y(g):.0f}" '
+        f'stroke="var(--divider)" stroke-width="1"/>'
+        f'<text x="{x(g):.0f}" y="{H-PB+14:.0f}" text-anchor="middle" font-size="9" '
+        f'fill="var(--faint)">{int(g*100)}</text>'
+        f'<text x="{PL-6:.0f}" y="{y(g)+3:.0f}" text-anchor="end" font-size="9" '
+        f'fill="var(--faint)">{int(g*100)}</text>'
+        for g in (0.0, 0.25, 0.5, 0.75, 1.0))
+    diag = (f'<line x1="{x(0):.0f}" y1="{y(0):.0f}" x2="{x(1):.0f}" y2="{y(1):.0f}" '
+            f'stroke="var(--muted)" stroke-width="1.5" stroke-dasharray="4 4"/>')
+    nmax = max(n for *_, n in pts)
+    dots = ""
+    for mp, ac, n in pts:
+        r = 4 + 7 * (n / nmax) ** 0.5
+        col = "var(--good)" if abs(ac - mp) <= 0.05 else "var(--accent)"
+        dots += (f'<g><title>predicted {mp:.0%} → actual {ac:.0%} (n={n})</title>'
+                 f'<circle cx="{x(mp):.1f}" cy="{y(ac):.1f}" r="{r:.1f}" '
+                 f'fill="{col}" fill-opacity="0.8" stroke="var(--surface)" '
+                 f'stroke-width="2"/></g>')
+    return (f'<div class="tw"><svg viewBox="0 0 {W} {H}" role="img" '
+            f'aria-label="calibration: model probability vs actual win rate" '
+            f'style="width:100%;max-width:340px;display:block">{grid}{diag}{dots}'
+            f'<text x="{(PL+W-PR)/2:.0f}" y="{H-2}" text-anchor="middle" font-size="10" '
+            f'fill="var(--muted)">model probability →</text></svg></div>'
+            f'<p class="sub2" style="margin-top:4px">dashed line = perfect calibration; '
+            f'dots below it = overconfident. Green = within 5 points.</p>')
+
+
+def clv_line_svg(points: list[tuple[datetime, float]]) -> str:
+    """Cumulative-average CLV (¢) over settled bets — converges to the true edge
+    vs the closing line. Zero line = break-even; above = beating the close."""
+    if len(points) < 2:
+        return ""
+    W, H, PL, PR, PT, PB = 620, 170, 42, 12, 12, 24
+    t0 = points[0][0].timestamp()
+    t1 = points[-1][0].timestamp()
+    vals = [v for _, v in points]
+    lo, hi = min(min(vals), 0), max(max(vals), 0)
+    if hi == lo:
+        hi = lo + 1
+    def x(ts): return PL + (ts - t0) / max(t1 - t0, 1) * (W - PL - PR)
+    def y(v): return PT + (hi - v) / (hi - lo) * (H - PT - PB)
+    path = "M" + " L".join(f"{x(p[0].timestamp()):.1f},{y(p[1]):.1f}" for p in points)
+    end = points[-1][1]
+    col = "var(--good)" if end > 0 else "var(--accent)" if end < 0 else "var(--muted)"
+    zero = (f'<line x1="{PL}" y1="{y(0):.0f}" x2="{W-PR}" y2="{y(0):.0f}" '
+            f'stroke="var(--divider-strong)" stroke-width="1.5"/>'
+            f'<text x="{PL-6}" y="{y(0)+3:.0f}" text-anchor="end" font-size="9" '
+            f'fill="var(--faint)">0¢</text>')
+    ends = (f'<text x="{PL-6}" y="{y(hi)+3:.0f}" text-anchor="end" font-size="9" '
+            f'fill="var(--faint)">{hi:+.0f}</text>'
+            f'<text x="{PL-6}" y="{y(lo)+3:.0f}" text-anchor="end" font-size="9" '
+            f'fill="var(--faint)">{lo:+.0f}</text>')
+    dot = (f'<circle cx="{x(t1):.1f}" cy="{y(end):.1f}" r="4" fill="{col}"/>'
+           f'<text x="{x(t1)-6:.0f}" y="{y(end)-7:.0f}" text-anchor="end" '
+           f'font-size="11" font-weight="800" fill="{col}">{end:+.1f}¢</text>')
+    return (f'<div class="tw"><svg viewBox="0 0 {W} {H}" role="img" '
+            f'aria-label="cumulative average CLV over time" '
+            f'style="width:100%;min-width:480px;display:block">{zero}{ends}'
+            f'<path d="{path}" fill="none" stroke="{col}" stroke-width="2" '
+            f'stroke-linejoin="round"/>{dot}</svg></div>'
+            f'<p class="sub2" style="margin-top:4px">above 0 = entries beat the '
+            f'closing line (a real edge signal); below = adverse selection.</p>')
 
 
 def trigger_html(sc, est_state: str | None, is_live: bool,
