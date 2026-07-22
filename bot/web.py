@@ -106,6 +106,8 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   align-items: center; gap: 7px; }
 .scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
   font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
+.scard { transition: border-color .12s ease; }
+.scard:hover { border-color: var(--accent); }
 .vsgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 2px; background: var(--divider); border: 2px solid var(--divider);
   margin-bottom: 26px; }
@@ -506,6 +508,7 @@ async def home(request: web.Request) -> web.Response:
 async def scenarios(request: web.Request) -> web.Response:
     from bot.models import Scenario
 
+    now = datetime.now(timezone.utc)
     with db_session() as db:
         latest_day = db.execute(select(func.max(Scenario.created_for))).scalar()
         rows = db.execute(
@@ -514,38 +517,148 @@ async def scenarios(request: web.Request) -> web.Response:
             .where(Scenario.created_for == latest_day)
             .order_by(Scenario.salience.desc())
         ).all() if latest_day else []
+        tickers = [sc.market_ticker for sc, _ in rows]
+        states = {s.market_ticker: s for s in db.execute(
+            select(LiveMatchState).where(
+                LiveMatchState.market_ticker.in_(tickers))).scalars()} \
+            if tickers else {}
 
-    cards = []
-    for sc, player in rows:
+    def card(sc, player) -> str:
         f = sc.facts or {}
         match_label = f.get("match") or sc.event_ticker
-        conf = f.get("model_confidence")
-        metrics = f"""<div class="metric-grid">
-<div class="metric"><div class="k">Prematch</div><div class="v mono">{sc.prematch_prob:.0%}</div></div>
-<div class="metric"><div class="k">In decider</div><div class="v mono">{sc.model_prob_at_state:.0%}</div></div>
-<div class="metric"><div class="k">Model conf</div><div class="v mono">{f"{conf:.0%}" if conf is not None else "—"}</div></div>
-<div class="metric"><div class="k">Salience</div><div class="v mono">{sc.salience:.2f}</div></div>
-</div>"""
-        cards.append(f"""<div class="card">
+        snippet = ". ".join(sc.narrative.split(". ")[:2]).strip()
+        if snippet and not snippet.endswith("."):
+            snippet += "."
+        st = states.get(sc.market_ticker)
+        live_tag = (f'<span class="scen-flag">● LIVE</span> '
+                    f'<span class="sub2">{esc(st.state)}</span>'
+                    if st is not None and not st.stale else "")
+        return f"""<a class="card scard" href="/scenario/{sc.id}"
+style="text-decoration:none;color:inherit;display:block">
 <div style="display:flex;align-items:center;justify-content:space-between;gap:12px">
 <span class="kicker" style="margin:0">{esc(f.get('event_label') or 'gameflow plan')}</span>
-{tag('outline', '◆', 'gameflow')}</div>
-<a href="/match/{esc(sc.event_ticker)}" style="text-decoration:none">
-<div class="title">{esc(match_label)} <span class="sub2">→</span></div></a>
+{tag('outline', '◆', f'{sc.salience:.2f}')}</div>
+<div class="title">{esc(match_label)} <span class="sub2">→</span></div>
 <div class="sub2 mono">watch <strong style="color:var(--text)">{esc(player)}</strong>
-· {pt(sc.scheduled_start)} · {esc(sc.market_ticker)}</div>
-{metrics}
-<div class="prose">{esc(sc.narrative)}</div>
-</div>""")
+· {sc.prematch_prob:.0%} prematch · {pt(sc.scheduled_start)}</div>
+<div style="margin:4px 0">{live_tag}</div>
+<div class="prose" style="margin-top:2px">{esc(snippet)}
+<span class="sub2">full scenario →</span></div>
+</a>"""
+
+    live_cards, soon_cards = [], []
+    for sc, player in rows:
+        st = states.get(sc.market_ticker)
+        start = sc.scheduled_start
+        is_live = (st is not None and not st.stale) or (
+            start is not None and now - timedelta(hours=3) <= start <= now + timedelta(minutes=15))
+        if is_live:
+            live_cards.append((start or now, card(sc, player)))
+        elif start is not None and now + timedelta(minutes=15) < start <= now + timedelta(hours=24):
+            soon_cards.append((start, card(sc, player)))
+        # else: stale (finished) or beyond 24h — dropped
+    live_cards.sort(key=lambda x: x[0])
+    soon_cards.sort(key=lambda x: x[0])
+
+    def section(title, aside, cards):
+        inner = "".join(c for _, c in cards) or \
+            f'<div class="card"><div class="empty">{esc(aside)}</div></div>'
+        return (f'<section class="block"><div class="blockhead"><h4>{title}</h4>'
+                f'<span class="aside">{len(cards)}</span></div>'
+                f'<div class="rule"></div><div class="cards">{inner}</div></section>')
+
     body = pagehead("Strategy", "Gameflow Scenarios",
-                    f"generated {latest_day} · next 48h" if latest_day else "") + f"""
-<p class="prose" style="margin:0 0 18px">Pre-computed before play: if the match
-reaches the named situation, the model already knows which side is live. The
-engine still applies every gate before any advisory fires.</p>
-<div class="cards">{''.join(cards) or
-    '<div class="card"><div class="empty">No scenarios yet — they generate with the daily ingest run.</div></div>'}
-</div>"""
+                    f"generated {latest_day}" if latest_day else "") + f"""
+<p class="prose" style="margin:0 0 18px">Pre-computed before play: if a match
+reaches the named situation, the model already knows which side is live. Each is
+its own page — click through for the full read. Regenerated continuously by the
+worker and the daily ingest; the engine still applies every gate before any
+advisory fires.</p>
+{section("Live now", "No scenario matches are live right now.", live_cards)}
+{section("Next 24 hours", "Nothing scenario-flagged in the next 24h.", soon_cards)}"""
     return respond(request, "Scenarios", "scenarios", body)
+
+
+async def scenario_detail(request: web.Request) -> web.Response:
+    from bot.models import Scenario
+
+    try:
+        sid = int(request.match_info["sid"])
+    except (KeyError, ValueError):
+        return web.Response(status=404, text="no such scenario")
+    with db_session() as db:
+        row = db.execute(
+            select(Scenario, Player.full_name)
+            .join(Player, Player.id == Scenario.player_id, isouter=True)
+            .where(Scenario.id == sid)).first()
+        if row is None:
+            return web.Response(status=404, text="no such scenario")
+        sc, player = row
+        opp = db.get(Player, sc.opponent_id) if sc.opponent_id else None
+        opp_name = opp.full_name if opp else "opponent"
+        # live context, if the match is under way
+        st = db.execute(select(LiveMatchState).where(
+            LiveMatchState.market_ticker == sc.market_ticker)).scalar()
+        from sqlalchemy import text as sqltext
+        sl = db.execute(sqltext(
+            "SELECT scoreline, sets_a, sets_b FROM match_score_log "
+            "WHERE market_ticker = :t ORDER BY ts DESC LIMIT 1"),
+            {"t": sc.market_ticker}).first()
+
+    f = sc.facts or {}
+    conf = f.get("model_confidence")
+    strip = statstrip([
+        ("Prematch", f"{sc.prematch_prob:.0%}", "model, pre-play"),
+        ("In a decider", f"{sc.model_prob_at_state:.0%}", "if it goes the distance"),
+        ("Model conf", f"{conf:.0%}" if conf is not None else "—", "data depth"),
+        ("Salience", f"{sc.salience:.2f}", "why it ranked"),
+    ], cols=4)
+
+    # set-rate comparison from the fact block
+    srw = f.get("set_rates_watch") or {}
+    sro = f.get("set_rates_opp") or {}
+    setrows = ""
+    for n in ("1", "2", "3"):
+        w = srw.get(n) if n in srw else srw.get(int(n))
+        o = sro.get(n) if n in sro else sro.get(int(n))
+        if w is None and o is None:
+            continue
+        setrows += (f'<div class="vsrow"><span class="k">set {n}</span>'
+                    f'<span class="v mono">{w if w is not None else "—"}%'
+                    f' <span class="sub2">vs {o if o is not None else "—"}%</span></span></div>')
+    dw, do = f.get("decider_watch"), f.get("decider_opp")
+    dec = ""
+    if dw or do:
+        dec = (f'<div class="vsrow"><span class="k">deciding sets</span>'
+               f'<span class="v mono">{dw[0]}-{dw[1] if dw else ""}'
+               f' <span class="sub2">vs {do[0]}-{do[1]}</span></span></div>'
+               if dw and do else "")
+    rates_html = (f'<section class="block"><div class="blockhead"><h4>'
+                  f'{esc(player)} vs {esc(opp_name)} — set rates</h4></div>'
+                  f'<div class="rule"></div>{setrows}{dec}</section>'
+                  if setrows or dec else "")
+
+    live_html = ""
+    if sl and sl[0]:
+        state = st.state if st else None
+        live_html = (f'<section class="block"><div class="blockhead"><h4>Live now</h4>'
+                     f'<span class="aside">{esc(state or "in play")}</span></div>'
+                     f'<div class="rule"></div><div class="mono" '
+                     f'style="font-size:16px;font-weight:800">{esc(sl[0])} '
+                     f'<span class="sub2">· {sl[1]}-{sl[2]} sets</span></div></section>')
+
+    match_label = f.get("match") or sc.event_ticker
+    body = pagehead("Scenario", esc(match_label),
+                    f'<a href="/scenarios">← all scenarios</a>') + f"""
+<p class="prose" style="margin:0 0 16px">Watch <strong>{esc(player)}</strong>
+· {esc(f.get('event_label') or '')} · scheduled {pt(sc.scheduled_start)} ·
+{kalshi_link(sc.market_ticker)} · <a href="/match/{esc(sc.event_ticker)}">full match data →</a></p>
+{strip}{live_html}
+<section class="block"><div class="blockhead"><h4>The read</h4>
+<span class="aside">deterministic — every number traces to the fact block</span></div>
+<div class="rule"></div><div class="prose">{esc(sc.narrative)}</div></section>
+{rates_html}"""
+    return respond(request, f"Scenario · {match_label}", "scenarios", body)
 
 
 TP_LIMIT = 90  # take-profit limit price (cents) for the TP variant
@@ -1839,7 +1952,7 @@ async def live(request: web.Request) -> web.Response:
                 f'<div class="planrow"><span class="scen-flag">◆ PLAY</span> '
                 f'<strong>{esc(wname.split()[-1])}</strong> '
                 f'{trigger_html(sc, est.state if est else None, is_live, wmid)} '
-                f'<a href="/scenarios" class="sub2">full scenario →</a></div>')
+                f'<a href="/scenario/{sc.id}" class="sub2">full scenario →</a></div>')
         tour = series_label.get(ev["series"], "?")
         has_play = any(m.ticker in advised for m in sides)
         trig = _trig_class(est, is_live)
@@ -2729,6 +2842,7 @@ def make_app() -> web.Application:
     app = web.Application(middlewares=[token_guard])
     app.router.add_get("/", home)
     app.router.add_get("/scenarios", scenarios)
+    app.router.add_get("/scenario/{sid:\\d+}", scenario_detail)
     app.router.add_get("/testrun", testrun)
     app.router.add_get("/testrun/t2", testrun_t2)
     app.router.add_get("/testrun/history", testrun_history)
