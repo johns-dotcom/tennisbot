@@ -193,26 +193,69 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
     return True
 
 
+def _apply_settlement(bet, result: str, source: str) -> None:
+    outcome = advisory_outcome(bet.side, result)
+    if outcome is None:
+        return
+    bet.status = outcome if outcome in ("won", "lost") else "void"
+    per = advisory_pnl_cents(bet.side, bet.price_cents, result)
+    bet.pnl_cents = per * (bet.units or 1) if per is not None else None
+    bet.settled_at = datetime.now(timezone.utc)
+    bet.reasoning = {**(bet.reasoning or {}), "settled_from": source}
+
+
 def settle_open_bets(db: Session) -> int:
-    """Settle open paper bets whose market has a result. Returns settled count."""
+    """Settle open paper bets. Kalshi's market result is authoritative, but it
+    LAGS the match end (the market sits 'active' with result=None for a while
+    after the final point) — so a decided bet would otherwise show 'open' for
+    ages. Fallback: settle from the final recorded scoreline (sets_a = the YES
+    player of the bet's market), which we have the instant the match ends. When
+    the authoritative result later arrives it re-checks a scoreline-settled bet
+    and corrects it if they disagree (guards the ~rare mapping flip)."""
+    from sqlalchemy import text as _sqltext
+
+    n = 0
+    # 1) authoritative — market has a result
     rows = db.execute(
         select(PaperBet, KalshiMarket.result)
         .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)
-        .where(PaperBet.status == "open", KalshiMarket.result.is_not(None))
-    ).all()
-    n = 0
+        .where(PaperBet.status == "open", KalshiMarket.result.is_not(None))).all()
     for bet, result in rows:
-        outcome = advisory_outcome(bet.side, result)
-        if outcome is None:
-            continue
-        bet.status = outcome if outcome in ("won", "lost") else "void"
-        per_contract = advisory_pnl_cents(bet.side, bet.price_cents, result)
-        bet.pnl_cents = per_contract * (bet.units or 1) \
-            if per_contract is not None else None
-        bet.settled_at = datetime.now(timezone.utc)
+        _apply_settlement(bet, result, "kalshi_result")
         n += 1
-        log.info("paper bet settled", event=bet.event_ticker, outcome=bet.status,
-                 pnl=bet.pnl_cents)
-    if n:
-        db.commit()
+        log.info("paper bet settled", event=bet.event_ticker, bot=bet.bot,
+                 outcome=bet.status, pnl=bet.pnl_cents)
+
+    # 2) fallback — match finished (final scoreline) but market not yet settled
+    open_rest = db.execute(
+        select(PaperBet, KalshiMarket.result)
+        .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)
+        .where(PaperBet.status == "open", KalshiMarket.result.is_(None))).all()
+    for bet, _ in open_rest:
+        fin = db.execute(_sqltext(
+            "SELECT sets_a, sets_b FROM match_score_log WHERE market_ticker = :t "
+            "AND is_final = true ORDER BY ts DESC LIMIT 1"),
+            {"t": bet.market_ticker}).first()
+        if not fin or fin[0] == fin[1]:
+            continue  # no final score, or an undecided/void-looking line
+        result = "yes" if fin[0] > fin[1] else "no"  # sets_a = YES player's sets
+        _apply_settlement(bet, result, "scoreline")
+        n += 1
+        log.info("paper bet settled (scoreline)", event=bet.event_ticker,
+                 bot=bet.bot, outcome=bet.status, pnl=bet.pnl_cents)
+
+    # 3) correction — a scoreline-settled bet whose market result now disagrees
+    prov = db.execute(
+        select(PaperBet, KalshiMarket.result)
+        .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)
+        .where(PaperBet.status.in_(("won", "lost")),
+               KalshiMarket.result.in_(("yes", "no")),
+               PaperBet.reasoning["settled_from"].astext == "scoreline")).all()
+    for bet, result in prov:
+        want = advisory_outcome(bet.side, result)
+        if want in ("won", "lost") and want != bet.status:
+            _apply_settlement(bet, result, "kalshi_result_corrected")
+            log.warning("paper bet corrected on settlement", event=bet.event_ticker,
+                        bot=bet.bot, to=bet.status)
+    db.commit()  # persist settlements + any step-3 corrections
     return n
