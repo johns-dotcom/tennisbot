@@ -35,21 +35,22 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v6"  # v6: floor re-based to the recalibrated probability scale
+POLICY_VERSION = "v7"  # v7: edge cap raised to 30% (trust recalibrated big edges)
 
-# v6 — why the floor came back down. v4 set an 82% floor because the 68-82% band
-# won only ~57%; but that was OVERCONFIDENCE, and v3 fixed it by recalibrating
-# the model (PLATT_A 1.65→1.437), which SHRANK every probability. Keeping the
-# 82% floor on the recalibrated scale double-counted the same fix: it rejected
-# ~all opportunities (a "high-prob favorite WITH positive edge" is rare — the
-# market prices favorites efficiently), so the bots placed almost nothing. v6
-# restores a floor of 0.68 on the now-honest scale (a recalibrated 0.68 genuinely
-# wins ~0.68), while KEEPING v4's still-valid guards:
-#   - edge > 15%      → skip (model error / stale quote, not value)
-#   - Challenger tier → demoted, needs a stronger favorite (>=72%)
+# v6 re-based the floor to the recalibrated scale (0.68). v7 raises the edge cap.
+# The floor is on the IN-HOUSE model probability, not Kalshi's price — so the bot
+# already bets the side its model favors even when Kalshi has that player as an
+# underdog (a value bet). The old 15% edge cap (from the pre-recalibration model,
+# where a big edge meant the model was overconfident/wrong) was cutting exactly
+# those good value bets. Post-recalibration the model is honest, so a large edge
+# is a genuine, calibrated disagreement with the market — real value. v7 lifts
+# the cap to 30% (still skipping absurd >30% edges as stale quotes / data errors).
+#   - model prob < 0.68  → skip (record-focused: back the model's favorites)
+#   - edge > 30%         → skip (implausible — likely a stale/thin quote)
+#   - Challenger tier    → demoted, needs a stronger favorite (>=72%)
 PAPER_MIN_PROB = 0.68
 PAPER_MIN_EDGE = 0.03
-PAPER_MAX_EDGE = 0.15
+PAPER_MAX_EDGE = 0.30
 PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20

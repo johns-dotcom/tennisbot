@@ -40,9 +40,11 @@ def test_v6_floor_is_a_favorite_band_not_a_coinflip():
     assert not decide_bet(p_yes=0.55, confidence=0.9, yes_ask=42, yes_bid=40).place
 
 
-def test_v6_skips_big_edges_entirely():
-    # the Kayo Nishimura case: 90% model vs 65¢ = +25% edge — skipped (>15%)
-    assert not decide_bet(p_yes=0.90, confidence=1.0, yes_ask=65, yes_bid=63).place
+def test_v7_allows_value_edges_but_skips_absurd():
+    # v7: a model-favorite the market underprices (22% edge) is a value bet now
+    assert decide_bet(p_yes=0.90, confidence=1.0, yes_ask=68, yes_bid=66).place
+    # but a >30% edge is still skipped as an implausible / stale quote
+    assert not decide_bet(p_yes=0.90, confidence=1.0, yes_ask=55, yes_bid=53).place
 
 
 def test_v6_challenger_is_demoted():
@@ -71,7 +73,7 @@ def test_sizing_is_continuous_confidence_driven_and_sparing():
     # floor and cap, and a suspicious edge is never pressed
     assert size_units(0.68, 0.03, 0.60) == 1.0
     assert size_units(0.99, 0.05, 1.0) == MAX_UNITS
-    assert size_units(0.95, 0.25, 1.0) == 1.0
+    assert size_units(0.95, 0.35, 1.0) == 1.0  # edge beyond the cap → not pressed
 
 
 def test_shared_gate_used_by_both_paths():
@@ -80,7 +82,8 @@ def test_shared_gate_used_by_both_paths():
 
     assert policy_ok(0.85, 0.10, 75, None)
     assert not policy_ok(0.60, 0.10, 70, None)      # below 68% floor
-    assert not policy_ok(0.90, 0.25, 65, None)      # edge > 15%
+    assert policy_ok(0.90, 0.25, 65, None)          # 25% value edge allowed (v7)
+    assert not policy_ok(0.90, 0.35, 55, None)      # edge > 30% skipped
     assert not policy_ok(0.70, 0.05, 65, "C")       # Challenger needs 72%
     assert policy_ok(0.75, 0.05, 70, "C")
 

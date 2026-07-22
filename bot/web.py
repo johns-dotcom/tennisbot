@@ -102,6 +102,10 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   border-radius: 4px; cursor: pointer; letter-spacing: .02em; }
 .fchip:hover { color: var(--text); }
 .fchip.on { border-color: var(--accent); color: var(--text); }
+.planrow { margin-top: 6px; font-size: 12.5px; display: flex; flex-wrap: wrap;
+  align-items: center; gap: 7px; }
+.scen-flag { background: var(--accent); color: #0a0a0a; font-weight: 800;
+  font-size: 10px; letter-spacing: .08em; padding: 2px 7px; border-radius: 4px; }
 .vsgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
   gap: 2px; background: var(--divider); border: 2px solid var(--divider);
   margin-bottom: 26px; }
@@ -273,16 +277,19 @@ function applyLiveFilters(){
   total++;
   var okT=tours.length===0||tours.indexOf(c.dataset.tour)>=0;
   var okP=!s.play||c.dataset.play==='1';
+  var okS=!s.scenario||c.dataset.scenario==='1';
   var okG=!s.trig||c.dataset.trig==='hit'||c.dataset.trig==='near';
-  var ok=okT&&okP&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
+  var ok=okT&&okP&&okS&&okG; c.style.display=ok?'':'none'; if(ok)shown++;});
  document.querySelectorAll('.fchip').forEach(function(ch){var f=ch.dataset.f,on;
-  if(f==='play')on=!!s.play; else if(f==='trig')on=!!s.trig; else on=tours.indexOf(f)>=0;
+  if(f==='play')on=!!s.play; else if(f==='trig')on=!!s.trig;
+  else if(f==='scenario')on=!!s.scenario; else on=tours.indexOf(f)>=0;
   ch.classList.toggle('on',on);});
  var vc=document.getElementById('livecount'); if(vc)vc.textContent=shown;}
 function bindFilters(){
  document.querySelectorAll('.fchip').forEach(function(ch){if(ch._b)return;ch._b=true;
   ch.addEventListener('click',function(){var s=lfState(),f=ch.dataset.f;
    if(f==='play')s.play=!s.play; else if(f==='trig')s.trig=!s.trig;
+   else if(f==='scenario')s.scenario=!s.scenario;
    else{s.tours=s.tours||[];var i=s.tours.indexOf(f);if(i>=0)s.tours.splice(i,1);else s.tours.push(f);}
    localStorage.setItem('deuce_lf',JSON.stringify(s));applyLiveFilters();});});
  applyLiveFilters();}
@@ -666,7 +673,7 @@ async def testrun_tp(request: web.Request) -> web.Response:
 
 async def _testrun_view(request: web.Request, bot: str = "t1") -> web.Response:
     from bot.models import KalshiMarket, PaperBet, Scenario
-    from bot.paper import DEFAULT_POLICY, PAPER_MIN_EDGE, PAPER_MIN_PROB
+    from bot.paper import DEFAULT_POLICY, MAX_UNITS, PAPER_MIN_EDGE, PAPER_MIN_PROB
     from bot.t2 import t2_policy, t2_state
 
     is_tp = False  # both exits shown side-by-side; kept for existing branches
@@ -1108,10 +1115,51 @@ real order. Compare against the <a href="/testrun/t2">self-improving T2 →</a><
 inform it; every parameter is bounded and each change is versioned so records
 never blend.</p></section>"""
 
+    t2_extra = ("<p><strong>T2 learns.</strong> Unlike the base bot's fixed rules, "
+                "T2 re-tunes rules 3 and 4 from its own settled record (see the "
+                "Self-improvement panel above) — everything else is identical.</p>"
+                if is_t2 else "")
+    method_html = f"""<section class="block"><details class="coll" data-key="howbets-{bot}">
+<summary style="cursor:pointer;list-style:none;display:flex;align-items:baseline;
+justify-content:space-between;gap:12px">
+<span><span style="font-family:var(--font);font-weight:800;font-size:19px">How this bot places bets</span>
+<span class="sub2" style="margin-left:8px">its model · the rules · sizing · exit</span></span>
+<span class="sub2 coll-caret">▸ show</span></summary>
+<div class="rule" style="margin-top:8px"></div>
+<div class="prose">
+<p><strong>1 · Its own probability.</strong> A surface-adjusted, set-level Elo
+model — recalibrated against real match outcomes — estimates each player's chance
+to win. This is the bot's <em>own</em> number, built only from match results and
+<strong>never from the Kalshi price</strong>, so the model can't just echo the
+market.</p>
+<p><strong>2 · Edge vs the market.</strong> It compares that probability to the
+executable Kalshi price: <em>edge = model probability − price</em>. A positive edge
+means the bot thinks the market underprices its pick — including spots where Kalshi
+lists that player as an underdog under 50¢.</p>
+<p><strong>3 · The rules</strong> (a bet fires only if <em>all</em> hold): model
+probability ≥ <strong>{policy.min_prob:.0%}</strong> (its own number — favorites
+only, since the target is a winning record); edge between
+<strong>{policy.min_edge:.0%}</strong> and <strong>{policy.max_edge:.0%}</strong>
+(a bigger gap than {policy.max_edge:.0%} is treated as a stale/thin quote and
+skipped); executable price {policy.min_price}–{policy.max_price}¢; model confidence
+≥ <strong>{policy.min_conf:.0%}</strong> (enough match data on <em>both</em>
+players); Challenger-tier matches demand a stronger favorite
+(≥ <strong>{policy.challenger_min_prob:.0%}</strong>). One bet per match, ever.</p>
+<p><strong>4 · Size by conviction.</strong> $10 per unit, {1.0:.1f}–{MAX_UNITS:.1f}u.
+The stake grows only when the model is <em>both</em> very confident <em>and</em> the
+read rests on deep data — so multi-unit bets are rare and most sit near 1u.</p>
+<p><strong>5 · Exit.</strong> The headline record holds every bet to settlement
+(100¢ or 0¢); the 90¢ take-profit variant is tracked alongside for comparison.</p>
+{t2_extra}
+<p class="sub2">Every bet below also carries its own written reasoning — the
+gameflow read and why it was sized as it was. Advisory only: these are imaginary
+bets, and no order is ever placed.</p>
+</div></details></section>"""
+
     body = pagehead("Strategy Lab", title,
                     f'{n} settled · <a href="{hist_link}">post-game log →</a> · '
                     f'<a href="/track">advisory track record →</a>') \
-        + strip + exit_note + learned_html + watching_html + timeline_html + f"""
+        + strip + exit_note + method_html + learned_html + watching_html + timeline_html + f"""
 {comparison_html}
 <section class="block"><div class="blockhead"><h4>Tuning breakdown</h4>
 <span class="aside">where the record comes from — the improvement signal</span></div>
@@ -1730,10 +1778,10 @@ async def live(request: web.Request) -> web.Response:
         from bot.models import Scenario
 
         plans = {}
-        live_ev_tickers = [t for t, _ in live_evs]
-        if live_ev_tickers:
+        plan_ev_tickers = [t for t, _ in live_evs] + [t for t, _ in soon_evs]
+        if plan_ev_tickers:
             for sc in db.execute(select(Scenario).where(
-                    Scenario.event_ticker.in_(live_ev_tickers))
+                    Scenario.event_ticker.in_(plan_ev_tickers))
                     .order_by(Scenario.created_for)).scalars():
                 plans[sc.event_ticker] = sc
 
@@ -1772,28 +1820,35 @@ async def live(request: web.Request) -> web.Response:
         else:
             st = tag("accent" if is_live else "neutral", "●" if is_live else "○",
                      "LIVE" if is_live else "PRE")
-        play = tag("outline", "▲", "play") if any(m.ticker in advised for m in sides) else ""
+        play = tag("outline", "▲", "advisory") if any(m.ticker in advised for m in sides) else ""
         score_row = ""
         sl = next((scorelines.get(m.ticker) for m in sides if scorelines.get(m.ticker)),
                   None)
         if sl and sl[0]:
             score_row = (f'<div class="mono" style="font-size:15px;font-weight:800">'
                          f'{esc(sl[0])} <span class="sub2">· {sl[1]}-{sl[2]} sets</span></div>')
-        plan_row = ""
+        # a scenario = this match is on the bot's watchlist (the /scenarios page)
         sc = plans.get(ev_ticker)
+        scen_badge = tag("accent", "◆", "scenario") if sc is not None else ""
+        plan_row = ""
         if sc is not None:
             wm = next((m for m in sides if m.ticker == sc.market_ticker), None)
+            wname = ((wm.raw or {}).get("yes_sub_title") if wm else "") or "the pick"
             wmid = _odds_cents(wm, quotes)[0] if wm else None
-            plan_row = (f'<div class="sub2">plan: '
-                        f'{trigger_html(sc, est.state if est else None, is_live, wmid)}</div>')
+            plan_row = (
+                f'<div class="planrow"><span class="scen-flag">◆ PLAY</span> '
+                f'<strong>{esc(wname.split()[-1])}</strong> '
+                f'{trigger_html(sc, est.state if est else None, is_live, wmid)} '
+                f'<a href="/scenarios" class="sub2">full scenario →</a></div>')
         tour = series_label.get(ev["series"], "?")
         has_play = any(m.ticker in advised for m in sides)
         trig = _trig_class(est, is_live)
         return f"""<div class="card livecard" data-tour="{esc(tour)}" \
-data-play="{1 if has_play else 0}" data-trig="{trig}">
+data-play="{1 if has_play else 0}" data-scenario="{1 if sc is not None else 0}" \
+data-trig="{trig}">
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{tour}</span>
-<span>{st} {play}</span></div>
+<span>{st} {scen_badge} {play}</span></div>
 <a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
 <div>{''.join(rows_html)}</div></a>
 {score_row}
@@ -1835,8 +1890,10 @@ data-play="{1 if has_play else 0}" data-trig="{trig}">
                  if _trig_class(next((states.get(m.ticker) for m in e["sides"]
                                       if states.get(m.ticker)), None), True)
                  in ("hit", "near"))
+    scen_n = sum(1 for t, _ in live_evs if t in plans)
     filter_bar = (f'<div class="filterbar">{tour_chips}'
-                  f'<button class="fchip" data-f="play">▲ plays only</button>'
+                  f'<button class="fchip" data-f="scenario">◆ scenario ({scen_n})</button>'
+                  f'<button class="fchip" data-f="play">▲ advisory fired</button>'
                   f'<button class="fchip" data-f="trig">◎ near trigger ({near_n})</button>'
                   f'<span class="sub2" style="margin-left:auto">showing '
                   f'<span id="livecount">{len(live_evs)}</span> of {len(live_evs)}</span>'
