@@ -30,30 +30,29 @@ def test_no_bet_on_low_confidence():
     assert not d.place and "confidence" in d.reason
 
 
-# --- v6 selectivity (floor re-based to the recalibrated scale) -----------
+# --- v8 selectivity (fit to the first live run's results) ----------------
 
-def test_v6_floor_is_a_favorite_band_not_a_coinflip():
-    # v6 floor is 0.68 (recalibrated & honest); a 78% favorite with value now
-    # clears, but a coin-flip / underdog is still skipped (record-focused)
-    assert 0.65 <= PAPER_MIN_PROB <= 0.75
-    assert decide_bet(p_yes=0.78, confidence=0.9, yes_ask=70, yes_bid=68).place
-    assert not decide_bet(p_yes=0.55, confidence=0.9, yes_ask=42, yes_bid=40).place
-
-
-def test_v7_allows_value_edges_but_skips_absurd():
-    # v7: a model-favorite the market underprices (22% edge) is a value bet now
-    assert decide_bet(p_yes=0.90, confidence=1.0, yes_ask=68, yes_bid=66).place
-    # but a >30% edge is still skipped as an implausible / stale quote
-    assert not decide_bet(p_yes=0.90, confidence=1.0, yes_ask=55, yes_bid=53).place
+def test_v8_floor_is_the_calibrated_high_band():
+    # v8 floor is 0.82 — the bet population only wins at 82%+ (90%+ best); an
+    # 88% favorite with value clears, a 78% favorite no longer does
+    assert 0.80 <= PAPER_MIN_PROB <= 0.86
+    assert decide_bet(p_yes=0.88, confidence=0.9, yes_ask=78, yes_bid=76).place
+    assert not decide_bet(p_yes=0.78, confidence=0.9, yes_ask=68, yes_bid=66).place
 
 
-def test_v6_challenger_is_demoted():
-    # 70% favorite clears the general 68% floor but not the Challenger 72% bar
-    assert decide_bet(p_yes=0.70, confidence=0.9, yes_ask=65, yes_bid=63).place
-    assert not decide_bet(p_yes=0.70, confidence=0.9, yes_ask=65, yes_bid=63,
+def test_v8_skips_big_edges():
+    # edge > 15% lost badly (15-30% went 23%) — skipped again
+    assert decide_bet(p_yes=0.90, confidence=1.0, yes_ask=80, yes_bid=78).place  # 10% edge
+    assert not decide_bet(p_yes=0.90, confidence=1.0, yes_ask=68, yes_bid=66).place  # 22% edge
+
+
+def test_v8_challenger_is_demoted():
+    # 83% clears the general 82% floor but not the Challenger 85% bar
+    assert decide_bet(p_yes=0.83, confidence=0.9, yes_ask=74, yes_bid=72).place
+    assert not decide_bet(p_yes=0.83, confidence=0.9, yes_ask=74, yes_bid=72,
                           tier="C").place
     # a stronger Challenger favorite still clears
-    assert decide_bet(p_yes=0.78, confidence=0.9, yes_ask=70, yes_bid=68,
+    assert decide_bet(p_yes=0.88, confidence=0.9, yes_ask=78, yes_bid=76,
                       tier="C").place
 
 
@@ -80,12 +79,11 @@ def test_shared_gate_used_by_both_paths():
     # policy_ok is the single gate for the prematch and advisory bet paths
     from bot.paper import policy_ok
 
-    assert policy_ok(0.85, 0.10, 75, None)
-    assert not policy_ok(0.60, 0.10, 70, None)      # below 68% floor
-    assert policy_ok(0.90, 0.25, 65, None)          # 25% value edge allowed (v7)
-    assert not policy_ok(0.90, 0.35, 55, None)      # edge > 30% skipped
-    assert not policy_ok(0.70, 0.05, 65, "C")       # Challenger needs 72%
-    assert policy_ok(0.75, 0.05, 70, "C")
+    assert policy_ok(0.88, 0.10, 78, None)
+    assert not policy_ok(0.78, 0.10, 68, None)      # below 82% floor
+    assert not policy_ok(0.90, 0.25, 65, None)      # edge > 15% skipped
+    assert not policy_ok(0.83, 0.05, 78, "C")       # Challenger needs 85%
+    assert policy_ok(0.88, 0.05, 82, "C")
 
 
 def test_policy_parameterization_changes_the_gate():

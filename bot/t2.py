@@ -55,8 +55,8 @@ TOP5_N = 5  # max bets per day for the Top-5 bots
 MIN_BASIS = 15          # settled bets required before a bot adapts at all
 TARGET_WIN = 0.70
 MIN_BUCKET = 8          # bets needed in a prob band to trust its win rate
-FLOOR_MIN, FLOOR_MAX = 0.66, 0.85
-EDGE_MAX_TIGHT, EDGE_MAX_LOOSE = 0.15, 0.30
+FLOOR_MIN, FLOOR_MAX = 0.80, 0.92
+EDGE_MAX_TIGHT, EDGE_MAX_LOOSE = 0.10, 0.15
 SIZE_MULT_MIN, SIZE_MULT_MAX = 0.7, 1.3
 
 

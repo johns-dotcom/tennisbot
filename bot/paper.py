@@ -35,26 +35,28 @@ log = get_logger("paper")
 
 # bump whenever any threshold below changes — the testrun timeline annotates
 # version changes so before/after records never blend silently
-POLICY_VERSION = "v7"  # v7: edge cap raised to 30% (trust recalibrated big edges)
+POLICY_VERSION = "v8"  # v8: tightened from the first live run's own results
 
-# v6 re-based the floor to the recalibrated scale (0.68). v7 raises the edge cap.
-# The floor is on the IN-HOUSE model probability, not Kalshi's price — so the bot
-# already bets the side its model favors even when Kalshi has that player as an
-# underdog (a value bet). The old 15% edge cap (from the pre-recalibration model,
-# where a big edge meant the model was overconfident/wrong) was cutting exactly
-# those good value bets. Post-recalibration the model is honest, so a large edge
-# is a genuine, calibrated disagreement with the market — real value. v7 lifts
-# the cap to 30% (still skipping absurd >30% edges as stale quotes / data errors).
-#   - model prob < 0.68  → skip (record-focused: back the model's favorites)
-#   - edge > 30%         → skip (implausible — likely a stale/thin quote)
-#   - Challenger tier    → demoted, needs a stronger favorite (>=72%)
-PAPER_MIN_PROB = 0.68
+# v8 — fit to 78 settled bets across the fixed-scale run (the bots' own data):
+#   * By probability band the bet population is badly overconfident BELOW ~82%
+#     (68-82% won ~40-47% despite 71-78% model prob — adverse selection: the
+#     market fades a mediocre favorite for a reason) and only genuinely wins at
+#     90%+ (n=20, 100%). So the floor goes back UP to 0.82 on the recalibrated
+#     scale — there IS volume there (31 of 78 bets), unlike the pre-recalibration
+#     v4 era. Confidence is data-depth, this is the calibrated-value band.
+#   * Big edges LOST: 15-30% edge went 23% (n=13). v7's raised cap was wrong —
+#     a large gap vs the market is adverse selection, not free value. Back to 15%.
+#   * Challenger stays demoted (stronger favorite required).
+# The probability MODEL itself is well-calibrated on the full population (the
+# 28k walk-forward); this is a selection effect in the bet universe, so the fix
+# is policy selectivity, not re-recalibrating the model.
+PAPER_MIN_PROB = 0.82
 PAPER_MIN_EDGE = 0.03
-PAPER_MAX_EDGE = 0.30
+PAPER_MAX_EDGE = 0.15
 PAPER_MIN_CONF = 0.60
 PAPER_MAX_PRICE = 92  # above this there's nothing to win and one loss wrecks ROI
 PAPER_MIN_PRICE = 20
-CHALLENGER_MIN_PROB = 0.72
+CHALLENGER_MIN_PROB = 0.85
 
 # kept for sizing (multi-unit requires a believable edge, not an outlier)
 EDGE_SANE_MAX = PAPER_MAX_EDGE
