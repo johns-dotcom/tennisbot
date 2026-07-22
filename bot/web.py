@@ -1865,11 +1865,20 @@ async def live(request: web.Request) -> web.Response:
         global_last_seen = max((m.last_seen_at for m in markets
                                 if m.last_seen_at), default=None)
         discovery_alive = global_last_seen is not None and global_last_seen >= seen_cutoff
+        # fresh score activity = the strongest 'actually live' signal (the bot
+        # scores live matches every ~25s), so a game recorded this recently means
+        # play is under way; no recent scoring past the start grace ⇒ finished.
+        from sqlalchemy import text as _sqltext
+        fresh = {r[0]: r[1] for r in db.execute(_sqltext(
+            "SELECT market_ticker, max(ts) FROM match_score_log "
+            "WHERE ts > now() - interval '90 minutes' GROUP BY market_ticker")).all()}
+        FRESH_LIVE = timedelta(minutes=45)
+
         # A match is DONE only on an authoritative signal — settled result, the
         # market having left Kalshi's open set (discovery-gone), or a definitely-
         # terminal status word. The milestone feed also emits opaque codes
         # ('P','S','SCH'…) that must NOT hide a match (that bug dropped ~120 live
-        # games): anything started-and-still-open counts as live.
+        # games).
         ENDED = {"finished", "complete", "ended", "closed", "cancelled", "canceled",
                  "walkover", "wov", "abandoned", "retired", "postponed"}
         LIVE = {"live", "inprogress", "in_progress", "in progress", "interrupted"}
@@ -1886,9 +1895,14 @@ async def live(request: web.Request) -> web.Response:
                 if now - occ <= timedelta(hours=18):
                     done_evs.append((ev_ticker, ev))
                 continue
-            if (status in LIVE
-                    or occ - LIVE_WINDOW_BEFORE <= now <= occ + LIVE_WINDOW_AFTER
-                    or now - timedelta(hours=12) <= occ <= now):  # started, still open
+            # actually live: recent scoring, an explicit live status, or just
+            # started (grace for a match not yet scored). NOT merely 'occ is in
+            # the past and the market is still open' — that let finished games
+            # linger.
+            score_fresh = any(m.ticker in fresh and now - fresh[m.ticker] <= FRESH_LIVE
+                              for m in ev["sides"])
+            if (status in LIVE or score_fresh
+                    or occ - LIVE_WINDOW_BEFORE <= now <= occ + timedelta(hours=2)):
                 live_evs.append((ev_ticker, ev))
             elif now < occ <= now + UPCOMING_HORIZON:
                 soon_evs.append((ev_ticker, ev))
