@@ -2176,21 +2176,31 @@ async def live(request: web.Request) -> web.Response:
         # scores live matches every ~25s), so a game recorded this recently means
         # play is under way; no recent scoring past the start grace ⇒ finished.
         from sqlalchemy import text as _sqltext
-        # last score per match over the recent past: within FRESH_LIVE ⇒ actively
-        # live; any row at all ⇒ the match has STARTED (so it's never "upcoming").
-        recent = {r[0]: r[1] for r in db.execute(_sqltext(
-            "SELECT market_ticker, max(ts) FROM match_score_log "
-            "WHERE ts > now() - interval '18 hours' GROUP BY market_ticker")).all()}
+        # latest score row per match: (ts, total_games, is_final). games>0 ⇒ play
+        # has actually started (a 0-0 poll doesn't count); is_final ⇒ over.
+        recent = {r[0]: (r[1], r[2], r[3]) for r in db.execute(_sqltext(
+            "SELECT DISTINCT ON (market_ticker) market_ticker, ts, total_games, is_final "
+            "FROM match_score_log WHERE ts > now() - interval '18 hours' "
+            "ORDER BY market_ticker, ts DESC")).all()}
         FRESH_LIVE = timedelta(minutes=90)
 
-        # A match is DONE only on an authoritative signal — settled result, the
-        # market having left Kalshi's open set (discovery-gone), or a definitely-
-        # terminal status word. The milestone feed also emits opaque codes
-        # ('P','S','SCH'…) that must NOT hide a match (that bug dropped ~120 live
-        # games).
+        # LIVE requires positive evidence of play — an explicit live status, or a
+        # fresh score with games actually played. Scheduled time alone is NOT
+        # enough (a match 50m past its slot at 0-0 hasn't started). A match is
+        # DONE on: settlement, discovery-gone, a terminal status word, or a
+        # final scoreline.
         ENDED = {"finished", "complete", "ended", "closed", "cancelled", "canceled",
                  "walkover", "wov", "abandoned", "retired", "postponed"}
         LIVE = {"live", "inprogress", "in_progress", "in progress", "interrupted"}
+
+        def _rec(ev):  # (latest ts, total_games, is_final) across the event's sides
+            best = None
+            for m in ev["sides"]:
+                r = recent.get(m.ticker)
+                if r and (best is None or r[0] > best[0]):
+                    best = r
+            return best
+
         live_evs, soon_evs, done_evs = [], [], []
         for ev_ticker, ev in events.items():
             occ = ev["occ"]
@@ -2200,21 +2210,21 @@ async def live(request: web.Request) -> web.Response:
             gone = discovery_alive and last_seen is not None and last_seen < seen_cutoff
             status = (next(((m.raw or {}).get("_live_status") for m in ev["sides"]
                             if (m.raw or {}).get("_live_status")), "") or "").lower()
-            if settled or gone or status in ENDED:
+            r = _rec(ev)
+            is_final = bool(r and r[2])
+            if settled or gone or status in ENDED or is_final:
                 if now - occ <= timedelta(hours=18):
                     done_evs.append((ev_ticker, ev))
                 continue
-            # started = any game recorded; fresh = scored within FRESH_LIVE
-            started = any(m.ticker in recent for m in ev["sides"])
-            score_fresh = any(m.ticker in recent and now - recent[m.ticker] <= FRESH_LIVE
-                              for m in ev["sides"])
-            ev["started"] = started
-            if (status in LIVE or score_fresh
-                    or occ - LIVE_WINDOW_BEFORE <= now <= occ + timedelta(hours=2)):
+            games = r[1] if r else 0
+            fresh = bool(r and now - r[0] <= FRESH_LIVE)
+            playing = games > 0 and fresh
+            ev["started"] = games > 0
+            if status in LIVE or playing:
                 live_evs.append((ev_ticker, ev))
-            elif not started and now < occ <= now + UPCOMING_HORIZON:
-                # only genuinely upcoming matches — a started match (any score,
-                # or occ already past) is never shown as "Starting soon"
+            elif not playing and (now - timedelta(hours=2) <= occ <= now + UPCOMING_HORIZON):
+                # scheduled or awaiting start (tennis runs late) — shown as
+                # upcoming, never falsely "live"
                 soon_evs.append((ev_ticker, ev))
         live_evs.sort(key=lambda e: e[1]["occ"])
         soon_evs.sort(key=lambda e: e[1]["occ"])
@@ -2369,6 +2379,8 @@ async def live(request: web.Request) -> web.Response:
         # timing label: live matches with a future scheduled time started early
         if is_live:
             when = f"started {pt(ev['occ'])}" if ev["occ"] <= now else "live now (early start)"
+        elif ev["occ"] <= now:
+            when = f"awaiting start · scheduled {pt(ev['occ'])}"
         else:
             when = f"starts {pt(ev['occ'])}"
         return f"""<div class="{klass}" \
