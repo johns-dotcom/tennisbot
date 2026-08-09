@@ -1,5 +1,5 @@
 """SQLAlchemy models. All timestamps stored UTC."""
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 
 from sqlalchemy import (
     BigInteger,
@@ -36,9 +36,37 @@ class Player(Base):
     dob: Mapped[date | None] = mapped_column(Date)
     ioc: Mapped[str | None] = mapped_column(String(8))
     height_cm: Mapped[int | None] = mapped_column(Integer)
+    # current ATP/WTA ranking, refreshed from api-tennis get_standings
+    rank: Mapped[int | None] = mapped_column(Integer)
+    rank_points: Mapped[int | None] = mapped_column(Integer)
+    rank_date: Mapped[date | None] = mapped_column(Date)
+    # career surface win/loss splits from api-tennis get_players (singles):
+    # {"hard": {"w": int, "l": int}, "clay": {...}, "grass": {...}}
+    surface_stats: Mapped[dict | None] = mapped_column(JSONB)
+    # last incremental bio/surface fetch (get_players is billed per player, so
+    # only active players are refreshed and only when this is stale)
+    bio_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     __table_args__ = (
         UniqueConstraint("tour", "sackmann_id", name="uq_players_tour_sackmann"),
         Index("ix_players_api_tennis", "tour", "api_tennis_id"),
+    )
+
+
+class PlayerRanking(Base):
+    """Weekly ATP/WTA ranking snapshot from api-tennis get_standings. One row
+    per player per snapshot date — accumulates ranking history over time (the
+    whole table costs two API calls a week). Player.rank holds the latest."""
+
+    __tablename__ = "player_rankings"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    player_id: Mapped[int] = mapped_column(
+        ForeignKey("players.id", ondelete="CASCADE"), index=True)
+    tour: Mapped[str] = mapped_column(String(8))
+    as_of: Mapped[date] = mapped_column(Date)
+    rank: Mapped[int] = mapped_column(Integer)
+    points: Mapped[int | None] = mapped_column(Integer)
+    __table_args__ = (
+        UniqueConstraint("player_id", "as_of", name="uq_player_ranking"),
     )
 
 
@@ -295,7 +323,7 @@ class PaperBet(Base):
     reasoning: Mapped[dict | None] = mapped_column(JSONB)  # snapshot for tuning
     status: Mapped[str] = mapped_column(String(8), default="open")  # open/won/lost/void
     settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    pnl_cents: Mapped[int | None] = mapped_column(Integer)
+    pnl_cents: Mapped[float | None] = mapped_column(Float)  # fractional cents (decimal units)
     __table_args__ = (
         UniqueConstraint("bot", "event_ticker", name="uq_paper_bet_bot_event"),
     )
@@ -375,3 +403,132 @@ class IngestState(Base):
     key: Mapped[str] = mapped_column(String(96), primary_key=True)
     value: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class AppUser(Base):
+    """A person allowed to use the web interface. Accounts are created only by an
+    admin (no public sign-up) and every route is gated on a valid session — an
+    unapproved visitor sees nothing but the login page. Passwords are stored as a
+    salted scrypt hash (see bot.webauth), never in plaintext."""
+
+    __tablename__ = "app_users"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    password_hash: Mapped[str] = mapped_column(String(256))
+    is_admin: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)  # admin can disable
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    created_by: Mapped[str | None] = mapped_column(String(128))
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # My Bets page: the user's current stake per "unit" (USD). Stamped onto each
+    # new bet so a later change never retroactively rescales past units.
+    mybets_unit_usd: Mapped[int] = mapped_column(Integer, default=500)
+
+
+class UserPin(Base):
+    """A match a user has pinned on the live board for easy viewing. Per-user;
+    keyed by Kalshi event_ticker (the match), so it survives market re-discovery.
+    Pins are advisory bookmarks only — they change nothing about what the bot
+    watches or bets."""
+
+    __tablename__ = "user_pins"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    event_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (UniqueConstraint("user_id", "event_ticker",
+                                       name="uq_user_pins_user_event"),)
+
+
+class UserFavoritePlayer(Base):
+    """A player a user has marked as a favorite (from the database or live pages).
+    Per-user; keyed by player_id so a favorite follows the player across matches.
+    Advisory bookmark only — it changes nothing about what the bot watches or bets."""
+
+    __tablename__ = "user_favorite_players"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    player_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("players.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    __table_args__ = (UniqueConstraint("user_id", "player_id",
+                                       name="uq_user_fav_players_user_player"),)
+
+
+class UserTag(Base):
+    """Per-user colour for a My Bets tag (e.g. a person they tail). Cosmetic only —
+    lets tag chips be colour-coded across the ledger. Keyed by (user, tag)."""
+
+    __tablename__ = "user_tags"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    tag: Mapped[str] = mapped_column(String(64))
+    color: Mapped[str | None] = mapped_column(String(16))  # '#rrggbb' or NULL/''
+    # per-tag stake per unit ($). NULL → fall back to the user's personal
+    # (untagged) unit. Stamped onto new bets with this tag at creation.
+    unit_usd: Mapped[int | None] = mapped_column(Integer)
+    __table_args__ = (UniqueConstraint("user_id", "tag", name="uq_user_tags_user_tag"),)
+
+
+class ModelCalibration(Base):
+    """Latest fitted model-calibration parameters, refit walk-forward by the daily
+    ingest. Currently the state-conditioned logit-scaling (per set-score). The
+    model loads the newest row when it rebuilds; the hardcoded defaults in
+    bot.prob.state_adjust are the fallback if the table is empty. Each refit is
+    self-gated on out-of-sample log-loss lift, so a bad window can't regress."""
+
+    __tablename__ = "model_calibration"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    window_days: Mapped[int] = mapped_column(Integer)
+    # {"best_of|sets_a|sets_b": scale_A} for canonical (leader-perspective) states
+    state_scale: Mapped[dict | None] = mapped_column(JSONB)
+    detail: Mapped[dict | None] = mapped_column(JSONB)  # per-state n / lift / calib
+    # global pre-match Platt scalar (walk-forward refit); overrides the elo.py
+    # default on model rebuild via load_platt_calibration(). NULL on state-only rows.
+    platt_a: Mapped[float | None] = mapped_column(Float)
+
+
+class UserBet(Base):
+    """A user's personal, manually-logged bet on a Kalshi tennis market. Purely a
+    record-keeping ledger — the app is advisory-only and places no orders; this
+    just tracks what the user says they bought so their own P&L / CLV can be shown
+    alongside the bot leaderboard. Outcome, closing line and settlement are read
+    live off the referenced KalshiMarket, so nothing here is a duplicated result."""
+
+    __tablename__ = "user_bets"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    event_ticker: Mapped[str] = mapped_column(String(128), index=True)
+    market_ticker: Mapped[str] = mapped_column(String(128), index=True)  # side bought
+    side: Mapped[str] = mapped_column(String(4), default="yes")  # 'yes' | 'no'
+    player_name: Mapped[str] = mapped_column(String(128))       # denormalized display
+    opponent_name: Mapped[str | None] = mapped_column(String(128))
+    entry_price_cents: Mapped[int] = mapped_column(Integer)     # 1..99 (¢ paid)
+    shares: Mapped[int] = mapped_column(Integer)                # contracts held
+    # $/unit in effect when this bet was placed (snapshot; NULL on legacy rows,
+    # treated as the $500 default). Groups the ledger into unit-size epochs.
+    unit_usd: Mapped[int | None] = mapped_column(Integer)
+    # exit: NULL = still held (settles on the match result); set = cashed out at
+    # this price, so P&L is realized at the sell regardless of the final outcome.
+    exit_price_cents: Mapped[int | None] = mapped_column(Integer)
+    exit_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # partial cash-out: selling only SOME of a position splits it, and the sold
+    # slice is a new row pointing back here. NULL = this row is the position
+    # itself (whole, or the still-open remainder after slices were sold off).
+    parent_bet_id: Mapped[int | None] = mapped_column(
+        BigInteger, ForeignKey("user_bets.id", ondelete="SET NULL"), index=True)
+    note: Mapped[str | None] = mapped_column(String(256))
+    # optional user tag (e.g. a person they tail, or a strategy) — groups the
+    # ledger so per-tag performance can be shown separately. NULL = untagged.
+    tag: Mapped[str | None] = mapped_column(String(64), index=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
