@@ -34,7 +34,7 @@ MIN_SET_RATE_GAP = 0.08  # set-1 edge worth calling out
 THIN_SAMPLE = 10  # a rate on fewer decisions than this is an early read, not a trend
 SWEET_LO, SWEET_HI = 0.50, 0.85  # model-prob band where markets actually move
 SERIES_TIER = {"KXATPMATCH": "A", "KXWTAMATCH": "A", "KXWTAGAME": "A",
-               "KXATPCHALLENGERMATCH": "C"}
+               "KXATPCHALLENGERMATCH": "C", "KXWTACHALLENGERMATCH": "C"}
 
 
 @dataclass
@@ -139,6 +139,44 @@ def _pct_rank(sorted_vals: list, v) -> float | None:
         return None
     import bisect
     return bisect.bisect_left(sorted_vals, v) / len(sorted_vals)
+
+
+FRESH_K = 0.04  # max ± shift for the freshness/form-adjusted probability
+
+
+def _fresh_drag(prof, fat) -> float:
+    """0..1 fatigue/rust drag on a player from recent load — same-day/yesterday
+    play, going the distance, and recent deciding-set load."""
+    s = 0.0
+    if fat and fat.get("played_today"):
+        s += 0.5
+    elif fat and fat.get("played"):
+        s += 0.25
+    if fat and fat.get("went_distance"):
+        s += 0.2
+    lb = getattr(prof, "layoff", None)
+    if lb is not None:
+        if getattr(lb, "deciders_last_3d", 0) >= 1:
+            s += 0.3
+        if getattr(lb, "deciders_last_30d", 0) >= 3:
+            s += 0.1
+    return min(1.0, s)
+
+
+def _form_delta(prof) -> float:
+    return getattr(getattr(prof, "form", None), "ytd_vs_career_delta", None) or 0.0
+
+
+def fresh_adjust(p: float, w_prof, o_prof, w_fat, o_fat) -> tuple[float, float]:
+    """Bounded freshness+form conditioning of a watch-side probability. Returns
+    (adjusted_p, drift in [-1,1]). The watch side gains when the OPPONENT carries
+    more fatigue and when the watch player's year-form is trending up relative to
+    the opponent's. Deliberately NOT in the calibrated model (bot/prob) — it's an
+    advisory-layer experiment measured via the freshadj bot before it's trusted."""
+    drag_w, drag_o = _fresh_drag(w_prof, w_fat), _fresh_drag(o_prof, o_fat)
+    form_w, form_o = _form_delta(w_prof), _form_delta(o_prof)
+    drift = max(-1.0, min(1.0, (drag_o - drag_w) + 2.0 * (form_w - form_o)))
+    return max(0.02, min(0.98, p + FRESH_K * drift)), drift
 
 
 def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
@@ -434,6 +472,19 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
                 f"decider (confidence: {cband.label}, {model_confidence:.0%} data "
                 f"depth{conf_note}).")
 
+    # recency footnote: when each player last competed — fatigue/rust context
+    def _last_played(hist):
+        ds = [m.match_date for m in hist if m.match_date and m.match_date < as_of]
+        return max(ds) if ds else None
+
+    def _played_txt(name, d):
+        if d is None:
+            return f"{name} has no prior match on record"
+        return f"{name} last played {d:%b %d} ({(as_of - d).days}d ago)"
+
+    bits.append(f"Last match — {_played_txt(w_name, _last_played(w_hist))}; "
+                f"{_played_txt(o_name, _last_played(o_hist))}.")
+
     # 7. supporting depth (form / H2H / common opponents / trajectory)
     support_text, support = _supporting_analysis(
         w_prof, o_prof, w_hist, o_hist, dec_state, as_of,
@@ -444,6 +495,31 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
 
     if SWEET_LO <= p_w <= SWEET_HI:
         salience += 0.15  # market can actually move through this range
+
+    # freshness/form adjustment (experimental — freshadj bot only; base model
+    # numbers above are untouched). Folds opponent fatigue + year-form trend into
+    # the watch-side probability, bounded to ±4pt.
+    adj_pre, drift = fresh_adjust(p_w, w_prof, o_prof, w_fat, o_fat)
+    adj_dec, _ = fresh_adjust(p_dec, w_prof, o_prof, w_fat, o_fat)
+    if abs(adj_pre - p_w) >= 0.005:
+        bits.append(
+            f"Fresh/form adjustment: {'+' if adj_pre >= p_w else ''}"
+            f"{(adj_pre - p_w) * 100:.0f}pt → {w_name} {adj_pre:.0%} "
+            f"(opponent load + year-form trend; experimental, freshadj bot only).")
+
+    # trigger set (watch-side perspective) — the live set-states this plan keys on,
+    # each with the model's prob there. More than the decider: taking set 1 (ride /
+    # market-lag), dropping set 1 (re-entry only if still favoured), and the decider.
+    triggers = []
+    for kind, label, (ws, os_) in (("set1", "takes set 1", (1, 0)),
+                                   ("drop1", "drops set 1", (0, 1)),
+                                   ("decider", "deciding set", (need - 1, need - 1))):
+        try:
+            ms = MatchState(ws, os_, best_of)
+        except ValueError:
+            continue
+        triggers.append({"kind": kind, "label": label, "state": ms.key,
+                         "prob": round(condition_on_state(p_w, ms), 3)})
 
     return Candidate(
         market_ticker=w_tick, event_ticker=event_ticker, player_id=w_id,
@@ -458,6 +534,9 @@ def build_gameflow(*, ticker_a: str, ticker_b: str, event_ticker: str,
             "decider_opp": [do.wins, do.losses] if do is not None else None,
             "fatigue_opp": o_fat, "support": support,
             "model_confidence": round(model_confidence, 2),
+            "fresh_adj": {"prematch": round(adj_pre, 3),
+                          "decider": round(adj_dec, 3), "drift": round(drift, 3)},
+            "triggers": triggers,
         },
         scheduled_start=start)
 
@@ -552,8 +631,10 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
         raw = a.raw or {}
         best_of = int(raw.get("_best_of", 3))
         tier = SERIES_TIER.get(raw.get("_series", ""), "15")
-        pred = model.predict(a.player_a_id, b.player_a_id, None, tier,
-                             MatchState(0, 0, best_of))
+        from bot.stats.surface import live_match_surface
+        surface = live_match_surface(db, a.player_a_id, b.player_a_id, as_of)
+        pred = model.predict(a.player_a_id, b.player_a_id, surface, tier,
+                             MatchState(0, 0, best_of), as_of=as_of)
         if pred.confidence < 0.3:
             continue  # not enough data to say anything responsible
         try:
@@ -570,6 +651,7 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
                 set_rates_a=rates_a, set_rates_b=rates_b,
                 p_a=pred.p_a, best_of=best_of, start=occs.get(ev_ticker),
                 as_of=as_of, model_confidence=pred.confidence,
+                pctl=distributions.get(_tour),
                 fatigue_a=fatigue.get(a.player_a_id),
                 fatigue_b=fatigue.get(b.player_a_id),
                 event_label=(a.title or "").split(":")[0].replace("Will ", ""))

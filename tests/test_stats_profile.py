@@ -169,6 +169,36 @@ def test_serve_return_omits_without_stats():
     assert sr.n_matches == 0 and sr.ace_pct is None
 
 
+def test_serve_conditional_winrate():
+    from bot.stats.profile import serve_conditional_winrate
+
+    # 10 matches: when the player serves 10 aces they win 4 of 6; serving few
+    # aces (2) they win 1 of 4. Opponent DFs: opp had 5 DFs in the 6 the player
+    # won, 0 in the 4 they lost.
+    hist = []
+    for i in range(10):
+        won = i < 6
+        m = mk(10 + i, won, sets=((1, won), (2, won)))
+        object.__setattr__(m, "serve", _serve(10 if won else 2, 3, 80, 50, 38, 18, 12, 4, 6))
+        object.__setattr__(m, "opp_serve", _serve(4, 5 if won else 0, 78, 45, 30, 15, 12, 6, 10))
+        hist.append(m)
+
+    # self serving 10+ aces → the 6 wins only (they served 10 there)
+    s = serve_conditional_winrate(hist, AS_OF, key="ace", side="self", thresh=10)
+    assert (s.wins, s.losses) == (6, 0) and s.value == 1.0
+    # facing an opponent with 5+ double faults → those same 6 (opp DF=5 in wins)
+    o = serve_conditional_winrate(hist, AS_OF, key="df", side="opp", thresh=5)
+    assert (o.wins, o.losses) == (6, 0)
+    # a thin split is omitted (min_n): only 4 matches at <=2 aces via exact-0? use
+    # a threshold nothing meets → 0 matches → omitted
+    z = serve_conditional_winrate(hist, AS_OF, key="ace", side="self", thresh=99)
+    assert z.value is None and z.method == "omitted"
+    # min_n gate: 6 wins is fine at default 6, but raise the bar and it omits
+    hi = serve_conditional_winrate(hist, AS_OF, key="ace", side="self",
+                                   thresh=10, min_n=8)
+    assert hi.value is None
+
+
 def test_clutch_tiebreaks_and_rank_quality():
     from bot.stats.profile import compute_clutch, compute_deciding_sets
 

@@ -9,15 +9,21 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from bot.config import settings
 from bot.log import get_logger
 from bot.matching.market_matcher import PlayerMatcher, normalize_name
-from bot.models import IngestState, Match, MatchSet, Player, Tournament
+from bot.models import (IngestState, KalshiMarket, Match, MatchSet, Player,
+                        PlayerRanking, Tournament)
 from bot.sources.base import SyncResult, TennisDataSource
+
+# get_players is billed per player; only refresh an active player's bio this
+# often, and cap how many we fetch per ingest run.
+BIO_REFRESH_DAYS = 30
+BIO_MAX_PER_RUN = 60
 
 log = get_logger("sources.api_tennis")
 
@@ -45,6 +51,126 @@ _ROUND_MAP = {
     "round of 64": "R64", "1/32-finals": "R64",
     "round of 128": "R128", "1/64-finals": "R128",
 }
+
+
+def _int(v) -> int | None:
+    """Parse an api-tennis stat scalar ('53', '68%', '', None) to int or None."""
+    if v is None:
+        return None
+    s = str(v).strip().rstrip("%")
+    if not s:
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        try:
+            return int(float(s))
+        except ValueError:
+            return None
+
+
+def _parse_bday(raw) -> date | None:
+    """api-tennis player_bday is 'DD.MM.YYYY' (or empty)."""
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(str(raw).strip(), "%d.%m.%Y").date()
+    except ValueError:
+        return None
+
+
+def _parse_surface_stats(stats) -> dict | None:
+    """Career singles win/loss per surface from get_players `stats` (a list of
+    per-season rows). Doubles rows are skipped. Returns
+    {"hard": {"w", "l"}, "clay": {...}, "grass": {...}} with any positive total,
+    else None."""
+    if not isinstance(stats, list):
+        return None
+    agg = {s: {"w": 0, "l": 0} for s in ("hard", "clay", "grass")}
+    for row in stats:
+        if (row.get("type") or "").lower() != "singles":
+            continue
+        for surf in agg:
+            w = _int(row.get(f"{surf}_won"))
+            l = _int(row.get(f"{surf}_lost"))
+            if w:
+                agg[surf]["w"] += w
+            if l:
+                agg[surf]["l"] += l
+    agg = {s: v for s, v in agg.items() if v["w"] + v["l"] > 0}
+    return agg or None
+
+
+def _side_serve(by_stat: dict[tuple[str, str], dict]) -> dict | None:
+    """Build the Sackmann-schema serve line ({ace, df, svpt, 1stIn, 1stWon,
+    2ndWon, SvGms, bpSaved, bpFaced}) for ONE player from that player's
+    match-period api-tennis statistics, keyed (stat_type, stat_name)→row.
+
+    Returns None unless the core serve-point data is present, so partial rows
+    (a retirement with no serve feed) are absent rather than half-populated —
+    the profile treats a partial serve line as no line at all.
+
+    Break points are defaulted to 0 when the row is absent: a player who faced
+    zero break points legitimately has no 'Break Points Saved' stat, and that
+    is real data (0 faced, 0 saved), not a gap. svpt is DERIVED as
+    1stIn + 2nd-serve-points so first_in/svpt reproduces api-tennis's own
+    reported 1st-serve %; the raw 'Service Points Won' total is noisier
+    (counts lets/retired points inconsistently) and would break that identity.
+    """
+    def won(t, n):
+        return _int((by_stat.get((t, n)) or {}).get("stat_won"))
+
+    def total(t, n):
+        return _int((by_stat.get((t, n)) or {}).get("stat_total"))
+
+    def val(t, n):
+        return _int((by_stat.get((t, n)) or {}).get("stat_value"))
+
+    first_in = total("Service", "1st serve points won")
+    first_won = won("Service", "1st serve points won")
+    second_pts = total("Service", "2nd serve points won")
+    second_won = won("Service", "2nd serve points won")
+    svgms = total("Games", "Service games won")
+    # core serve-point data must be present and non-degenerate
+    if None in (first_in, first_won, second_pts, second_won, svgms):
+        return None
+    if first_in <= 0 or svgms <= 0:
+        return None
+    return {
+        "ace": val("Service", "Aces") or 0,
+        "df": val("Service", "Double Faults") or 0,
+        "svpt": first_in + second_pts,       # derived; see docstring
+        "1stIn": first_in,
+        "1stWon": first_won,
+        "2ndWon": second_won,
+        "SvGms": svgms,
+        "bpSaved": won("Service", "Break Points Saved") or 0,
+        "bpFaced": total("Service", "Break Points Saved") or 0,
+    }
+
+
+def parse_serve_stats(f: dict, winner_key, loser_key) -> dict | None:
+    """Winner/loser serve line from a finished fixture's `statistics`, in the
+    same w_*/l_* schema Sackmann writes to Match.stats — so the serve/return
+    profile picks these matches up with no new table or aggregator. None when
+    either side lacks a usable serve line (both sides required, since the
+    profile drops any match missing one side)."""
+    stats = f.get("statistics")
+    if not isinstance(stats, list) or not stats:
+        return None
+    by_player: dict[str, dict] = {}
+    for s in stats:
+        if (s.get("stat_period") or "").lower() != "match":
+            continue
+        pk = str(s.get("player_key"))
+        by_player.setdefault(pk, {})[(s.get("stat_type"), s.get("stat_name"))] = s
+    w = _side_serve(by_player.get(str(winner_key), {}))
+    l = _side_serve(by_player.get(str(loser_key), {}))
+    if w is None or l is None:
+        return None
+    out = {f"w_{k}": v for k, v in w.items()}
+    out.update({f"l_{k}": v for k, v in l.items()})
+    return out
 
 
 def _norm_round(raw: str | None) -> str | None:
@@ -83,6 +209,18 @@ class ApiTennisSource(TennisDataSource):
         result = body.get("result") or []
         return result if isinstance(result, list) else []
 
+    def live_scores(self) -> list[dict]:
+        """Normalized live singles events (for the live-score backup). Empty if
+        no key configured — never raises to the caller's loop."""
+        if not self.key:
+            return []
+        from bot.market.api_tennis_live import parse_live_singles
+        try:
+            return parse_live_singles(self._get("get_livescore"))
+        except Exception as e:
+            log.warning("api-tennis livescore fetch failed", error=str(e))
+            return []
+
     # ---------- helpers ----------
 
     @staticmethod
@@ -118,8 +256,10 @@ class ApiTennisSource(TennisDataSource):
         resolved = res.player_id
         if resolved and api_key:
             db.get(Player, resolved).api_tennis_id = str(api_key)
-        if resolved is None and res.method == "none" and res.confidence == 0.0 \
-                and context.get("reason") != "ambiguous":
+        # Create a provisional ONLY on a genuine no-candidate miss — never on an
+        # ambiguous match (method "ambiguous"), which would spawn a phantom third
+        # player and misattribute every future fixture to it.
+        if resolved is None and res.method == "none" and res.confidence == 0.0:
             p = Player(tour=tour, api_tennis_id=str(api_key) if api_key else None,
                        full_name=raw_name, normalized_name=normalize_name(raw_name))
             db.add(p)
@@ -133,9 +273,18 @@ class ApiTennisSource(TennisDataSource):
         tkey = str(fixture.get("tournament_key") or "")
         if not tkey:
             return None
+        from bot.stats.surface import resolve_surface
+        name = fixture.get("tournament_name") or tkey
+        # api-tennis carries no surface; resolve it by venue from Sackmann history
+        surface = resolve_surface(db, name)
         stmt = pg_insert(Tournament).values(
-            tour=tour, source=self.name, source_key=tkey,
-            name=fixture.get("tournament_name") or tkey,
+            tour=tour, source=self.name, source_key=tkey, name=name,
+            surface=surface, level=None, start_date=None,
+        ).on_conflict_do_update(
+            constraint="uq_tournaments_key",
+            set_={"surface": surface} if surface else {},
+        ) if surface else pg_insert(Tournament).values(
+            tour=tour, source=self.name, source_key=tkey, name=name,
             surface=None, level=None, start_date=None,
         ).on_conflict_do_nothing(constraint="uq_tournaments_key")
         db.execute(stmt)
@@ -184,21 +333,41 @@ class ApiTennisSource(TennisDataSource):
             winner_side = (f.get("event_winner") or "").strip().lower()
             if winner_side not in ("first player", "second player"):
                 return
-            winner_id, loser_id = (p1, p2) if winner_side == "first player" else (p2, p1)
-            sets, ww, wl = self._parse_api_sets(f, winner_is_first=(winner_side == "first player"))
+            winner_is_first = winner_side == "first player"
+            winner_id, loser_id = (p1, p2) if winner_is_first else (p2, p1)
+            winner_key, loser_key = (
+                (f.get("first_player_key"), f.get("second_player_key"))
+                if winner_is_first
+                else (f.get("second_player_key"), f.get("first_player_key")))
+            serve_stats = parse_serve_stats(f, winner_key, loser_key)
+            sets, ww, wl = self._parse_api_sets(f, winner_is_first=winner_is_first)
             is_dup = self._duplicate_of_sackmann(db, tour, p1, p2, event_date)
+            # best_of: a completed win to 3 sets is best-of-5 (Grand Slam men's),
+            # otherwise best-of-3 — don't hardcode 3 or slams misclassify their
+            # deciding set. outcome: detect ret/walkover so they aren't recorded
+            # as clean completions.
+            best_of = 5 if ww >= 3 else 3
+            _st = f"{(f.get('event_status') or '').lower()} {(f.get('event_final_result') or '').lower()}"
+            outcome = ("ret" if "ret" in _st
+                       else "wo" if ("walk" in _st or "w/o" in _st) else "completed")
+            from bot.stats.surface import resolve_surface
+            surface = resolve_surface(db, f.get("tournament_name"))
             values = dict(
                 tour=tour, source=self.name, source_key=skey, tournament_id=tid,
                 winner_id=winner_id, loser_id=loser_id, match_date=event_date,
-                round=_norm_round(f.get("tournament_round")), best_of=3,
+                round=_norm_round(f.get("tournament_round")), best_of=best_of,
                 score_raw=(f.get("event_final_result") or None),
-                outcome="completed", sets_won_winner=ww, sets_won_loser=wl,
-                surface=None, tourney_level=None, is_duplicate=is_dup,
-                scheduled_start=None,
+                outcome=outcome, sets_won_winner=ww, sets_won_loser=wl,
+                surface=surface, tourney_level=None, is_duplicate=is_dup,
+                scheduled_start=None, stats=serve_stats,
             )
+            update_cols = {k: v for k, v in values.items()
+                           if k not in ("source", "source_key")}
+            # never overwrite stored serve stats with a null re-fetch
+            if serve_stats is None:
+                update_cols.pop("stats", None)
             stmt = pg_insert(Match).values(values).on_conflict_do_update(
-                constraint="uq_matches_source_key",
-                set_={k: v for k, v in values.items() if k not in ("source", "source_key")},
+                constraint="uq_matches_source_key", set_=update_cols,
             ).returning(Match.id)
             mid = db.execute(stmt).scalar()
             db.execute(MatchSet.__table__.delete().where(MatchSet.match_id == mid))
@@ -250,6 +419,113 @@ class ApiTennisSource(TennisDataSource):
                              completed=True))
         return sets, ww, wl
 
+    # ---------- rankings & bios (cheap; get_players is per-player, so gated) ----------
+
+    def sync_rankings(self, db: Session, result: SyncResult) -> None:
+        """Refresh current ATP/WTA rankings from get_standings (two calls) and
+        snapshot them for history. Only players already in our DB are updated —
+        standings never create players (they'd have no match history)."""
+        as_of = date.today()
+        for league, tour in (("ATP", "atp"), ("WTA", "wta")):
+            try:
+                rows = self._get("get_standings", event_type=league)
+            except (httpx.HTTPError, RuntimeError) as e:
+                result.errors.append(f"standings {league}: {e}")
+                continue
+            # resolve the whole tour pool once (avoid a query per standings row):
+            # by api-tennis key first, then a UNIQUE exact normalized name.
+            by_key: dict[str, int] = {}
+            by_norm: dict[str, list[int]] = {}
+            for pid, norm, akey in db.execute(
+                select(Player.id, Player.normalized_name, Player.api_tennis_id)
+                .where(Player.tour == tour)
+            ):
+                by_norm.setdefault(norm, []).append(pid)
+                if akey:
+                    by_key[akey] = pid
+            n = 0
+            for r in rows:
+                rank = _int(r.get("place"))
+                if rank is None:
+                    continue
+                pts = _int(r.get("points"))
+                pk = r.get("player_key")
+                pid = by_key.get(str(pk)) if pk is not None else None
+                if pid is None:  # fall back to a UNIQUE exact-name match
+                    ids = by_norm.get(normalize_name(r.get("player") or ""), [])
+                    if len(ids) == 1:
+                        pid = ids[0]
+                if pid is None:
+                    continue
+                db.execute(update(Player).where(Player.id == pid).values(
+                    rank=rank, rank_points=pts, rank_date=as_of))
+                db.execute(pg_insert(PlayerRanking).values(
+                    player_id=pid, tour=tour, as_of=as_of, rank=rank, points=pts
+                ).on_conflict_do_update(
+                    constraint="uq_player_ranking",
+                    set_={"rank": rank, "points": pts}))
+                n += 1
+            db.commit()
+            log.info("api-tennis rankings synced", tour=tour, updated=n)
+
+    def _active_player_ids(self, db: Session) -> list[int]:
+        """Players in an upcoming/live match or an unsettled Kalshi market —
+        the set worth spending a per-player get_players call on."""
+        now = datetime.now(timezone.utc)
+        lo, hi = now - timedelta(days=1), now + self.horizon
+        ids: set[int] = set()
+        for wid, lid in db.execute(
+            select(Match.winner_id, Match.loser_id).where(
+                Match.outcome == "scheduled",
+                Match.scheduled_start.is_not(None),
+                Match.scheduled_start >= lo, Match.scheduled_start <= hi)
+        ):
+            ids.update((wid, lid))
+        for a, b in db.execute(
+            select(KalshiMarket.player_a_id, KalshiMarket.player_b_id).where(
+                KalshiMarket.result.is_(None))
+        ):
+            ids.update((a, b))
+        ids.discard(None)
+        return list(ids)
+
+    def sync_bios(self, db: Session, result: SyncResult) -> None:
+        """Fill dob + career surface splits for ACTIVE players via get_players
+        (billed per player). Capped and staleness-gated so a run costs a few
+        dozen calls at most. Handedness is not exposed by get_players — it
+        stays Sackmann-sourced."""
+        active = self._active_player_ids(db)
+        if not active:
+            return
+        cutoff = datetime.now(timezone.utc) - timedelta(days=BIO_REFRESH_DAYS)
+        due = db.execute(
+            select(Player.id, Player.api_tennis_id).where(
+                Player.id.in_(active),
+                Player.api_tennis_id.is_not(None),
+                or_(Player.bio_synced_at.is_(None), Player.bio_synced_at < cutoff))
+            .limit(BIO_MAX_PER_RUN)
+        ).all()
+        n = 0
+        for pid, pk in due:
+            try:
+                rows = self._get("get_players", player_key=pk)
+            except (httpx.HTTPError, RuntimeError) as e:
+                result.errors.append(f"players {pk}: {e}")
+                continue
+            vals = {"bio_synced_at": datetime.now(timezone.utc)}
+            if rows:
+                p = rows[0]
+                dob = _parse_bday(p.get("player_bday"))
+                if dob is not None:
+                    vals["dob"] = dob
+                surf = _parse_surface_stats(p.get("stats"))
+                if surf:
+                    vals["surface_stats"] = surf
+            db.execute(update(Player).where(Player.id == pid).values(**vals))
+            db.commit()
+            n += 1
+        log.info("api-tennis bios synced", players=n, due=len(due), active=len(active))
+
     # ---------- entry point ----------
 
     def sync(self, db: Session, *, full: bool = False) -> SyncResult:
@@ -287,6 +563,18 @@ class ApiTennisSource(TennisDataSource):
             log.info("api-tennis window done", start=str(cur), stop=str(win_end),
                      matches=result.matches_upserted)
             cur = win_end + timedelta(days=1)
+
+        # rankings (2 calls) and, for active players only, bios/surface splits
+        try:
+            self.sync_rankings(db, result)
+        except Exception as e:
+            db.rollback()
+            result.errors.append(f"rankings: {e}")
+        try:
+            self.sync_bios(db, result)
+        except Exception as e:
+            db.rollback()
+            result.errors.append(f"bios: {e}")
 
         stmt = pg_insert(IngestState).values(
             key="api_tennis:last_sync", value=datetime.now(timezone.utc).isoformat(),

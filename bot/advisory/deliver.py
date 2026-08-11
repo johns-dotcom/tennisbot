@@ -1,6 +1,7 @@
 """Advisory delivery: persistent audit row (written by the engine) + a
-structured stdout log line. No external delivery channel — by user decision
-(2026-07-19) advisories live in the database and the logs only.
+structured stdout log line. The Discord phone push lives in the engine (see
+AdvisoryEngine._fire), which gates it on the match being a tracked SCENARIO —
+so this stays the DB/logs source of truth only.
 """
 from __future__ import annotations
 

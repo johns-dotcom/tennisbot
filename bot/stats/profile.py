@@ -47,6 +47,7 @@ class FormBlock:
     last20: Stat
     last5_surface: Stat
     last10_surface: Stat
+    win_rate_90: Stat
     win_rate_365: Stat
     win_rate_ytd: Stat
     win_rate_career: Stat
@@ -63,10 +64,12 @@ def compute_form(history: list[MatchRow], as_of: date, surface: str | None) -> F
         w, l = _record(pool[:n])
         return rate(w, l, window)
 
+    y90 = _window(ms, as_of, 90)
     y365 = _window(ms, as_of, 365)
     ytd = [m for m in ms if m.match_date >= date(as_of.year, 1, 1)]
     career_w, career_l = _record(ms)
     ytd_w, ytd_l = _record(ytd)
+    w90, l90 = _record(y90)
     w365, l365 = _record(y365)
 
     career = rate(career_w, career_l, "career")
@@ -90,6 +93,7 @@ def compute_form(history: list[MatchRow], as_of: date, surface: str | None) -> F
         last20=last_n(ms, 20, "last20"),
         last5_surface=last_n(on_surface, 5, f"last5_{surface}") if surface else Stat.omitted(),
         last10_surface=last_n(on_surface, 10, f"last10_{surface}") if surface else Stat.omitted(),
+        win_rate_90=rate(w90, l90, "last90"),
         win_rate_365=rate(w365, l365, "last365"), win_rate_ytd=ytd_stat,
         win_rate_career=career, ytd_vs_career_delta=delta, streak=streak, surface=surface,
     )
@@ -224,6 +228,30 @@ def compute_set_rates(history: list[MatchRow], as_of: date,
     return out
 
 
+def compute_set_rates_both(history: list[MatchRow],
+                           as_of: date) -> dict[int, tuple[Stat, Stat, Stat]]:
+    """Three windows per set: {set_no: (last-90d, past-year, career) Stats}. Feeds
+    the side-by-side display; unlike compute_set_rates it never collapses to one
+    window."""
+    ms = _before(history, as_of)
+    cut365 = as_of - timedelta(days=365)
+    cut90 = as_of - timedelta(days=90)
+    career: dict[int, list[int]] = {}
+    recent: dict[int, list[int]] = {}
+    recent90: dict[int, list[int]] = {}
+    for m in ms:
+        for set_no, won in m.set_results:
+            career.setdefault(set_no, [0, 0])[0 if won else 1] += 1
+            if m.match_date >= cut365:
+                recent.setdefault(set_no, [0, 0])[0 if won else 1] += 1
+            if m.match_date >= cut90:
+                recent90.setdefault(set_no, [0, 0])[0 if won else 1] += 1
+    return {n: (rate(*recent90.get(n, [0, 0]), window=f"set{n}_last90"),
+                rate(*recent.get(n, [0, 0]), window=f"set{n}_last365"),
+                rate(*career[n], window=f"set{n}_career"))
+            for n in sorted(career)}
+
+
 @dataclass
 class ServeReturnBlock:
     """Aggregated serve/return rates from matches carrying Sackmann stats.
@@ -282,6 +310,33 @@ def compute_serve_return(history: list[MatchRow], as_of: date,
         bp_saved_pct, ret_win, break_pct)
 
 
+def serve_conditional_winrate(history: list[MatchRow], as_of: date, *,
+                              key: str, side: str, thresh: int,
+                              min_n: int = 6) -> Stat:
+    """Win rate over past matches (those carrying Sackmann serve stats) where a
+    serve count meets a threshold — the historical read behind a LIVE count, e.g.
+    "when this player serves 9+ aces, they win X%".
+
+    key   : 'ace' | 'df'
+    side  : 'self' (this player's serve stat) | 'opp' (their opponent's)
+    thresh: >= thresh matches (or exactly 0 when thresh <= 0, i.e. a clean count)
+
+    Omitted below `min_n` matches — a thin split is not reported (CLAUDE.md)."""
+    ms = _before(history, as_of)
+
+    def val(m: MatchRow):
+        d = m.serve if side == "self" else m.opp_serve
+        return d.get(key) if d else None
+
+    if thresh <= 0:
+        pool = [m for m in ms if val(m) == 0]
+    else:
+        pool = [m for m in ms if (v := val(m)) is not None and v >= thresh]
+    w = sum(1 for m in pool if m.won)
+    s = rate(w, len(pool) - w, f"{side}_{key}_{'0' if thresh <= 0 else f'ge{thresh}'}")
+    return s if s.n >= min_n else Stat.omitted(s.window)
+
+
 @dataclass
 class ClutchBlock:
     tiebreak: Stat            # tiebreak win record
@@ -332,6 +387,25 @@ def compute_schedule(history: list[MatchRow], as_of: date, days: int = 365,
               if m.opp_rank and m.match_date >= as_of - timedelta(days=days)]
     ms = recent if len(recent) >= min_ranked else \
         [m for m in _before(history, as_of) if m.opp_rank]
+    if not ms:
+        return ScheduleBlock(0, None, Stat.omitted("vs_top100"), "unknown")
+    avg = sum(m.opp_rank for m in ms) / len(ms)
+    top = [m for m in ms if m.opp_rank <= 100]
+    field = ("elite" if avg <= 50 else "strong" if avg <= 150
+             else "mid" if avg <= 400 else "weak")
+    return ScheduleBlock(len(ms), round(avg, 0), rate(*_record(top), "vs_top100"),
+                         field)
+
+
+def schedule_in_window(history: list[MatchRow], as_of: date,
+                       days: int | None) -> ScheduleBlock:
+    """Strength of schedule STRICTLY within a window (no cross-window fallback),
+    so each timeframe reflects its own opponents. days=None → career. Returns an
+    'unknown' block when there are no ranked opponents in that window."""
+    ms = [m for m in _before(history, as_of) if m.opp_rank]
+    if days is not None:
+        cutoff = as_of - timedelta(days=days)
+        ms = [m for m in ms if m.match_date >= cutoff]
     if not ms:
         return ScheduleBlock(0, None, Stat.omitted("vs_top100"), "unknown")
     avg = sum(m.opp_rank for m in ms) / len(ms)
@@ -592,8 +666,10 @@ class PlayerProfile:
     set_rates: dict = field(default_factory=dict)
     conditional: ConditionalBlock | None = None
     schedule: ScheduleBlock | None = None
+    schedule_windows: dict = field(default_factory=dict)  # 'last90'|'last365'|'career' -> ScheduleBlock
     age: float | None = None
     layoff: LayoffBlock | None = None
+    recent_load: dict = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -608,7 +684,7 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
     q = (
         select(Match.id, Match.match_date, Match.winner_id, Match.loser_id, Match.surface,
                Match.best_of, Match.outcome, Match.sets_won_winner, Match.sets_won_loser,
-               Match.tourney_level, Match.round, Match.stats)
+               Match.tourney_level, Match.round, Match.stats, Match.minutes)
         .where(
             ((Match.winner_id == player_id) | (Match.loser_id == player_id)),
             Match.outcome.in_(PLAYED_OUTCOMES),
@@ -657,7 +733,7 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
 
     history = []
     for (mid, mdate, wid, lid, surface, best_of, outcome, sww, swl, level, rnd,
-         mstats) in rows:
+         mstats, minutes) in rows:
         won = wid == player_id
         bo = best_of or 3
         dec_won_by_match_winner = deciders.get(mid)
@@ -680,6 +756,7 @@ def load_history(db: Session, player_id: int) -> list[MatchRow]:
                             sorted(tbs_by_match.get(mid, ()))),
             serve=side_stats(mstats, me),
             opp_serve=side_stats(mstats, opp),
+            minutes=minutes,
             opp_rank=(mstats or {}).get(opp_rank_key),
             player_rank=(mstats or {}).get(rank_key),
         ))
@@ -694,6 +771,11 @@ def build_profile(db: Session, player_id: int, as_of: date,
     history = load_history(db, player_id)
     surfaces_present = sorted({m.surface for m in history if m.surface})
     deciding = compute_deciding_sets(history, as_of)
+    # quantified fatigue: match/set/minute load over the last 7 days
+    _r7 = [m for m in history if m.match_date and as_of - timedelta(days=7) <= m.match_date < as_of]
+    recent_load = {"m": len(_r7),
+                   "sets": sum(len(m.set_results) for m in _r7),
+                   "min": sum(m.minutes or 0 for m in _r7)}
     return PlayerProfile(
         player_id=player_id, player_name=player.full_name, as_of=as_of,
         form=compute_form(history, as_of, surface),
@@ -706,6 +788,12 @@ def build_profile(db: Session, player_id: int, as_of: date,
         set_rates=compute_set_rates(history, as_of),
         conditional=compute_conditional(history, as_of),
         schedule=compute_schedule(history, as_of),
+        schedule_windows={
+            "last90": schedule_in_window(history, as_of, 90),
+            "last365": schedule_in_window(history, as_of, 365),
+            "career": schedule_in_window(history, as_of, None),
+        },
         age=round((as_of - player.dob).days / 365.25, 1) if player.dob else None,
         layoff=compute_layoff(history, as_of),
+        recent_load=recent_load,
     )

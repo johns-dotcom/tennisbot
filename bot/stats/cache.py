@@ -38,6 +38,10 @@ def refresh_stats_cache(db: Session, as_of: date | None = None,
             # ("86% set-2 win rate — top 1% of the field")
             "set_rates": {n: asdict(s) for n, s in (profile.set_rates or {}).items()},
             "conditional": asdict(profile.conditional) if profile.conditional else None,
+            # serve baselines (ace/DF rate per service point) — the norm the live
+            # board's statistical-significance ace/fault flags compare against
+            "serve_return": (asdict(profile.serve_return)
+                             if profile.serve_return else None),
         }
         db.execute(pg_insert(PlayerStatsCache).values(
             player_id=pid, as_of=as_of, payload=payload,

@@ -11,7 +11,7 @@ class FakeModel:
     def __init__(self, p=0.70, conf=0.9):
         self.p, self.conf = p, conf
 
-    def predict(self, a, b, surface, tier, state):
+    def predict(self, a, b, surface, tier, state, as_of=None):
         return Prediction(p_a=self.p, confidence=self.conf)
 
 

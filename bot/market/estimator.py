@@ -33,6 +33,13 @@ log = get_logger("market.estimator")
 FAV_JUMP_MULT = 0.7  # favorite-won-set jump threshold multiplier (asymmetry)
 BASE_CONFIDENCE = 0.72
 CONFIDENCE_CAP = 0.95
+# price-plausibility guards on the 'final' state: a decided match trades near a
+# terminal price (winner ~99¢). An inferred 'final' while the market is a
+# coin-flip is noise (the detector over-counted a boundary). Require the winner's
+# mid ≥ FINAL_MID_MIN to ENTER final; if an existing 'final' is contradicted by a
+# live quote below UNSTICK_MID, revert it (hysteresis avoids flapping).
+FINAL_MID_MIN = 80
+UNSTICK_MID = 70
 
 
 @dataclass
@@ -131,11 +138,25 @@ class SetBoundaryEstimator:
     def on_quote(self, ts: datetime, yes_bid: int | None, yes_ask: int | None,
                  degraded: bool = False) -> None:
         self.last_tick_at = ts
-        if self.final or yes_bid is None or yes_ask is None:
+        if yes_bid is None or yes_ask is None:
             return
         mid = (yes_bid + yes_ask) / 2
-        if degraded:
-            return  # REST-fallback ticks never trigger boundary detection
+        # self-heal: an inferred 'final' contradicted by a live coin-flip price was
+        # a mis-count — revert it so the read keeps tracking the live match instead
+        # of freezing (e.g. "plan done" at 54/46). Only a real, non-degraded quote.
+        if self.final and not degraded:
+            winner_mid = mid if self.sets_a >= self.need else 100 - mid
+            if winner_mid < UNSTICK_MID:
+                self.final = False
+                self.sets_a = min(self.sets_a, self.need - 1)
+                self.sets_b = min(self.sets_b, self.need - 1)
+                self.confidence = min(self.confidence, BASE_CONFIDENCE)
+                log.info("estimator un-final — live price contradicts final",
+                         ticker=self.ticker, mid=round(mid, 1),
+                         sets=f"{self.sets_a}-{self.sets_b}")
+                self.persist(self.snapshot())
+        if self.final or degraded:
+            return  # final (corroborated) or REST-fallback: no boundary detection
         self._quotes.append((ts, mid))
         self._prune(ts)
         self._detect(ts)
@@ -188,6 +209,19 @@ class SetBoundaryEstimator:
 
     def _transition(self, yes_won_set: bool, now: datetime, jump: float,
                     traded: int, plausibility: float, threshold: float) -> None:
+        # would this boundary end the match? if so, require the price to
+        # corroborate a decided match — otherwise it's a mis-count on noise and we
+        # reject it (a finished match isn't priced as a coin-flip).
+        prosp_a = self.sets_a + (1 if yes_won_set else 0)
+        prosp_b = self.sets_b + (0 if yes_won_set else 1)
+        if prosp_a >= self.need or prosp_b >= self.need:
+            _, latest_mid = self._quotes[-1]
+            winner_mid = latest_mid if yes_won_set else 100 - latest_mid
+            if winner_mid < FINAL_MID_MIN:
+                log.info("final boundary rejected — price not terminal",
+                         ticker=self.ticker, winner_mid=round(winner_mid, 1),
+                         jump=round(jump, 1))
+                return
         if yes_won_set:
             self.sets_a += 1
         else:

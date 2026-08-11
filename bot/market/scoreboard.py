@@ -34,7 +34,8 @@ def parse_scoreboard(details: dict, yes_is_c1: bool) -> dict | None:
     c1_rounds = details.get("competitor1_round_scores") or []
     c2_rounds = details.get("competitor2_round_scores") or []
     status = (details.get("status") or "").lower()
-    is_final = status in ("closed", "ended", "complete", "finished")
+    is_final = (status in ("closed", "ended", "complete", "finished")
+                or "retire" in status or "walk" in status)
 
     # completed-set game pairs, competitor-1 perspective
     completed = []
@@ -115,9 +116,18 @@ def record_snapshot(db: Session, market_ticker: str, event_ticker: str | None,
         return False  # nothing changed since last poll
     from datetime import timezone
 
-    stats = {k: details.get(k) for k in
-             ("competitor1_statistics", "competitor2_statistics", "advantage")
-             if details.get(k) is not None}
+    # store the live serve/return stats ALREADY ORIENTED to our sides
+    # (yes = the market's YES player, opp = the other) so the UI never has to
+    # re-derive the competitor↔player mapping — the raw competitor1/2 labels
+    # carry no reliable orientation once persisted.
+    c1 = details.get("competitor1_statistics")
+    c2 = details.get("competitor2_statistics")
+    stats = {}
+    if c1 is not None and c2 is not None:
+        stats["yes_statistics"] = c1 if yes_is_c1 else c2
+        stats["opp_statistics"] = c2 if yes_is_c1 else c1
+    if details.get("advantage") is not None:
+        stats["advantage"] = details["advantage"]
     db.add(MatchScoreLog(
         market_ticker=market_ticker, event_ticker=event_ticker,
         ts=datetime.now(timezone.utc), detail=stats or None, **sb))

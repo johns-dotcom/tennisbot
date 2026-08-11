@@ -280,12 +280,18 @@ class SackmannDataSource(TennisDataSource):
                 if not full and self._get_watermark(db, wm_key) == tree[fname]:
                     result.skipped_files += 1
                     continue
+                before = set(pmap)  # players known before this file
                 try:
                     self._sync_matches_file(db, tour, repo, fname, pmap, result)
                     self._set_watermark(db, wm_key, tree[fname])
                     db.commit()
                 except Exception as e:  # keep going; one bad file must not kill the run
                     db.rollback()
+                    # rollback discarded any players _ensure_player flushed for this
+                    # file — evict their now-dangling ids from pmap so a later file
+                    # re-creates them instead of referencing a non-existent row
+                    for k in set(pmap) - before:
+                        pmap.pop(k, None)
                     result.errors.append(f"{fname}: {e}")
                     log.error("file ingest failed", file=fname, error=str(e))
         return result

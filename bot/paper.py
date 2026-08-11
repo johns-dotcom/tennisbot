@@ -28,6 +28,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from bot.log import get_logger
+from bot.market.line_move import adverse_prematch, market_move_cents
 from bot.models import KalshiMarket, PaperBet
 from bot.track import advisory_outcome, advisory_pnl_cents
 
@@ -101,10 +102,15 @@ def tier_prob_floor(tier: str | None, policy: Policy = DEFAULT_POLICY) -> float:
 
 
 def policy_ok(prob: float, edge: float, price: int, tier: str | None,
-              policy: Policy = DEFAULT_POLICY) -> bool:
-    """The single bet gate, shared by the prematch and advisory paths (and both
-    bots) so they can never drift: calibrated-band favorite, sane edge/price."""
-    return (prob >= tier_prob_floor(tier, policy)
+              policy: Policy = DEFAULT_POLICY,
+              confidence: float | None = None) -> bool:
+    """The single bet gate, shared by the prematch and advisory paths (and all
+    bots) so they can never drift: calibrated-band favorite, sane edge/price,
+    and — when the caller supplies it — the model-confidence (data-depth) floor.
+    Pass `confidence` from every path so the live/top5 bots gate on it too, not
+    just the prematch path via decide_bet."""
+    return ((confidence is None or confidence >= policy.min_conf)
+            and prob >= tier_prob_floor(tier, policy)
             and policy.min_edge <= edge <= policy.max_edge
             and policy.min_price <= price <= policy.max_price)
 
@@ -172,10 +178,21 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
               basis: str, tier: str | None, state: str = "0-0",
               reasoning: dict | None = None, bot: str = "pre",
               policy_version: str = POLICY_VERSION) -> bool:
-    """One bet per event per bot. Returns True if placed."""
+    """One bet per event per bot. Returns True if placed.
+
+    Records line movement (our side's drift from the open) on EVERY bet, and
+    for PRE-MATCH bets applies the adverse-selection gate: skip when our side
+    has fallen since the open (the market faded our pick). The chalk control is
+    exempt — it must stay a pure market-favorite baseline. In-play bets record
+    the move but are not gated (an in-play drift is the score, not news)."""
     exists = db.execute(select(PaperBet.id).where(
         PaperBet.bot == bot, PaperBet.event_ticker == event_ticker)).first()
     if exists:
+        return False
+    move = market_move_cents(db, market_ticker, decision.side, decision.price_cents)
+    if bot != "chalk" and basis == "prematch" and adverse_prematch(move):
+        log.info("PAPER BET SKIPPED — adverse pre-match line move", bot=bot,
+                 event=event_ticker, side=decision.side, move=move)
         return False
     db.add(PaperBet(
         created_at=datetime.now(timezone.utc), bot=bot, event_ticker=event_ticker,
@@ -185,7 +202,7 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
         units=round(max(1.0, min(MAX_UNITS, decision.units)), 1), tier=tier,
         state_at_placement=state,
         reasoning={**(reasoning or {}), "policy_reason": decision.reason,
-                   "policy_version": policy_version}))
+                   "policy_version": policy_version, "market_move": move}))
     db.commit()
     log.info("PAPER BET PLACED", bot=bot, event=event_ticker, side=decision.side,
              price=decision.price_cents, prob=decision.prob, edge=decision.edge,
@@ -193,15 +210,21 @@ def place_bet(db: Session, *, event_ticker: str, market_ticker: str,
     return True
 
 
-def _apply_settlement(bet, result: str, source: str) -> None:
+def _apply_settlement(bet, result: str, source: str) -> bool:
+    """Settle one bet from a market/scoreline result. Returns True if the result
+    was actionable (yes/no/void) and the bet moved to a settled state; False for
+    an unrecognised/empty result (bet left untouched)."""
     outcome = advisory_outcome(bet.side, result)
     if outcome is None:
-        return
+        return False
     bet.status = outcome if outcome in ("won", "lost") else "void"
     per = advisory_pnl_cents(bet.side, bet.price_cents, result)
-    bet.pnl_cents = per * (bet.units or 1) if per is not None else None
+    # units is decimal (Float); pnl_cents is Float too, so multi-unit P&L keeps
+    # its fractional cents instead of being silently rounded into an int column.
+    bet.pnl_cents = round(per * (bet.units or 1), 2) if per is not None else None
     bet.settled_at = datetime.now(timezone.utc)
     bet.reasoning = {**(bet.reasoning or {}), "settled_from": source}
+    return True
 
 
 def settle_open_bets(db: Session) -> int:
@@ -221,10 +244,10 @@ def settle_open_bets(db: Session) -> int:
         .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)
         .where(PaperBet.status == "open", KalshiMarket.result.is_not(None))).all()
     for bet, result in rows:
-        _apply_settlement(bet, result, "kalshi_result")
-        n += 1
-        log.info("paper bet settled", event=bet.event_ticker, bot=bet.bot,
-                 outcome=bet.status, pnl=bet.pnl_cents)
+        if _apply_settlement(bet, result, "kalshi_result"):
+            n += 1
+            log.info("paper bet settled", event=bet.event_ticker, bot=bet.bot,
+                     outcome=bet.status, pnl=bet.pnl_cents)
 
     # 2) fallback — match finished (final scoreline) but market not yet settled
     open_rest = db.execute(
@@ -244,16 +267,18 @@ def settle_open_bets(db: Session) -> int:
         log.info("paper bet settled (scoreline)", event=bet.event_ticker,
                  bot=bet.bot, outcome=bet.status, pnl=bet.pnl_cents)
 
-    # 3) correction — a scoreline-settled bet whose market result now disagrees
+    # 3) correction — a scoreline-settled bet whose authoritative market result
+    # now disagrees. Include "void" (a walkover/void reverses a scoreline win),
+    # not just yes/no, so a scoreline-won bet later voided gets corrected too.
     prov = db.execute(
         select(PaperBet, KalshiMarket.result)
         .join(KalshiMarket, KalshiMarket.ticker == PaperBet.market_ticker)
         .where(PaperBet.status.in_(("won", "lost")),
-               KalshiMarket.result.in_(("yes", "no")),
+               KalshiMarket.result.in_(("yes", "no", "void")),
                PaperBet.reasoning["settled_from"].astext == "scoreline")).all()
     for bet, result in prov:
-        want = advisory_outcome(bet.side, result)
-        if want in ("won", "lost") and want != bet.status:
+        want = advisory_outcome(bet.side, result)  # won|lost|void|None
+        if want is not None and want != bet.status:
             _apply_settlement(bet, result, "kalshi_result_corrected")
             log.warning("paper bet corrected on settlement", event=bet.event_ticker,
                         bot=bet.bot, to=bet.status)

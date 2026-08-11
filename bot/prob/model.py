@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from datetime import date
 
 
 @dataclass(frozen=True)
@@ -41,5 +42,9 @@ class WinProbabilityModel(ABC):
 
     @abstractmethod
     def predict(self, player_a: int, player_b: int, surface: str | None,
-                tier: str | None, match_state: MatchState) -> Prediction:
+                tier: str | None, match_state: MatchState,
+                as_of: date | None = None) -> Prediction:
+        """as_of: the prediction date. When given, recency-based confidence is
+        decayed forward to that date (so a layoff since a player's last match
+        lowers confidence at prediction time, not one match too late)."""
         ...

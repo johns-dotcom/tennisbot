@@ -17,13 +17,14 @@ import json
 import os
 import random
 import signal
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 from sqlalchemy import select
 
 from bot.config import settings
 from bot.db import session as db_session
 from bot.log import get_logger
+from bot.market.derivatives import refresh_derivatives
 from bot.market.discovery import discover_markets
 from bot.market.estimator import SetBoundaryEstimator
 from bot.market.kalshi import KalshiClient, dollars_to_cents
@@ -35,7 +36,10 @@ from bot.models import FeedGap, KalshiMarket, LiveMatchState, StateInferenceLog
 log = get_logger("watch")
 
 SERIES_TIER = {"KXATPMATCH": "A", "KXWTAMATCH": "A", "KXWTAGAME": "A",
-               "KXATPCHALLENGERMATCH": "C", "KXITFMATCH": "15", "KXITFWMATCH": "15"}
+               "KXATPCHALLENGERMATCH": "C", "KXWTACHALLENGERMATCH": "C",
+               "KXITFMATCH": "15", "KXITFWMATCH": "15"}
+
+WS_CHANNELS = ["ticker", "trade", "market_lifecycle_v2"]
 
 
 def utcnow() -> datetime:
@@ -72,6 +76,9 @@ class WatchService:
         self.recorder: MarketRecorder | None = None
         self.ws_connected = False
         self.disconnect_at: datetime | None = None
+        self.ws = None                     # live websocket, for incremental subscribes
+        self.subscribed: set[str] = set()  # tickers currently subscribed on the ws
+        self._ws_id = 1                    # monotonic ws command id
         self.priors_by_bucket: dict[str, object] = {}
         self.advisory_hook = None  # Phase 5 plugs in here
 
@@ -135,6 +142,7 @@ class WatchService:
                             KalshiMarket.status.in_(["active", "open"]),
                             KalshiMarket.player_a_id.is_not(None))
                     ).scalars().all()
+                    prev = self.watched  # carry live_status across the rebuild
                     self.watched = {
                         r.ticker: {
                             "event_ticker": r.event_ticker,
@@ -142,9 +150,24 @@ class WatchService:
                             "series": (r.raw or {}).get("_series", "KXATPMATCH"),
                             "title": r.title,
                             "occurrence": (r.raw or {}).get("occurrence_datetime"),
+                            # don't lose the in-memory live flag on every discovery
+                            # cycle — fall back to the persisted status
+                            "live_status": (prev.get(r.ticker, {}).get("live_status")
+                                            or (r.raw or {}).get("_live_status")),
                         } for r in rows
                     }
                 log.info("watch set updated", markets=len(self.watched))
+                # stream newly-discovered markets immediately (no reconnect wait)
+                await self._sync_subscriptions()
+                # Non-match-winner markets (set winner, exact score, ...) for the
+                # matches we just discovered. Its own table, read by the My Bets
+                # ledger only — nothing here reaches the watch set, the advisory
+                # engine or the paper bots, so a failure can't affect the bot.
+                try:
+                    with db_session() as db:
+                        await asyncio.to_thread(refresh_derivatives, db, self.client)
+                except Exception as e:
+                    log.error("derivative refresh error", error=str(e))
             except Exception as e:
                 log.error("discovery loop error", error=str(e))
             try:
@@ -174,20 +197,50 @@ class WatchService:
                                               ping_interval=10, ping_timeout=10) as ws:
                     self._on_connect()
                     backoff = 1.0
+                    self._ws_id += 1
                     await ws.send(json.dumps({
-                        "id": 1, "cmd": "subscribe",
-                        "params": {"channels": ["ticker", "trade", "market_lifecycle_v2"],
+                        "id": self._ws_id, "cmd": "subscribe",
+                        "params": {"channels": WS_CHANNELS,
                                    "market_tickers": sorted(self.watched)}}))
+                    # expose the live socket so discovery can incrementally
+                    # subscribe newly-found markets without waiting for a reconnect
+                    self.ws = ws
+                    self.subscribed = set(self.watched)
                     async for raw in ws:
                         self._on_ws_message(json.loads(raw))
                         if self.stop.is_set():
                             break
             except Exception as e:
                 log.error("websocket dropped", error=str(e))
+            self.ws = None
+            self.subscribed = set()
             self._on_disconnect()
             jitter = random.uniform(0, backoff / 2)
             await asyncio.sleep(min(60.0, backoff + jitter))
             backoff = min(60.0, backoff * 2)
+
+    async def _sync_subscriptions(self) -> None:
+        """Subscribe the live websocket to any newly-discovered markets without
+        waiting for a reconnect. Add-only: settled/removed tickers keep streaming
+        harmlessly (ignored by _on_ws_message) and get cleared on the next
+        reconnect. Fixes the gap where a match discovered mid-connection received
+        no live quotes until the socket happened to drop."""
+        ws = self.ws
+        if ws is None:
+            return  # not connected → next connect subscribes the full set
+        new = sorted(t for t in self.watched if t not in self.subscribed)
+        if not new:
+            return
+        self._ws_id += 1
+        try:
+            await ws.send(json.dumps({
+                "id": self._ws_id, "cmd": "subscribe",
+                "params": {"channels": WS_CHANNELS, "market_tickers": new}}))
+            self.subscribed.update(new)
+            log.info("ws incremental subscribe", added=len(new),
+                     subscribed=len(self.subscribed))
+        except Exception as e:
+            log.warning("ws incremental subscribe failed", error=str(e))
 
     def _on_connect(self) -> None:
         now = utcnow()
@@ -288,9 +341,16 @@ class WatchService:
                 for ticker, info in self.watched.items():
                     ev = info.get("event_ticker")
                     st = statuses.get(ev)
-                    if st and info.get("live_status") != st:
-                        info["live_status"] = st
-                        changed[ev] = st
+                    prev = info.get("live_status")
+                    if st:
+                        if prev != st:
+                            info["live_status"] = st
+                            changed[ev] = st
+                    elif prev and prev != "ended":
+                        # was live, now gone from the milestone feed → finished.
+                        # Clear it so ended matches stop displaying as live.
+                        info["live_status"] = "ended"
+                        changed[ev] = "ended"
                 if changed:
                     with db_session() as db:
                         rows = db.execute(select(KalshiMarket).where(
@@ -392,18 +452,48 @@ class WatchService:
                 log.info("score poll cycle", active=len(active), polled=polled,
                          scored=scored)
             try:
+                await self._api_tennis_score_backup()
+            except Exception as e:
+                log.warning("api-tennis score backup failed", error=str(e))
+            try:
                 await asyncio.wait_for(self.stop.wait(),
                                        timeout=self.cfg.kalshi_score_poll_interval_s)
             except asyncio.TimeoutError:
                 pass
+
+    async def _api_tennis_score_backup(self) -> None:
+        """Fill live scores for watched matches Kalshi doesn't score (mostly ITF/
+        Challenger) from api-tennis. Throttled to ≤1 call/min, and only when there
+        are watched events. No-op without an API key."""
+        from bot.config import settings as _settings
+        if not _settings().api_tennis_key:
+            return
+        now = utcnow()
+        if getattr(self, "_at_next", None) and now < self._at_next:
+            return
+        self._at_next = now + timedelta(seconds=60)  # cost guard: ≤1 livescore/min
+        evs = {i["event_ticker"] for i in self.watched.values()
+               if i.get("event_ticker")}
+        if not evs:
+            return
+        if getattr(self, "_at", None) is None:
+            from bot.sources.api_tennis import ApiTennisSource
+            self._at = ApiTennisSource()
+        events = await asyncio.to_thread(self._at.live_scores)
+        if not events:
+            return
+        from bot.market.api_tennis_live import backfill
+        with db_session() as db:
+            backfill(db, events, evs)
 
     @staticmethod
     def _yes_is_competitor1(ticker: str, info: dict, payload: dict) -> bool:
         """Heuristic: competitor1 is the first-named player in the event title
         ('Rocha vs Martinez'); market ticker suffix is built from that surname."""
         title = (info.get("title") or "")
-        first_surname = title.replace("Will ", "").split(" vs ")[0].strip().split()[-1] \
-            if " vs " in title else ""
+        left = title.replace("Will ", "").split(" vs ")[0].strip() if " vs " in title else ""
+        toks = left.split()
+        first_surname = toks[-1] if toks else ""  # empty left side must not IndexError
         suffix = ticker.rsplit("-", 1)[-1].upper()
         return bool(first_surname) and first_surname.upper().startswith(suffix[:3])
 
@@ -415,7 +505,8 @@ class WatchService:
         matches get none — the policy in bot/paper.py decides."""
         from bot.paper import decide_bet, place_bet
         from bot.prob.model import MatchState
-        from bot.t2 import iter_bot_policies, place_top5_bets
+        from bot.t2 import (
+            iter_bot_policies, place_chalk_bets, place_freshadj_bets, place_top5_bets)
 
         while not self.stop.is_set():
             if self.advisory_hook is None or not self.watched:
@@ -431,6 +522,22 @@ class WatchService:
                     log.info("top-5 daily bets placed", count=n)
             except Exception as e:
                 log.warning("top-5 placement failed", error=str(e))
+            # chalk control: back the market favorite on every scenario (baseline)
+            try:
+                with db_session() as db:
+                    nc = place_chalk_bets(db)
+                if nc:
+                    log.info("chalk control bets placed", count=nc)
+            except Exception as e:
+                log.warning("chalk placement failed", error=str(e))
+            # freshadj experiment: top plays on the fatigue/form-adjusted prob
+            try:
+                with db_session() as db:
+                    nf = place_freshadj_bets(db)
+                if nf:
+                    log.info("freshadj bets placed", count=nf)
+            except Exception as e:
+                log.warning("freshadj placement failed", error=str(e))
             candidates: dict[str, dict] = {}
             for ticker, info in self.watched.items():
                 occ_raw = info.get("occurrence") or ""
@@ -460,8 +567,8 @@ class WatchService:
                 yb = dollars_to_cents(m.get("yes_bid_dollars"))
                 ya = dollars_to_cents(m.get("yes_ask_dollars"))
                 pred = self.advisory_hook.model.predict(
-                    ctx["player_a_id"], ctx["player_b_id"], None, ctx["tier"],
-                    MatchState(0, 0, ctx["best_of"]))
+                    ctx["player_a_id"], ctx["player_b_id"], ctx.get("surface"),
+                    ctx["tier"], MatchState(0, 0, ctx["best_of"]), as_of=date.today())
                 with db_session() as db:
                     for bot, policy in iter_bot_policies(db, "prematch"):
                         decision = decide_bet(pred.p_a, pred.confidence, ya, yb,

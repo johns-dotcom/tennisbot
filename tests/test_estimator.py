@@ -147,6 +147,40 @@ def test_match_reaches_final():
     assert est.final
 
 
+def test_final_rejected_when_price_not_terminal():
+    # 1-0, then a second 'yes won set' jump that ends at a coin-flip price (<80¢):
+    # a finished match isn't priced ~55¢, so the final boundary is rejected.
+    est, _ = build()
+    est.on_trade(T0, 60, 10)
+    feed_boundary(est, T0 + timedelta(minutes=30))          # → 1-0
+    feed_boundary(est, T0 + timedelta(minutes=65), mid_from=62, mid_to=76)
+    assert not est.final
+    assert est.state_key == "1-0"
+
+
+def test_stuck_final_reverts_on_coinflip_quote():
+    # reach a legit final at a terminal price, then a live coin-flip quote arrives:
+    # the final was contradicted → revert so the read isn't frozen.
+    est, _ = build()
+    est.on_trade(T0, 60, 10)
+    feed_boundary(est, T0 + timedelta(minutes=30))
+    feed_boundary(est, T0 + timedelta(minutes=65), mid_from=75, mid_to=92)
+    assert est.final
+    est.on_quote(T0 + timedelta(minutes=80), 53, 55)        # coin-flip, non-degraded
+    assert not est.final
+    assert est.state_key != "final"
+
+
+def test_degraded_coinflip_does_not_unfinal():
+    # a REST-fallback (degraded) coin-flip quote must NOT revert a final
+    est, _ = build()
+    est.on_trade(T0, 60, 10)
+    feed_boundary(est, T0 + timedelta(minutes=30))
+    feed_boundary(est, T0 + timedelta(minutes=65), mid_from=75, mid_to=92)
+    est.on_quote(T0 + timedelta(minutes=80), 53, 55, degraded=True)
+    assert est.final
+
+
 def test_restore_roundtrip():
     est, _ = build()
     est.on_trade(T0, 60, 10)

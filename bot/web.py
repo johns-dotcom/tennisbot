@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import base64
 import html
+import json
 import os
 from datetime import date, datetime, timedelta, timezone
 from urllib.parse import quote
@@ -418,8 +419,9 @@ table.t.lb td .sub2 { font-size: 10.5px; }
 .modal { background: var(--surface); border: 1px solid var(--divider-strong);
   border-radius: 12px; padding: 22px; width: 100%; max-width: 400px; }
 .modal h4 { font-size: 17px; margin: 0 0 4px; }
-.modal .side-pick { display: flex; gap: 8px; margin: 14px 0; }
-.modal .side-pick button { flex: 1; background: var(--surface-2);
+/* wraps so N-way markets (exact score has 4 outcomes) stay readable */
+.modal .side-pick { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+.modal .side-pick button { flex: 1 1 44%; background: var(--surface-2);
   border: 1px solid var(--divider-strong); color: var(--text); font: inherit;
   font-weight: 700; padding: 10px 8px; border-radius: 8px; cursor: pointer; }
 .modal .side-pick button.sel { border-color: var(--accent); color: var(--text);
@@ -432,6 +434,18 @@ table.t.lb td .sub2 { font-size: 10.5px; }
 .modal .mrow { display: flex; gap: 12px; }
 .modal .mrow > div { flex: 1; }
 .modal .cost { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+/* "Other markets" on a match — one card per Kalshi event (set winner, exact
+   score, total games ...), each listing its outcomes and their asks */
+.dm-wrap { display: grid; gap: 12px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
+.dm-group { background: var(--surface); border: 1px solid var(--divider);
+  border-radius: var(--radius-sm); padding: 12px 14px; }
+.dm-head { display: flex; align-items: center; justify-content: space-between;
+  gap: 8px; font-weight: 700; font-size: 13px; margin-bottom: 8px;
+  padding-bottom: 8px; border-bottom: 1px solid var(--divider); }
+.dm-opt { display: flex; align-items: baseline; justify-content: space-between;
+  gap: 10px; padding: 3px 0; font-size: 13px; color: var(--muted); }
+.dm-opt span:last-child { color: var(--text); font-weight: 600; }
 .modal .mbtns { display: flex; gap: 10px; margin-top: 18px; }
 .modal .mbtns button { flex: 1; font: inherit; font-weight: 700; padding: 10px;
   border-radius: 6px; cursor: pointer; border: 1px solid var(--divider-strong); }
@@ -832,6 +846,88 @@ def _bet_btn(ev_ticker: str, a, b, quotes: dict, csrf: str,
         f'data-a-tk="{esc(a.ticker)}" data-a-nm="{esc(n0)}" data-a-px="{p0 or ""}" '
         f'data-b-tk="{esc(b.ticker)}" data-b-nm="{esc(n1)}" data-b-px="{p1 or ""}">'
         f'{esc(label)}</span>')
+
+
+def _derivative_bet_btn(ev_ticker: str, opts: list[dict], csrf: str,
+                        what: str, opp: str) -> str:
+    """'＋ bet' for a non-match-winner market. Same client-side modal as the
+    match-winner control, but N-way: exact score has four outcomes, total games
+    has as many as Kalshi lists. `ev_ticker` is the MATCH event so the ledger's
+    'match →' link still lands on the match page."""
+    if not csrf or not opts:
+        return ""
+    return (f'<span class="betbtn" role="button" tabindex="0" title="Log a bet" '
+            f'data-ev="{esc(ev_ticker)}" data-csrf="{esc(csrf)}" '
+            f'data-what="{esc(what)}" data-opp="{esc(opp)}" '
+            f'data-opts="{esc(json.dumps(opts))}">＋ bet</span>')
+
+
+def _derivative_section(match_event_ticker: str, csrf: str) -> str:
+    """The other Kalshi markets on this match — set winner, exact score, total
+    games and whatever else Kalshi has listed — each with a control to log a
+    personal bet. Read-only market data; the app still places no orders.
+
+    These are NOT priced by the model: the probability engine covers match winner
+    only, so no edge or advisory is shown here, just Kalshi's own prices."""
+    from bot.market.derivatives import KIND_ORDER, kind_label
+    from bot.models import DerivativeMarket
+
+    with db_session() as db:
+        rows = db.execute(select(DerivativeMarket).where(
+            DerivativeMarket.match_event_ticker == match_event_ticker,
+            DerivativeMarket.result.is_(None))
+            .order_by(DerivativeMarket.event_ticker,
+                      DerivativeMarket.ticker)).scalars().all()
+        rows = [_DerivRow(r) for r in rows]
+    if not rows:
+        return ""
+    groups: dict[str, list] = {}
+    for r in rows:
+        groups.setdefault(r.event_ticker, []).append(r)
+
+    def sort_key(item):
+        rs = item[1]
+        k = rs[0].kind
+        return (KIND_ORDER.index(k) if k in KIND_ORDER else 99, rs[0].set_no or 0)
+
+    blocks = []
+    for _ev, rs in sorted(groups.items(), key=sort_key):
+        head = kind_label(rs[0].kind, rs[0].set_no)
+        opp = rs[0].match_label or ""
+        opts = [{"tk": r.ticker, "nm": r.label or r.ticker,
+                 "px": r.price if r.price is not None else ""} for r in rs]
+        cells = "".join(
+            f'<div class="dm-opt"><span>{esc(r.label or r.ticker)}</span>'
+            f'<span class="mono">{(str(r.price) + "¢") if r.price is not None else "—"}</span>'
+            f'</div>' for r in rs)
+        blocks.append(
+            f'<div class="dm-group"><div class="dm-head">{esc(head)}'
+            f'{_derivative_bet_btn(match_event_ticker, opts, csrf, head, opp)}</div>'
+            f'{cells}</div>')
+    return (
+        '<section class="block"><div class="blockhead"><h4>Other markets</h4>'
+        '<span class="aside">Kalshi\'s other markets on this match · prices are '
+        'Kalshi\'s ask · the model does not price these, so no edge is shown</span>'
+        '</div><div class="rule"></div>'
+        f'<div class="dm-wrap">{"".join(blocks)}</div></section>')
+
+
+class _DerivRow:
+    """Detached snapshot of a DerivativeMarket — the section reads it after the
+    session closes, and picks the executable price (the ask on the side you would
+    buy, per CLAUDE.md), falling back to the last trade."""
+
+    __slots__ = ("ticker", "event_ticker", "kind", "set_no", "label",
+                 "match_label", "price")
+
+    def __init__(self, r):
+        self.ticker = r.ticker
+        self.event_ticker = r.event_ticker
+        self.kind = r.kind
+        self.set_no = r.set_no
+        self.label = r.label
+        self.match_label = r.match_label
+        self.price = r.yes_ask_cents if r.yes_ask_cents else r.last_price_cents
 
 
 def _fav_player_ids(db, user) -> set[int]:
@@ -1414,30 +1510,40 @@ function bindProfMore(){
    document.querySelectorAll('.prof-toggle').forEach(function(x){x.textContent = now?'− Less stats':'＋ More stats';});
   });});}
 function openBetModal(b){
- var sideT=b.dataset.aTk, sideN=b.dataset.aNm, sidePx=b.dataset.aPx;
- var oppN=b.dataset.bNm;
+ // Options come as JSON (data-opts) so this works for any Kalshi market on the
+ // match, not just the two match-winner sides: exact score has 4 outcomes,
+ // total games has N. data-opp is what the ledger shows as the context line.
+ var opts;
+ try{opts=JSON.parse(b.dataset.opts||'[]');}catch(e){opts=[];}
+ if(!opts.length) opts=[{tk:b.dataset.aTk,nm:b.dataset.aNm,px:b.dataset.aPx},
+                        {tk:b.dataset.bTk,nm:b.dataset.bNm,px:b.dataset.bPx}];
+ var oppN=b.dataset.opp||b.dataset.bNm||'';
  var back=document.createElement('div'); back.className='modal-back';
+ var esc=function(s){return String(s==null?'':s)
+  .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');};
  back.innerHTML=
   '<div class="modal"><h4>Log a bet</h4>'+
-  '<div class="sub2">Records a personal bet — the app places no orders.</div>'+
+  '<div class="sub2">'+(b.dataset.what?esc(b.dataset.what)+' · ':'')+
+   'Records a personal bet — the app places no orders.</div>'+
   '<div class="side-pick">'+
-   '<button data-tk="'+b.dataset.aTk+'" data-nm="'+b.dataset.aNm+'" data-px="'+b.dataset.aPx+'" class="sel">'+b.dataset.aNm+'</button>'+
-   '<button data-tk="'+b.dataset.bTk+'" data-nm="'+b.dataset.bNm+'" data-px="'+b.dataset.bPx+'">'+b.dataset.bNm+'</button>'+
+   opts.map(function(o,i){return '<button data-tk="'+esc(o.tk)+'" data-nm="'+esc(o.nm)+
+    '" data-px="'+esc(o.px)+'"'+(i===0?' class="sel"':'')+'>'+esc(o.nm)+'</button>';}).join('')+
   '</div>'+
   '<div class="mrow"><div><label>PRICE (¢)</label><input id="bp" type="number" inputmode="numeric" min="1" max="99" step="1"></div>'+
   '<div><label>SHARES</label><input id="bs" type="number" inputmode="numeric" min="1" step="1" value="10"></div></div>'+
   '<div><label>TAG (optional — who you tailed; comma-separate for several)</label>'+
-   '<input id="btag" list="bettags" maxlength="64" placeholder="e.g. blvr, clutch" '+
+   '<input id="btag" list="bettags" maxlength="256" placeholder="e.g. blvr, clutch" '+
    'style="width:100%;box-sizing:border-box"></div>'+
   '<div class="cost" id="bcost"></div>'+
   '<div class="mbtns"><button class="cancel">Cancel</button><button class="go">Place bet</button></div></div>';
  document.body.appendChild(back);
+ bindTagInputs(back);   // the modal's tag field is built after page load
  var picks=back.querySelectorAll('.side-pick button');
  var pxIn=back.querySelector('#bp'), shIn=back.querySelector('#bs'), cost=back.querySelector('#bcost');
- var sel={tk:sideT,nm:sideN,px:sidePx};
+ var sel={tk:opts[0].tk,nm:opts[0].nm,px:opts[0].px};
  function paintCost(){var p=+pxIn.value,s=+shIn.value;
   if(p>0&&s>0){var c=(p*s/100).toFixed(2); var win=((100-p)*s/100).toFixed(2);
-   cost.textContent='Cost $'+c+' · wins $'+win+' if '+sel.nm+' wins';}else cost.textContent='';}
+   cost.textContent='Cost $'+c+' · wins $'+win+' if “'+sel.nm+'” hits';}else cost.textContent='';}
  function setPx(){pxIn.value=sel.px||''; paintCost();}
  setPx();
  picks.forEach(function(pb){pb.addEventListener('click',function(){
@@ -1451,8 +1557,11 @@ function openBetModal(b){
   var p=Math.round(+pxIn.value), s=Math.round(+shIn.value);
   if(!(p>=1&&p<=99)||!(s>=1)){cost.textContent='Enter a price 1–99¢ and shares ≥ 1.';return;}
   var tg=(back.querySelector('#btag').value||'').trim();
+  // the "opponent" is whichever other side you did NOT take (two-way markets);
+  // on N-way markets it's the match context passed in as data-opp
+  var other=opts.length===2 ? (opts[0].tk===sel.tk?opts[1].nm:opts[0].nm) : oppN;
   var body='event_ticker='+encodeURIComponent(b.dataset.ev)+'&market_ticker='+encodeURIComponent(sel.tk)+
-   '&player_name='+encodeURIComponent(sel.nm)+'&opponent_name='+encodeURIComponent(oppN)+
+   '&player_name='+encodeURIComponent(sel.nm)+'&opponent_name='+encodeURIComponent(other)+
    '&price='+p+'&shares='+s+'&tag='+encodeURIComponent(tg)+'&csrf='+encodeURIComponent(b.dataset.csrf);
   fetch('/bet',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded'},body:body})
    .then(function(r){if(r.ok){cost.textContent='Saved ✓ — see My Bets.';setTimeout(close,700);}
@@ -1463,6 +1572,29 @@ function bindBets(){
  document.querySelectorAll('.betbtn').forEach(function(b){
   if(b._b) return; b._b=true;
   b.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();openBetModal(b);});
+ });}
+// A tag field holds a comma-separated list, but <input list> matches the datalist
+// against the WHOLE value — so once you type "blvr, cl" nothing suggests. Rewrite
+// the options as you go: match only the tag being typed, offer it with the tags
+// already entered prefixed back on, and hide ones this bet already carries.
+function bindTagInputs(root){
+ var dl=document.getElementById('bettags'); if(!dl) return;
+ if(!dl._base) dl._base=Array.prototype.map.call(
+  dl.querySelectorAll('option'),function(o){return o.value;});
+ (root||document).querySelectorAll('input[list="bettags"]').forEach(function(inp){
+  if(inp._tg) return; inp._tg=true;
+  function refresh(){
+   var v=inp.value, i=v.lastIndexOf(',');
+   var prefix = i<0 ? '' : v.slice(0,i+1)+' ';
+   var typed = (i<0 ? v : v.slice(i+1)).trim().toLowerCase();
+   var used = prefix.split(',').map(function(s){return s.trim().toLowerCase();});
+   while(dl.firstChild) dl.removeChild(dl.firstChild);
+   dl._base.forEach(function(t){
+    var lt=t.toLowerCase();
+    if(used.indexOf(lt)>=0 || lt.indexOf(typed)!==0) return;
+    var o=document.createElement('option'); o.value=prefix+t; dl.appendChild(o);});
+  }
+  inp.addEventListener('input',refresh); inp.addEventListener('focus',refresh);
  });}
 function typing(){var a=document.activeElement;
  return a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName);}
@@ -1505,7 +1637,7 @@ async function refreshMain(){
     var tmp=document.createElement('div'); tmp.innerHTML=h;
     rel(tmp);  // normalize .rel timestamps to relative form so unchanged cards match
     if(!reconcile(tmp, m)){var y=window.scrollY; m.innerHTML=h; window.scrollTo(0,y);}
-    bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore();}
+    bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs();}
    pulse();
   }}catch(e){} rel();}
 function pulse(){var d=document.getElementById('refreshdot');
@@ -1530,7 +1662,7 @@ document.addEventListener('DOMContentLoaded',function(){
  // catch up immediately when the tab comes back to the foreground
  document.addEventListener('visibilitychange',function(){
   if(!document.hidden){refreshMain();pollEvents();}});
- bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore();
+ bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs();
  var bell=document.getElementById('bell');
  function paint(){bell.textContent=Notification.permission==='granted'?'🔔 alerts on':'🔕 enable alerts';}
  if(!('Notification' in window)){bell.style.display='none';return;} paint();
@@ -6612,6 +6744,7 @@ odds-based estimator.</p></section>"""
                f'records to My Bets, places no order</span></div>') if _betbtn else ""
     sections = f"""
 {bet_bar}
+{_derivative_section(event_ticker, csrf)}
 {score_html}
 {livestats_html}
 {h2h_compare_html}
@@ -7031,9 +7164,11 @@ async def bet_create(request: web.Request) -> web.Response:
         return web.json_response({"error": "bad price/shares"}, status=400)
     if not mt or not (1 <= price <= 99) or shares < 1:
         return web.json_response({"error": "invalid bet"}, status=400)
-    # a bet can be tailed from several sources → comma-separated tags
-    tags = _bet_tags(data.get("tag"))
-    tag = (", ".join(tags))[:64] or None
+    # a bet can be tailed from several sources → comma-separated tags. Parse to
+    # the stored form first, then read the list back off it, so the unit lookup
+    # below can only ever see tags that actually made it onto the bet.
+    tag = _norm_tags(data.get("tag"))
+    tags = _bet_tags(tag)
     with db_session() as db:
         from bot.models import AppUser, UserTag
         au = db.get(AppUser, user["id"])
@@ -7202,7 +7337,7 @@ async def bet_edit(request: web.Request) -> web.Response:
             raise web.HTTPFound("/mybets")
         if action == "tag":
             # a bet may carry several comma-separated tails; normalize the list
-            b.tag = (", ".join(_bet_tags(data.get("tag"))))[:64] or None
+            b.tag = _norm_tags(data.get("tag"))
             db.commit()
             raise web.HTTPFound("/mybets")
         if action == "add":
@@ -7307,6 +7442,8 @@ async def mybets(request: web.Request) -> web.Response:
     csrf = webauth.csrf_token(sess) if sess else ""
     uid = user["id"] if user else None
 
+    from bot.models import DerivativeMarket
+
     with db_session() as db:
         rows = db.execute(
             select(UserBet, KalshiMarket)
@@ -7314,6 +7451,16 @@ async def mybets(request: web.Request) -> web.Response:
                   isouter=True)
             .where(UserBet.user_id == uid)
             .order_by(UserBet.created_at.desc())).all() if uid else []
+        # bets on Kalshi's other markets (set winner, exact score, ...) live in
+        # their own table, so the join above leaves them unmatched — fill those in.
+        # A DerivativeMarket exposes .ticker/.raw/.result like a KalshiMarket, so
+        # pricing and settlement below work on either without special-casing.
+        missing = [b.market_ticker for b, mk in rows if mk is None]
+        dmap = {d.ticker: d for d in db.execute(select(DerivativeMarket).where(
+            DerivativeMarket.ticker.in_(missing))).scalars()} if missing else {}
+        if dmap:
+            rows = [(b, mk if mk is not None else dmap.get(b.market_ticker))
+                    for b, mk in rows]
         open_tks = [b.market_ticker for b, _ in rows]
         quotes = _latest_quotes(db, open_tks) if open_tks else {}
         from bot.models import AppUser as _AU
@@ -7336,7 +7483,11 @@ async def mybets(request: web.Request) -> web.Response:
             entry = b.entry_price_cents
             sh = b.shares
             cost = sh * entry / 100.0
-            close = mk.close_yes_cents if mk else None
+            # non-match-winner market → carry it through so the row can be
+            # labelled ("Set 2 winner", "Exact score") instead of "X vs Y"
+            dm = mk if isinstance(mk, DerivativeMarket) else None
+            # derivative markets carry no closing line, so CLV is simply absent
+            close = getattr(mk, "close_yes_cents", None) if mk else None
             clv = clv_cents(b.side, entry, close)
             if b.exit_price_cents is not None:
                 # CASHED OUT — realized at the sell price, regardless of the result
@@ -7354,7 +7505,7 @@ async def mybets(request: web.Request) -> web.Response:
                     clvs.append(clv)
                 settled.append((b, {"outcome": outcome, "exit": "cashed",
                                     "exit_px": ex, "pnl": pnl, "cost": cost,
-                                    "clv": clv}))
+                                    "clv": clv, "dm": dm}))
                 continue
             outcome = advisory_outcome(b.side, mk.result if mk else None)
             if outcome in ("won", "lost", "void"):
@@ -7376,7 +7527,7 @@ async def mybets(request: web.Request) -> web.Response:
                     clvs.append(clv)
                 settled.append((b, {"outcome": outcome, "exit": "held",
                                     "exit_px": None, "pnl": pnl, "cost": cost,
-                                    "clv": clv}))
+                                    "clv": clv, "dm": dm}))
             else:
                 cur = _odds_cents(mk, quotes)[0] if mk else None
                 cur_val = sh * cur / 100.0 if cur is not None else None
@@ -7386,14 +7537,17 @@ async def mybets(request: web.Request) -> web.Response:
                 if u is not None:
                     unreal += u
                 openp.append((b, {"cost": cost, "cur": cur, "mtm": cur_val,
-                                  "unreal": u}))
+                                  "unreal": u, "dm": dm}))
 
         # --- Theoretical exits: apply two fixed policies to EVERY bet whose match
         # has settled, ignoring what the user actually did — (a) hold to the result,
         # (b) sell at 90¢ whenever our side ever reached a 90¢ bid (else the full
         # loss). Same 90¢ take-profit rule the bot leaderboard uses.
+        # match-winner bets only: the 90¢ take-profit policy is the bot's own
+        # match-winner rule, and derivative markets have no tick history to test
+        # it against, so including them would quietly misreport both policies
         settled_rows = [(b, mk) for b, mk in rows
-                        if mk and mk.result in ("yes", "no")]
+                        if isinstance(mk, KalshiMarket) and mk.result in ("yes", "no")]
         max_bid: dict[str, int] = {}
         if settled_rows:
             from sqlalchemy import text as _sq
@@ -7572,6 +7726,21 @@ async def mybets(request: web.Request) -> web.Response:
     # only what is LEFT, so flag it rather than let the share count look wrong
     scaled_ids = {b.parent_bet_id for b, _ in rows if b.parent_bet_id}
 
+    def _pick_cell(b, d):
+        """Pick + context. A match-winner bet reads 'Swiatek / vs Sabalenka'; a bet
+        on one of Kalshi's other markets reads its own outcome and what market it
+        came from — 'Wolf wins 2-1 / Exact score · Wolf vs Samuel'."""
+        from bot.market.derivatives import kind_label
+        dm = d.get("dm")
+        if dm is None:
+            sub = f'vs {b.opponent_name or "?"}'
+        else:
+            sub = kind_label(dm.kind, dm.set_no)
+            if dm.match_label:
+                sub += f" · {dm.match_label}"
+        return (f'{esc(b.player_name)}{_tagchip(b.tag, tag_colors)}'
+                f'<div class="sub2">{esc(sub)}</div>')
+
     def _shares_cell(b):   # what's LEFT, plus what was already sold off
         if b.id not in scaled_ids:
             return str(b.shares)
@@ -7581,8 +7750,7 @@ async def mybets(request: web.Request) -> web.Response:
     # open positions — marked to the live market, each with a cash-out control
     if d_openp:
         orows = "".join(
-            f'<tr><td class="pick">{esc(b.player_name)}{_tagchip(b.tag, tag_colors)}'
-            f'<div class="sub2">vs {esc(b.opponent_name or "?")}</div></td>'
+            f'<tr><td class="pick">{_pick_cell(b, d)}</td>'
             f'<td class="mono" data-label="Entry">{b.entry_price_cents}¢</td>'
             f'<td class="mono" data-label="Shares">{_shares_cell(b)}</td>'
             f'<td class="mono" data-label="Size" title="${d["cost"]:,.2f} staked · ${_unit_of(b):,}/unit">'
@@ -7623,7 +7791,7 @@ async def mybets(request: web.Request) -> web.Response:
         return '<span class="sub2">held → settled</span>'
     if d_settled:
         hrows = "".join(
-            f'<tr><td class="pick">{esc(b.player_name)}{_tagchip(b.tag, tag_colors)} <span class="sub2">vs {esc(b.opponent_name or "?")}</span></td>'
+            f'<tr><td class="pick">{_pick_cell(b, d)}</td>'
             f'<td class="sub2 mono" data-label="Placed">{pt(b.created_at)}</td>'
             f'<td data-label="Result">{tag("good","✓","won") if d["outcome"]=="won" else tag("neutral","·","push") if d["outcome"]=="void" else tag("accent","✕","lost")}</td>'
             f'<td class="mono" data-label="Entry">{b.entry_price_cents}¢ × {b.shares}'
@@ -8000,6 +8168,28 @@ def _tag_color_style(color: str | None) -> str:
     return f";color:{color};border-color:{color}" if color else ""
 
 
+# one tag is capped at TAG_MAX_LEN (matching user_tags.tag); the comma-joined
+# list stored on user_bets.tag is capped at that column's width
+TAG_MAX_LEN = 64
+TAGS_MAX_LEN = 256
+
+
+def _norm_tags(raw, limit: int = TAGS_MAX_LEN) -> str | None:
+    """Parse a comma-separated tag field into the form stored on user_bets.tag.
+
+    Overflow drops WHOLE tags off the end. Slicing the joined string instead (the
+    old behaviour) left a half-written tag — "pinnacle" stored as "pinnacl" — which
+    then showed up in autocomplete and as its own phantom row in the per-tag
+    performance table, permanently and invisibly."""
+    out = ""
+    for t in _bet_tags(raw):
+        nxt = f"{out}, {t[:TAG_MAX_LEN]}" if out else t[:TAG_MAX_LEN]
+        if len(nxt) > limit:
+            break
+        out = nxt
+    return out or None
+
+
 def _bet_tags(tag) -> list[str]:
     """A bet can be tailed from more than one source, so its tag field holds a
     comma-separated list. Split it, trimmed, de-duped (case-insensitive), order
@@ -8123,7 +8313,7 @@ def _edit_form(b, csrf: str) -> str:
         f'<input type="hidden" name="action" value="tag">'
         f'<span class="sub2">tag</span>'
         f'<input name="tag" list="bettags" value="{esc(b.tag or "")}" '
-        f'placeholder="tail(s), comma-sep" maxlength="64" style="width:140px;{inp}">'
+        f'placeholder="tail(s), comma-sep" maxlength="256" style="width:170px;{inp}">'
         f'<button type="submit" class="sub2" style="{btn}">set</button></form>'
         f'</div></details>')
 

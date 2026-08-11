@@ -62,7 +62,10 @@ def test_no_market_identifiers(path):
 
 def test_predict_signature_is_closed():
     params = list(inspect.signature(WinProbabilityModel.predict).parameters)
-    assert params == ["self", "player_a", "player_b", "surface", "tier", "match_state"], \
+    # as_of is a DATE (prediction date, for recency-decayed confidence) — not a
+    # market input. Any price/odds/quote param would still (correctly) fail here.
+    assert params == ["self", "player_a", "player_b", "surface", "tier",
+                      "match_state", "as_of"], \
         "predict() signature changed — price/market inputs must never be added"
 
 

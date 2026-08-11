@@ -162,6 +162,46 @@ class KalshiMarket(Base):
     close_yes_cents: Mapped[int | None] = mapped_column(Integer)
 
 
+class DerivativeMarket(Base):
+    """A Kalshi tennis market on a match that is NOT the match winner — set
+    winner, exact match score, total games and friends.
+
+    Deliberately its own table rather than more rows in kalshi_markets. The
+    probability engine models match winner only, and every part of the bot
+    (discovery, the advisory engine, the paper bots, scenarios, the watch loop)
+    reads kalshi_markets — so putting these there would feed the pipeline markets
+    it cannot price. Nothing in the bot reads this table; it exists purely so a
+    user can log a personal bet on one of these and have it settle. Read-only
+    market data, and still no orders anywhere (CLAUDE.md rule 1)."""
+
+    __tablename__ = "derivative_markets"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(96), unique=True)
+    event_ticker: Mapped[str] = mapped_column(String(96), index=True)
+    series_ticker: Mapped[str] = mapped_column(String(64))
+    # 'set_winner' | 'exact_score' | 'total_games' | 'total_sets' | ...
+    kind: Mapped[str] = mapped_column(String(24), index=True)
+    # the kalshi_markets event this hangs off, e.g. 'KXATPMATCH-26AUG10DARNAK'.
+    # A plain string, NOT a foreign key — kalshi_markets rows can be re-discovered
+    # and this must never cascade into the bot's own tables.
+    match_event_ticker: Mapped[str] = mapped_column(String(96), index=True)
+    set_no: Mapped[int | None] = mapped_column(Integer)   # set_winner only
+    label: Mapped[str | None] = mapped_column(String(160))  # Kalshi's yes_sub_title
+    match_label: Mapped[str | None] = mapped_column(String(160))  # 'A vs B'
+    title: Mapped[str | None] = mapped_column(Text)
+    status: Mapped[str | None] = mapped_column(String(24))
+    close_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # last seen quote/trade, in cents (YES side)
+    yes_bid_cents: Mapped[int | None] = mapped_column(Integer)
+    yes_ask_cents: Mapped[int | None] = mapped_column(Integer)
+    last_price_cents: Mapped[int | None] = mapped_column(Integer)
+    result: Mapped[str | None] = mapped_column(String(8))  # 'yes' | 'no' | 'void'
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw: Mapped[dict | None] = mapped_column(JSONB)
+
+
 class Advisory(Base):
     __tablename__ = "advisories"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
@@ -527,8 +567,10 @@ class UserBet(Base):
     parent_bet_id: Mapped[int | None] = mapped_column(
         BigInteger, ForeignKey("user_bets.id", ondelete="SET NULL"), index=True)
     note: Mapped[str | None] = mapped_column(String(256))
-    # optional user tag (e.g. a person they tail, or a strategy) — groups the
-    # ledger so per-tag performance can be shown separately. NULL = untagged.
-    tag: Mapped[str | None] = mapped_column(String(64), index=True)
+    # optional user tags (people tailed, strategies) — groups the ledger so
+    # per-tag performance can be shown separately. NULL = untagged. A bet can
+    # carry several, stored comma-joined; each one is capped at 64 chars to match
+    # user_tags.tag, and the joined list at this column's width.
+    tag: Mapped[str | None] = mapped_column(String(256), index=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))

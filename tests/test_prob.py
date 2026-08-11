@@ -56,6 +56,20 @@ def test_elo_update_moves_ratings():
     assert pred.p_a > 0.5
 
 
+def test_surface_specific_rating_changes_prediction():
+    # player 1 dominates on clay, player 2 on hard → their surface ratings split
+    # away from their (roughly even) overall. Supplying the surface must move the
+    # number. Production used to pass surface=None everywhere, so this was dead.
+    m = SetElo()
+    for _ in range(10):
+        m.update_set(1, 2, "Clay", "A")   # 1 wins on clay
+        m.update_set(2, 1, "Hard", "A")   # 2 wins on hard
+    p_clay = m.predict(1, 2, "Clay", "A", MatchState()).p_a
+    p_none = m.predict(1, 2, None, "A", MatchState()).p_a
+    p_hard = m.predict(1, 2, "Hard", "A", MatchState()).p_a
+    assert p_clay > p_none > p_hard   # surface swings the pick the right way
+
+
 def test_elo_prediction_is_symmetric():
     m = SetElo()
     for _ in range(10):
@@ -104,6 +118,23 @@ def test_stale_rating_has_low_confidence():
     assert stale < active
     assert m.ratings[1].sets_seen > m.ratings[3].sets_seen  # lifetime: returnee has more
     assert m.ratings[1].recent < m.ratings[3].recent        # recent: far less
+
+
+def test_confidence_decays_to_prediction_date():
+    import datetime as _dt
+    m = SetElo()
+    last = _dt.date(2026, 1, 1)
+    for i in range(30):  # plenty of recent activity, ending 2026-01-01
+        m.apply_match(1, 2, None, None, [True, False, True],
+                      day=last - _dt.timedelta(days=(29 - i) * 3))
+    fresh = m.predict(1, 2, None, None, MatchState(), as_of=last).confidence
+    # predicting a comeback ~2 years later must read as LOWER confidence, even
+    # though no new match has been applied (the layoff is decayed in at predict)
+    stale = m.predict(1, 2, None, None, MatchState(),
+                      as_of=last + _dt.timedelta(days=730)).confidence
+    assert stale < fresh
+    # and with no as_of the old behavior (undecayed) is preserved
+    assert m.predict(1, 2, None, None, MatchState()).confidence == fresh
 
 
 def test_apply_match_set_results_order():

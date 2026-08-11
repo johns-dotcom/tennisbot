@@ -39,6 +39,7 @@ class MatchRow:
     # {ace, df, svpt, firstin, firstwon, secondwon, svgms, bpsaved, bpfaced}
     serve: dict | None = None
     opp_serve: dict | None = None
+    minutes: int | None = None  # match duration, for recent-load / fatigue
     opp_rank: int | None = None
     player_rank: int | None = None
 

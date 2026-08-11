@@ -27,13 +27,22 @@ from bot.advisory.facts import build_fact_block, build_facts
 from bot.advisory.render import render_prose
 from bot.config import settings
 from bot.log import get_logger
+from bot.market.live_status import is_live_status
 from bot.models import Advisory, KalshiMarket, StateInferenceLog
+from bot.notify import notify_signal
 from bot.prob.elo import SetElo
 from bot.prob.model import MatchState
 
 log = get_logger("engine")
 
 EDGE_BANDS = (0.06, 0.10, 0.15)  # band edges; crossing into a new band re-arms debounce
+# "armed" phone heads-up: a live match reaching its deciding set with the model
+# favouring a side by at least this much (a bet setup is now live). Pushed
+# advisories have their own, stricter gates (edge/volume/confidence).
+ARMED_MIN_PROB = 0.55
+# Discord alerts fire ONLY for tracked scenarios, and ONLY when the alerted
+# side's price is in the toss-up band (user decision 2026-07-23).
+ALERT_PRICE_MIN, ALERT_PRICE_MAX = 35, 65
 
 
 def edge_band(edge: float) -> int:
@@ -56,6 +65,7 @@ class AdvisoryEngine:
         self.pending: dict[str, dict] = {}  # ticker -> {advisory_id, state, block}
         self._profiles: dict[int, tuple] = {}  # player_id -> (profile, history)
         self._hitrate_warned_at: datetime | None = None
+        self._signalled: set[str] = set()  # event_tickers already signal-alerted
 
     # ---------- context ----------
 
@@ -80,6 +90,7 @@ class AdvisoryEngine:
             pa, pb = db.get(Player, row.player_a_id), db.get(Player, sib.player_a_id)
             raw = row.raw or {}
             series = raw.get("_series", "")
+            from bot.stats.surface import live_match_surface
             ctx = {
                 "player_a_id": row.player_a_id, "player_b_id": sib.player_a_id,
                 "name_a": pa.full_name, "name_b": pb.full_name,
@@ -87,6 +98,13 @@ class AdvisoryEngine:
                 "event_ticker": row.event_ticker,
                 "tier": {"KXATPMATCH": "A", "KXWTAMATCH": "A", "KXWTAGAME": "A",
                          "KXATPCHALLENGERMATCH": "C"}.get(series, "15"),
+                # men/women: Player.tour is 'atp' (men, incl. ITF men) or 'wta'
+                # (women, incl. ITF women) — the authoritative gender split
+                "tour": pa.tour,
+                # this match's court → the model applies its surface-specific
+                # rating (else it falls back to overall). Static per match.
+                "surface": live_match_surface(db, row.player_a_id, sib.player_a_id,
+                                               date.today()),
             }
         self.ctx[ticker] = ctx
         return ctx
@@ -149,8 +167,10 @@ class AdvisoryEngine:
             state = MatchState(sa, sb, ctx["best_of"])
         except ValueError:
             return
-        pred = self.model.predict(ctx["player_a_id"], ctx["player_b_id"], None,
-                                  ctx["tier"], state)
+        pred = self.model.predict(ctx["player_a_id"], ctx["player_b_id"],
+                                  ctx.get("surface"), ctx["tier"], state,
+                                  as_of=date.today())
+        self._maybe_arm(ticker, ctx, est, sa, sb, pred)
         # executable price: ask on the side you would buy
         sides = [
             ("yes", pred.p_a, yes_ask),
@@ -175,6 +195,103 @@ class AdvisoryEngine:
         self._fire(ticker, est, side=side, model_prob=model_prob,
                    model_conf=pred.confidence, price=price, volume=volume,
                    state=state, confirmed=confirmed, band=band)
+
+    def _scenario_plan(self, event_ticker: str | None) -> dict | None:
+        """The latest scenario for this event as {market_ticker (watch side),
+        narrative, triggers}, or None if the event isn't a tracked scenario.
+        The alert gate: None ⇒ no Discord alert. triggers is the watch-side
+        set-state list (takes set 1 / drops set 1 / decider), each with the model
+        prob there; falls back to the decider for pre-triggers scenarios."""
+        if not event_ticker:
+            return None
+        from bot.models import Scenario
+        with self.db_session() as db:
+            row = db.execute(select(
+                Scenario.market_ticker, Scenario.narrative, Scenario.facts,
+                Scenario.model_prob_at_state)
+                .where(Scenario.event_ticker == event_ticker)
+                .order_by(Scenario.created_for.desc()).limit(1)).first()
+        if row is None:
+            return None
+        mkt, narr, facts, dec_prob = row
+        triggers = (facts or {}).get("triggers") or [
+            {"kind": "decider", "label": "deciding set", "state": "1-1",
+             "prob": dec_prob}]
+        return {"market_ticker": mkt, "narrative": narr, "triggers": triggers}
+
+
+    def _match_live(self, ticker: str) -> bool:
+        """Is the match started AND not over? The gate for a Discord alert. An
+        authoritative END signal — a posted Kalshi result or a final scoreline —
+        OUTRANKS a live milestone status, so a finished match with a stale 'P'/
+        'live' flag can never keep alerting. (Not-yet-started matches have no
+        started signal; finished ones have an end signal.)"""
+        from bot.models import KalshiMarket, MatchScoreLog
+        with self.db_session() as db:
+            res, raw = db.execute(select(KalshiMarket.result, KalshiMarket.raw)
+                                  .where(KalshiMarket.ticker == ticker)).first() or (None, None)
+            if res is not None:
+                return False  # settled → over
+            row = db.execute(
+                select(MatchScoreLog.total_games, MatchScoreLog.is_final)
+                .where(MatchScoreLog.market_ticker == ticker)
+                .order_by(MatchScoreLog.ts.desc()).limit(1)).first()
+            if row and row[1]:
+                return False  # latest scoreline is final → over
+            started = (is_live_status((raw or {}).get("_live_status"))
+                       or bool(row and (row[0] or 0) > 0))
+            return started
+
+    def _maybe_arm(self, ticker: str, ctx: dict, est, sa: int, sb: int, pred) -> None:
+        """Fire the phone SIGNAL alert when a SCENARIO's trigger fires — ANY of its
+        watch-side set-state triggers (takes set 1 / drops set 1 / decider), not
+        just the decider — with the model still favouring the pick and the price in
+        the toss-up band. Once per EVENT — alerts happen when signals happen."""
+        ev = ctx.get("event_ticker")
+        if ev and ev in self._signalled:
+            return
+        plan = self._scenario_plan(ev)
+        if plan is None:
+            return  # not a tracked scenario
+        # Evaluate ONLY on the watch-side market: its state is in the watch
+        # player's perspective, so an asymmetric trigger (1-0 vs 0-1) reads right.
+        # The sibling ticker's state is mirrored and would misfire.
+        if ticker != plan["market_ticker"]:
+            return
+        state_ok = (est.last_confirmed == est.state_key
+                    or est.confidence >= self.cfg.min_state_confidence)
+        if not (state_ok and pred.confidence >= self.cfg.min_model_confidence):
+            return
+        # the fired trigger: watch state matches a trigger AND the model still
+        # favours the pick there (≥ ARMED_MIN_PROB)
+        trig = next((t for t in plan["triggers"]
+                     if t.get("state") == est.state_key
+                     and (t.get("prob") or 0) >= ARMED_MIN_PROB), None)
+        if trig is None:
+            return
+        # price gate: watch is the YES side of this (watch) ticker — toss-up band
+        yb, ya, _ = self.last_quote.get(ticker, (None, None, None))
+        if ya is None:
+            return
+        price = ya
+        if not (ALERT_PRICE_MIN <= price <= ALERT_PRICE_MAX):
+            return
+        if not self._match_live(ticker):
+            return  # hasn't started / already over
+        self._signalled.add(ev)
+        fav = ctx["name_a"]  # YES of the watch ticker = the watch pick
+        match = f"{ctx['name_a']} vs {ctx['name_b']}"
+        analysis = (f"Trigger fired: {trig['label']} ({est.state_key}), "
+                    f"priced {price}¢.\n\n{plan['narrative']}")
+        # message 1 pings @everyone with just the pick + confidence; message 2
+        # (no ping) carries this analysis and the structured fields.
+        notify_signal(match=match, pick=fav, confidence=f"{trig['prob']:.0%}",
+                      analysis=analysis, kind="armed",
+                      fields=[("Trigger", trig["label"]), ("State", est.state_key),
+                              ("Favours", fav), ("Model", f"{trig['prob']:.0%}"),
+                              ("Price", f"{price}¢")])
+        log.info("SIGNAL alert", ticker=ticker, state=est.state_key,
+                 trigger=trig["kind"], favours=fav, price=price)
 
     def _build_block(self, ticker: str, side: str, model_prob: float,
                      model_conf: float, price: int, volume, state: MatchState,
@@ -254,6 +371,10 @@ class AdvisoryEngine:
             db.execute(Advisory.__table__.update().where(Advisory.id == adv_id)
                        .values(delivered_at=datetime.now(timezone.utc)
                                if pushed else None))
+        # NO Discord alert here: an advisory can fire at any in-play edge, which
+        # is not the same as a SCENARIO SIGNAL. Alerts fire only when a scenario's
+        # trigger fires (see _maybe_arm) — "when signals happen is when alerts
+        # happen". The advisory still logs, persists, and drives paper bets.
         self.last_advised[ticker] = (est.state_key, band if band is not None
                                      else edge_band(block.edge))
         self._paper_from_advisory(ticker, ctx, block)
@@ -265,18 +386,51 @@ class AdvisoryEngine:
     def _paper_from_advisory(self, ticker: str, ctx: dict, block) -> None:
         """Bot testrun: an advisory that also clears the paper policy becomes
         an imaginary bet (basis 'advisory'). Never an order — CLAUDE.md rule 1."""
+        from bot.market.line_move import market_move_cents
         from bot.paper import BetDecision, place_bet, policy_ok, size_units
-        from bot.t2 import iter_bot_policies
+        from bot.t2 import BOTS, advisory_gate_ok, iter_bot_policies
 
         prob, price = block.model_prob, block.executable_price_cents
         edge = block.edge
         if not ctx.get("event_ticker"):
             return
+        best_of = ctx.get("best_of", 3)
+        need = best_of // 2
+        at_decider = block.state_key == f"{need}-{need}"
+        try:
+            sa, sb = (int(x) for x in block.state_key.split("-"))
+        except (ValueError, AttributeError):
+            sa = sb = None
+        # pre-match favorite for the 'dip' bot — recompute the model's OPENING
+        # read at 0-0 so "favorite" is model-defined, never price-defined (NO
+        # CIRCULARITY). fav_side is the YES/NO side the model favours pre-play.
+        fav_side = fav_prob = None
+        try:
+            pre = self.model.predict(ctx["player_a_id"], ctx["player_b_id"],
+                                     ctx.get("surface"), ctx.get("tier"),
+                                     MatchState(0, 0, best_of), as_of=date.today())
+            fav_side, fav_prob = (("yes", pre.p_a) if pre.p_a >= 0.5
+                                  else ("no", 1 - pre.p_a))
+        except Exception:
+            pass
         with self.db_session() as db:
-            # the two LIVE bots (fixed + self-improving) evaluate the advisory
-            # under their own policy — shared policy_ok so they can't drift
+            # line drift on our side since the open — the follow/fade gate reads it
+            move = market_move_cents(db, ticker, block.recommended_side, price)
+            # the LIVE bots evaluate the advisory under their own policy — shared
+            # policy_ok so they can't drift. Single-variable experiment bots add
+            # exactly one gate (decider / tier / confidence / line-move) so their
+            # record isolates that indicator.
             for bot, policy in iter_bot_policies(db, "advisory"):
-                if not policy_ok(prob, edge, price, ctx.get("tier"), policy):
+                if not advisory_gate_ok(
+                        BOTS[bot], at_decider=at_decider,
+                        confidence=block.model_confidence,
+                        tier=ctx.get("tier"), move=move, tour=ctx.get("tour"),
+                        sets=(sa, sb) if sa is not None else None,
+                        best_of=best_of, fav_side=fav_side, fav_prob=fav_prob,
+                        recommended_side=block.recommended_side):
+                    continue
+                if not policy_ok(prob, edge, price, ctx.get("tier"), policy,
+                                 confidence=block.model_confidence):
                     continue
                 decision = BetDecision(
                     True, side=block.recommended_side, prob=prob, edge=edge,

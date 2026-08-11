@@ -63,7 +63,7 @@ def run_backtest(db: Session, date_from: date, date_to: date) -> BacktestReport:
             # p as P(actual winner wins), which is label-symmetric.
             state = MatchState(0, 0, row["best_of"] if row["best_of"] in (3, 5) else 3)
             pred = model.predict(row["winner_id"], row["loser_id"], row["surface"],
-                                 row["tier"], state)
+                                 row["tier"], state, as_of=row.get("date"))
             if pred.confidence >= MIN_CONFIDENCE_SCORED:
                 preds.append((pred.p_a, True))
             else:

@@ -137,7 +137,10 @@ class KalshiResultsSource(TennisDataSource):
             log.info("settled events fetched", series=series, events=len(events))
             for ev_ticker, sides in events.items():
                 skey = f"{tour}:kalshi:{ev_ticker}"
-                if skey in existing or not ev_ticker:
+                # full=True re-ingests already-seen events so a row first written
+                # during a degraded window (null sets) gets repaired; incremental
+                # skips them.
+                if not ev_ticker or (skey in existing and not full):
                     continue
                 try:
                     n = self._ingest_event(db, matchers[tour], tour, series,

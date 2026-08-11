@@ -12,7 +12,7 @@ Docs read 2026-07-19 (docs.kalshi.com):
   base64(RSA-PSS-SHA256(timestamp + METHOD + path-without-query))
 - Prices arrive as dollar strings ("0.5400"); converted to integer cents here.
 - Tennis match-winner series: KXATPMATCH, KXATPCHALLENGERMATCH, KXITFMATCH,
-  KXITFWMATCH, KXWTAMATCH (+ legacy KXWTAGAME). Two markets per event (one per
+  KXITFWMATCH, KXWTAMATCH, KXWTACHALLENGERMATCH (+ legacy KXWTAGAME). Two markets per event (one per
   player, YES = that player wins). Milestones (type tennis_tournament_singles)
   carry the DELAYED score via GET /live_data/milestone/{id}:
   competitor1/2_overall_score = sets won.
@@ -38,6 +38,7 @@ TENNIS_SERIES = {
     "KXATPCHALLENGERMATCH": "atp",
     "KXITFMATCH": "atp",  # ITF men live under the ATP player universe
     "KXWTAMATCH": "wta",
+    "KXWTACHALLENGERMATCH": "wta",  # WTA 125 tour
     "KXWTAGAME": "wta",  # legacy naming: "game" = match
     "KXITFWMATCH": "wta",
 }
@@ -86,13 +87,35 @@ class KalshiClient:
             self.auth = KalshiAuth(cfg.kalshi_api_key_id, cfg.kalshi_private_key_b64)
         self.http = httpx.Client(base_url=self.base, timeout=30)
 
-    def _get(self, path: str, **params) -> dict:
-        headers = {}
-        if self.auth:
-            headers = self.auth.headers("GET", f"{self.api_root_path}{path}")
-        r = self.http.get(path, params=params, headers=headers)
-        r.raise_for_status()
-        return r.json()
+    def _get(self, path: str, _tries: int = 4, **params) -> dict:
+        """Authenticated GET with retry/backoff. Retries transient failures
+        (timeouts, transport errors, 429, 5xx) with exponential backoff, honoring
+        a 429 Retry-After. Auth headers are re-signed each attempt so the
+        timestamp never goes stale across a backoff sleep."""
+        for attempt in range(_tries):
+            headers = (self.auth.headers("GET", f"{self.api_root_path}{path}")
+                       if self.auth else {})
+            try:
+                r = self.http.get(path, params=params, headers=headers)
+            except (httpx.TimeoutException, httpx.TransportError) as e:
+                if attempt == _tries - 1:
+                    raise
+                log.warning("kalshi GET transient error — retrying",
+                            path=path, attempt=attempt + 1, error=str(e))
+                time.sleep(min(8.0, 0.5 * 2 ** attempt))
+                continue
+            if (r.status_code == 429 or r.status_code >= 500) and attempt < _tries - 1:
+                ra = r.headers.get("Retry-After")
+                try:
+                    delay = float(ra) if ra else min(8.0, 0.5 * 2 ** attempt)
+                except ValueError:
+                    delay = min(8.0, 0.5 * 2 ** attempt)
+                log.warning("kalshi GET throttled/5xx — backing off", path=path,
+                            status=r.status_code, delay=round(delay, 2))
+                time.sleep(delay)
+                continue
+            r.raise_for_status()
+            return r.json()
 
     def ws_headers(self) -> dict[str, str]:
         """Auth headers for the websocket handshake (required by Kalshi)."""
@@ -145,15 +168,20 @@ class KalshiClient:
         return d.get("milestones", [])
 
     def tennis_milestone_statuses(self, since_hours: int = 36) -> dict[str, str]:
-        """event_ticker -> live status ('live'/'not_started'/'P'…) for recent
-        tennis matches, one API call. The authoritative what-is-actually-live
-        signal — scheduled times drift, this doesn't."""
+        """event_ticker -> live status ('live'/'not_started'/'P'…) for tennis
+        matches. The authoritative what-is-actually-live signal (scheduled times
+        drift, this doesn't). The feed spans every recent AND upcoming tennis
+        singles milestone worldwide (ITF alone is hundreds/day), so we MUST
+        page through all of it — a low page cap silently drops currently-live
+        matches to no-status, hiding them from the live board."""
         from datetime import timedelta
 
+        MAX_PAGES = 40  # 40 * 200 = 8k milestones; a hard backstop, not a target
         start = (utcnow() - timedelta(hours=since_hours)).strftime("%Y-%m-%dT%H:%M:%SZ")
         out: dict[str, str] = {}
         cursor = None
-        for _ in range(5):  # paginate defensively
+        pages = 0
+        for pages in range(1, MAX_PAGES + 1):
             params = {"type": "tennis_tournament_singles",
                       "minimum_start_date": start, "limit": 200}
             if cursor:
@@ -168,6 +196,10 @@ class KalshiClient:
             cursor = d.get("cursor")
             if not cursor:
                 break
+        else:
+            log.warning("milestone status feed hit page cap — coverage may be "
+                        "truncated (live matches could read as no-status)",
+                        pages=MAX_PAGES, events=len(out))
         return out
 
     def live_data(self, milestone_id: str) -> dict:

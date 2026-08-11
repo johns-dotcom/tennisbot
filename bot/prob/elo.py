@@ -35,11 +35,15 @@ RECENCY_HALFLIFE_DAYS = 150
 CONFIDENCE_RECENT_FULL = 45
 # Global calibration for the raw Elo expectation, fitted by walk-forward log
 # loss against realized outcomes only (never price — CLAUDE.md rule 2), via
-# bot.prob.calibrate. The prior 1.65 (fit on 2023-24) over-sharpened the tail:
-# the 2026 walk-forward (n=28,782) showed favorites over-predicting by 2-3 pts
-# per bucket and refit to 1.437 (log loss 0.5981 → 0.5966). b stays 0 — a
-# two-player model must be symmetric, so no bias term. Refit when ratings change.
-PLATT_A = 1.437
+# bot.prob.calibrate. History: 1.65 (2023-24) over-sharpened; 1.437 (2026
+# walk-forward, n=28,782). By 2026-08 the ratings had drifted the fit down again
+# — the trailing-365d walk-forward (n=46,322) refit to ~1.20 (log loss 0.6027 →
+# 0.6001, Brier 0.2071 → 0.2066), i.e. the model had crept back toward
+# over-confident favorites. b stays 0 — a two-player model must be symmetric.
+# This value is now only the DEFAULT: the daily ingest refits and persists a new
+# scalar (calibrate.refit_and_persist_platt), and load_platt_calibration()
+# overrides this on model rebuild, so it can't silently go stale again.
+PLATT_A = 1.201
 
 
 @dataclass
@@ -100,11 +104,12 @@ class SetElo(WinProbabilityModel):
         rw, rl = self._get(winner_of_set), self._get(loser_of_set)
         e = _expected(rw.blended(surface), rl.blended(surface))
         kw, kl = self._k(rw, tier), self._k(rl, tier)
+        pre_w, pre_l = rw.overall, rl.overall  # seed a new surface from PRE-update overall
         rw.overall += kw * (1 - e)
         rl.overall -= kl * (1 - e)
         if surface:
-            sw = rw.by_surface.get(surface, rw.overall)
-            sl = rl.by_surface.get(surface, rl.overall)
+            sw = rw.by_surface.get(surface, pre_w)
+            sl = rl.by_surface.get(surface, pre_l)
             es = _expected(sw, sl)
             rw.by_surface[surface] = sw + kw * (1 - es)
             rl.by_surface[surface] = sl - kl * (1 - es)
@@ -134,7 +139,19 @@ class SetElo(WinProbabilityModel):
                              row["tier"], row["set_results"], day=row.get("date"))
             n += 1
         self.trained_through = through or (rows[-1]["date"] if rows else None)
-        log.info("elo fitted", matches=n, through=str(self.trained_through))
+        # refresh the state-conditioned recalibration from the persisted fit
+        # (daily-refit) whenever the model is rebuilt; falls back to defaults
+        from bot.prob.state_adjust import load_state_calibration
+        load_state_calibration(db)
+        # refresh the global pre-match Platt scalar from the newest persisted refit
+        # so calibration tracks the current ratings instead of a stale constant
+        from bot.prob.calibrate import load_platt_calibration
+        _pa = load_platt_calibration(db)
+        if _pa is not None:
+            global PLATT_A
+            PLATT_A = _pa
+        log.info("elo fitted", matches=n, through=str(self.trained_through),
+                 platt_a=PLATT_A)
         return n
 
     @staticmethod
@@ -174,8 +191,22 @@ class SetElo(WinProbabilityModel):
 
     # ---------- prediction ----------
 
+    @staticmethod
+    def _recent_as_of(r: _Rating, as_of: date | None) -> float:
+        """r.recent decayed forward from the player's last match to `as_of`,
+        WITHOUT mutating the rating. This is what makes recency awareness bite
+        at prediction time: a returnee whose last match was long ago has their
+        idle stretch decayed in here, not only after their next match applies."""
+        val = r.recent
+        if as_of is not None and r.last_day is not None:
+            dd = (as_of - r.last_day).days
+            if dd > 0:
+                val *= 0.5 ** (dd / RECENCY_HALFLIFE_DAYS)
+        return val
+
     def predict(self, player_a: int, player_b: int, surface: str | None,
-                tier: str | None, match_state: MatchState) -> Prediction:
+                tier: str | None, match_state: MatchState,
+                as_of: date | None = None) -> Prediction:
         ra = self.ratings.get(player_a, _Rating())
         rb = self.ratings.get(player_b, _Rating())
         raw = _expected(ra.blended(surface), rb.blended(surface))
@@ -184,7 +215,8 @@ class SetElo(WinProbabilityModel):
         z = PLATT_A * math.log(raw / (1 - raw))
         p_prematch = 1 / (1 + math.exp(-z))
         p = condition_on_state(p_prematch, match_state)
-        # confidence = RECENT activity (v9), so a high but stale rating (a
-        # returnee) no longer reads as high confidence
-        confidence = min(ra.recent, rb.recent) / CONFIDENCE_RECENT_FULL
+        # confidence = RECENT activity (v9), decayed to the prediction date so a
+        # high but stale rating (a returnee) no longer reads as high confidence
+        confidence = min(self._recent_as_of(ra, as_of),
+                         self._recent_as_of(rb, as_of)) / CONFIDENCE_RECENT_FULL
         return Prediction(p_a=p, confidence=min(1.0, confidence))

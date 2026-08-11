@@ -39,6 +39,49 @@ def test_gameflow_sequenced_structure():
     assert "%" in n                                 # stat-dense
 
 
+def test_gameflow_stores_multiple_triggers():
+    trigs = build().facts["triggers"]
+    by = {t["kind"]: t for t in trigs}
+    assert {"set1", "drop1", "decider"} <= set(by)
+    assert by["set1"]["state"] == "1-0"      # watch took set 1
+    assert by["drop1"]["state"] == "0-1"     # watch dropped set 1
+    assert by["decider"]["state"] == "1-1"
+    # for the favoured watch side, taking set 1 raises the prob, dropping lowers it
+    assert by["set1"]["prob"] > by["decider"]["prob"] > by["drop1"]["prob"]
+
+
+def test_fresh_adjust_bounded_and_directional():
+    from bot.scenarios import FRESH_K, fresh_adjust
+
+    class _P:
+        layoff = None
+
+        class form:
+            ytd_vs_career_delta = 0.0
+
+    base = 0.50
+    # opponent played earlier today AND went the distance → watch prob rises,
+    # bounded to ±FRESH_K
+    up, drift = fresh_adjust(base, _P(), _P(), {}, {"played_today": True,
+                                                    "went_distance": True})
+    assert up > base and (up - base) <= FRESH_K + 1e-9 and drift > 0
+    # symmetric: the WATCH side is the tired one → prob falls
+    down, _ = fresh_adjust(base, _P(), _P(), {"played_today": True,
+                                              "went_distance": True}, {})
+    assert down < base
+    # no fatigue, no form gap → unchanged
+    same, _ = fresh_adjust(base, _P(), _P(), {}, {})
+    assert abs(same - base) < 1e-9
+
+
+def test_gameflow_cites_last_match_date_for_both_players():
+    n = build().narrative
+    assert "Last match —" in n
+    assert n.count("last played") == 2  # both players' last-match dates
+    assert "Adams last played" in n and "Zelnickova last played" in n
+    assert "d ago)" in n                # days-since context
+
+
 def test_gameflow_fatigue_cited():
     c = build(fatigue_b={"played": True, "went_distance": True})
     assert "played yesterday and went the distance" in c.narrative

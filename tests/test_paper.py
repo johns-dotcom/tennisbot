@@ -1,4 +1,29 @@
-from bot.paper import PAPER_MAX_EDGE, PAPER_MIN_PROB, decide_bet
+from bot.paper import (
+    PAPER_MAX_EDGE, PAPER_MIN_CONF, PAPER_MIN_PROB, decide_bet, policy_ok)
+
+
+def test_mid_bots_only_bet_the_toss_up_price_band():
+    from bot.t2 import base_policy
+    p = base_policy("mid")
+    assert (p.min_price, p.max_price) == (35, 65)
+    assert p.min_prob == 0.35  # favorite floor dropped; price band is the gate
+    # a toss-up-priced side the model slightly favors, in band -> bet
+    assert policy_ok(0.58, 0.58 - 0.52, 52, tier=None, policy=p, confidence=0.8)
+    # a strong favorite priced 80c is OUT of the 35-65 band -> no bet
+    assert not policy_ok(0.90, 0.10, 80, tier=None, policy=p, confidence=0.8)
+    # too cheap (below 35c) -> no bet
+    assert not policy_ok(0.60, 0.30, 30, tier=None, policy=p, confidence=0.8)
+    # and the default (favorite) bots would NOT take that same toss-up price
+    assert not policy_ok(0.58, 0.06, 52, tier=None, confidence=0.8)  # 0.58 < 0.82 floor
+
+
+def test_policy_ok_gates_on_confidence_when_supplied():
+    # a calibrated favorite with a sane edge that ALL bots would otherwise take
+    prob, edge, price = 0.86, 0.10, 76
+    assert policy_ok(prob, edge, price, tier=None)  # no confidence → passes (prematch path gates via decide_bet)
+    assert policy_ok(prob, edge, price, tier=None, confidence=0.8)  # deep data → passes
+    # thin data must be rejected on the live/top5 paths too, not just prematch
+    assert not policy_ok(prob, edge, price, tier=None, confidence=PAPER_MIN_CONF - 0.01)
 
 
 def test_calibrated_favorite_with_sane_edge_bets_yes():
