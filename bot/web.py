@@ -434,6 +434,17 @@ table.t.lb td .sub2 { font-size: 10.5px; }
 .modal .mrow { display: flex; gap: 12px; }
 .modal .mrow > div { flex: 1; }
 .modal .cost { font-size: 13px; color: var(--muted); margin-top: 12px; min-height: 18px; }
+/* pickable tag chips — click to toggle a tag onto the bet */
+.tagpick { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 0 6px;
+  max-height: 92px; overflow-y: auto; }
+.tsel { font-size: 11px; line-height: 1; padding: 5px 8px; border-radius: 999px;
+  border: 1px solid var(--divider-strong); color: var(--muted); cursor: pointer;
+  user-select: none; white-space: nowrap; background: var(--surface-2); }
+.tsel:hover { color: var(--text); border-color: var(--text); }
+.tsel.on { color: var(--text); border-color: var(--accent);
+  background: rgba(200,90,60,.16); font-weight: 700; }
+.tsel.on::before { content: "✓ "; }
+.modal .tagpick { margin-bottom: 8px; }
 /* "Other markets" on a match — one card per Kalshi event (set winner, exact
    score, total games ...), each listing its outcomes and their asks */
 .dm-wrap { display: grid; gap: 12px;
@@ -1531,13 +1542,21 @@ function openBetModal(b){
   '</div>'+
   '<div class="mrow"><div><label>PRICE (¢)</label><input id="bp" type="number" inputmode="numeric" min="1" max="99" step="1"></div>'+
   '<div><label>SHARES</label><input id="bs" type="number" inputmode="numeric" min="1" step="1" value="10"></div></div>'+
-  '<div><label>TAG (optional — who you tailed; comma-separate for several)</label>'+
+  '<div><label>TAGS (optional — who you tailed; pick any, or type a new one)</label>'+
+   // chips for the tags you already use. Read the datalist's CACHED original
+   // list — bindTagInputs rewrites the live options as you type (filtered, and
+   // prefixed with the tags already entered), so those are not tag names.
+   '<div class="tagpick" data-for="btag">'+
+    knownTags().map(function(t){
+     return '<span class="tsel" role="button" tabindex="0" data-t="'+
+      esc(t)+'">'+esc(t)+'</span>';}).join('')+
+   '</div>'+
    '<input id="btag" list="bettags" maxlength="256" placeholder="e.g. blvr, clutch" '+
    'style="width:100%;box-sizing:border-box"></div>'+
   '<div class="cost" id="bcost"></div>'+
   '<div class="mbtns"><button class="cancel">Cancel</button><button class="go">Place bet</button></div></div>';
  document.body.appendChild(back);
- bindTagInputs(back);   // the modal's tag field is built after page load
+ bindTagInputs(back); bindTagPickers(back);  // modal is built after page load
  var picks=back.querySelectorAll('.side-pick button');
  var pxIn=back.querySelector('#bp'), shIn=back.querySelector('#bs'), cost=back.querySelector('#bcost');
  var sel={tk:opts[0].tk,nm:opts[0].nm,px:opts[0].px};
@@ -1572,6 +1591,47 @@ function bindBets(){
  document.querySelectorAll('.betbtn').forEach(function(b){
   if(b._b) return; b._b=true;
   b.addEventListener('click',function(e){e.preventDefault();e.stopPropagation();openBetModal(b);});
+ });}
+// Same parse as _bet_tags on the server: trimmed, de-duped case-insensitively,
+// order preserved. Kept in sync so the chips agree with what gets stored.
+// The user's known tags. bindTagInputs caches the datalist's original options on
+// the element before it starts rewriting them, so prefer that cache.
+function knownTags(){
+ var dl=document.getElementById('bettags'); if(!dl) return [];
+ return dl._base || Array.prototype.map.call(
+  dl.querySelectorAll('option'), function(o){return o.value;});}
+function parseTags(v){
+ var out=[], seen={};
+ (v||'').split(',').forEach(function(t){
+  t=t.trim(); var k=t.toLowerCase();
+  if(t && !seen[k]){seen[k]=1; out.push(t);}});
+ return out;}
+// Pick tags from the ones you already use. The chips drive the plain text input
+// they're bound to (data-for), so typing still works, new tags are still just
+// typed, and with JS off the field behaves exactly as it always did.
+function bindTagPickers(root){
+ (root||document).querySelectorAll('.tagpick').forEach(function(pick){
+  if(pick._tp) return; pick._tp=true;
+  var inp=document.getElementById(pick.dataset.for); if(!inp) return;
+  var chips=pick.querySelectorAll('.tsel');
+  function paint(){
+   var on={}; parseTags(inp.value).forEach(function(t){on[t.toLowerCase()]=1;});
+   chips.forEach(function(c){
+    c.classList.toggle('on', !!on[(c.dataset.t||'').toLowerCase()]);});}
+  function toggle(c){
+   var t=c.dataset.t, k=t.toLowerCase(), cur=parseTags(inp.value);
+   var next=cur.filter(function(x){return x.toLowerCase()!==k;});
+   if(next.length===cur.length) next.push(t);   // wasn't on → add it
+   inp.value=next.join(', ');
+   paint();
+   inp.dispatchEvent(new Event('input'));       // keep autocomplete in step
+  }
+  chips.forEach(function(c){
+   c.addEventListener('click',function(e){e.preventDefault();toggle(c);});
+   c.addEventListener('keydown',function(e){
+    if(e.key===' '||e.key==='Enter'){e.preventDefault();toggle(c);}});});
+  inp.addEventListener('input',paint);          // typing re-syncs the chips
+  paint();
  });}
 // A tag field holds a comma-separated list, but <input list> matches the datalist
 // against the WHOLE value — so once you type "blvr, cl" nothing suggests. Rewrite
@@ -1637,7 +1697,7 @@ async function refreshMain(){
     var tmp=document.createElement('div'); tmp.innerHTML=h;
     rel(tmp);  // normalize .rel timestamps to relative form so unchanged cards match
     if(!reconcile(tmp, m)){var y=window.scrollY; m.innerHTML=h; window.scrollTo(0,y);}
-    bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs();}
+    bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs(); bindTagPickers();}
    pulse();
   }}catch(e){} rel();}
 function pulse(){var d=document.getElementById('refreshdot');
@@ -1662,7 +1722,7 @@ document.addEventListener('DOMContentLoaded',function(){
  // catch up immediately when the tab comes back to the foreground
  document.addEventListener('visibilitychange',function(){
   if(!document.hidden){refreshMain();pollEvents();}});
- bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs();
+ bindWatch(); bindFilters(); bindSearch(); bindPins(); bindBets(); bindFavs(); bindProfMore(); bindTagInputs(); bindTagPickers();
  var bell=document.getElementById('bell');
  function paint(){bell.textContent=Notification.permission==='granted'?'🔔 alerts on':'🔕 enable alerts';}
  if(!('Notification' in window)){bell.style.display='none';return;} paint();
@@ -7761,7 +7821,7 @@ async def mybets(request: web.Request) -> web.Response:
             f'<td class="mono" data-label="Unreal." style="color:var(--{"good" if (d["unreal"] or 0)>=0 else "accent"})">'
             f'{money(d["unreal"]) if d["unreal"] is not None else "—"}</td>'
             f'<td data-label="Cash out">{_cashout_form(b, csrf, d["cur"])}</td>'
-            f'<td data-label="" style="white-space:nowrap">{_edit_form(b, csrf)}'
+            f'<td data-label="" style="white-space:nowrap">{_edit_form(b, csrf, bet_tags, tag_colors)}'
             f'<a class="sub2" href="/match/{esc(b.event_ticker)}">match →</a>'
             f' {_del_form(b.id, csrf)}</td></tr>'
             for b, d in d_openp)
@@ -7802,7 +7862,7 @@ async def mybets(request: web.Request) -> web.Response:
             f'<td data-label="Exit">{_exit_cell(b, d)}</td>'
             f'<td class="mono" data-label="P&amp;L" style="color:var(--{"good" if d["pnl"]>=0 else "accent"})">{money(d["pnl"])}</td>'
             f'<td data-label="CLV">{_clv_cell(d["clv"])}</td>'
-            f'<td data-label="" style="white-space:nowrap">{_edit_form(b, csrf)}'
+            f'<td data-label="" style="white-space:nowrap">{_edit_form(b, csrf, bet_tags, tag_colors)}'
             f'<a class="sub2" href="/match/{esc(b.event_ticker)}">match →</a>'
             f' {_del_form(b.id, csrf)}</td></tr>'
             for b, d in d_settled)
@@ -8205,6 +8265,24 @@ def _bet_tags(tag) -> list[str]:
     return out
 
 
+def _tag_picker(known: list[str], selected, for_id: str,
+                colors: dict | None = None) -> str:
+    """Pickable chips for the tags this user already uses — click to toggle one
+    on or off. Deliberately drives the plain text input it is bound to (`for_id`)
+    rather than a hidden field: the text input stays the thing that submits, so
+    typing still works, brand-new tags are still just typed, and with JS off the
+    field behaves exactly as it always did."""
+    if not known:
+        return ""
+    on = {t.lower() for t in _bet_tags(selected)}
+    chips = "".join(
+        f'<span class="tsel{" on" if t.lower() in on else ""}" data-t="{esc(t)}" '
+        f'role="button" tabindex="0" '
+        f'style="{_tag_color_style((colors or {}).get(t))}">{esc(t)}</span>'
+        for t in known)
+    return f'<div class="tagpick" data-for="{esc(for_id)}">{chips}</div>'
+
+
 def _tagchip(tag: str | None, colors: dict | None = None) -> str:
     """One chip per tag on the bet (multiple when tailed from several sources)."""
     colors = colors or {}
@@ -8266,7 +8344,8 @@ def _reopen_form(bid: int, csrf: str, partial: bool = False) -> str:
             f'padding:0 0 0 4px">↺</button></form>')
 
 
-def _edit_form(b, csrf: str) -> str:
+def _edit_form(b, csrf: str, known_tags: list[str] | None = None,
+               tag_colors: dict | None = None) -> str:
     """Expandable per-bet control: CHANGE the entry price/shares, or ADD onto the
     position (extra shares at a price → blended average entry)."""
     inp = ("background:var(--surface);border:1px solid var(--divider);"
@@ -8312,7 +8391,8 @@ def _edit_form(b, csrf: str) -> str:
         f'<input type="hidden" name="id" value="{b.id}">'
         f'<input type="hidden" name="action" value="tag">'
         f'<span class="sub2">tag</span>'
-        f'<input name="tag" list="bettags" value="{esc(b.tag or "")}" '
+        f'{_tag_picker(known_tags or [], b.tag, f"tagin{b.id}", tag_colors)}'
+        f'<input name="tag" id="tagin{b.id}" list="bettags" value="{esc(b.tag or "")}" '
         f'placeholder="tail(s), comma-sep" maxlength="256" style="width:170px;{inp}">'
         f'<button type="submit" class="sub2" style="{btn}">set</button></form>'
         f'</div></details>')
