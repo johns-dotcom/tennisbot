@@ -224,6 +224,23 @@ main { width: 100%; max-width: 1360px; margin: 0 auto; padding: 26px 20px 60px; 
   table.rt td:empty { display: none; }
   /* 16px inputs stop iOS from zooming in when a field is focused */
   input, select, textarea { font-size: 16px; }
+  /* ---- controls added to the stacked bet cards ---- */
+  /* the cash-out row (shares ½ @ price [cash out]) no longer fits beside its
+     label at 16px — let it wrap onto its own full-width line under it */
+  table.rt td.cashcell { flex-wrap: wrap; }
+  table.rt td.cashcell form { flex: 1 1 100%; justify-content: flex-end;
+    gap: 6px; margin-top: 4px; }
+  .cnum { width: 78px; }             /* fits 3 digits + spinner at 16px */
+  /* the edit panel is a card-width drawer, not a 220px desktop popover */
+  table.rt td details { width: 100%; }
+  .editpanel { min-width: 0; width: 100%; box-sizing: border-box; }
+  .editpanel input { max-width: 100%; }
+  .editpanel form { justify-content: flex-start; }
+  /* bigger tag chips — 11px/5px is under a comfortable thumb target */
+  .tsel { font-size: 12.5px; padding: 8px 12px; }
+  .tagpick { gap: 6px; max-height: 132px; }
+  /* one market card per row; 240px minimums leave no margin on a 320px screen */
+  .dm-wrap { grid-template-columns: 1fr; }
   /* profile cards: collapse the deep sections behind a toggle to cut scrolling */
   .prof-toggle { display: block; width: 100%; margin-top: 12px; padding: 10px;
     background: var(--surface-2); border: 1px solid var(--divider); border-radius: 8px;
@@ -424,6 +441,7 @@ table.t.lb td .sub2 { font-size: 10.5px; }
 .modal .side-pick button { flex: 1 1 44%; background: var(--surface-2);
   border: 1px solid var(--divider-strong); color: var(--text); font: inherit;
   font-weight: 700; padding: 10px 8px; border-radius: 8px; cursor: pointer; }
+.modal .side-pick.wide button { flex: 1 1 100%; }
 .modal .side-pick button.sel { border-color: var(--accent); color: var(--text);
   background: rgba(200,90,60,.12); }
 .modal label { display: block; font-size: 12px; color: var(--muted);
@@ -445,6 +463,10 @@ table.t.lb td .sub2 { font-size: 10.5px; }
   background: rgba(200,90,60,.16); font-weight: 700; }
 .tsel.on::before { content: "✓ "; }
 .modal .tagpick { margin-bottom: 8px; }
+/* cash-out inputs: sized by class, so the phone layout can widen them for the
+   16px font that stops iOS zooming on focus */
+.cnum { width: 58px; }
+.editpanel { min-width: 220px; }
 /* "Other markets" on a match — one card per Kalshi event (set winner, exact
    score, total games ...), each listing its outcomes and their asks */
 .dm-wrap { display: grid; gap: 12px;
@@ -1536,7 +1558,9 @@ function openBetModal(b){
   '<div class="modal"><h4>Log a bet</h4>'+
   '<div class="sub2">'+(b.dataset.what?esc(b.dataset.what)+' · ':'')+
    'Records a personal bet — the app places no orders.</div>'+
-  '<div class="side-pick">'+
+  // >2 outcomes (exact score, total games) stack full-width — labels like
+  // "Jeffrey John Wolf wins 2-1" are unreadable in a half-width column
+  '<div class="side-pick'+(opts.length>2?' wide':'')+'">'+
    opts.map(function(o,i){return '<button data-tk="'+esc(o.tk)+'" data-nm="'+esc(o.nm)+
     '" data-px="'+esc(o.px)+'"'+(i===0?' class="sel"':'')+'>'+esc(o.nm)+'</button>';}).join('')+
   '</div>'+
@@ -7820,7 +7844,8 @@ async def mybets(request: web.Request) -> web.Response:
             f'<td class="mono" data-label="Value">{money(d["mtm"]) if d["mtm"] is not None else "—"}</td>'
             f'<td class="mono" data-label="Unreal." style="color:var(--{"good" if (d["unreal"] or 0)>=0 else "accent"})">'
             f'{money(d["unreal"]) if d["unreal"] is not None else "—"}</td>'
-            f'<td data-label="Cash out">{_cashout_form(b, csrf, d["cur"])}</td>'
+            f'<td class="cashcell" data-label="Cash out">'
+            f'{_cashout_form(b, csrf, d["cur"])}</td>'
             f'<td data-label="" style="white-space:nowrap">{_edit_form(b, csrf, bet_tags, tag_colors)}'
             f'<a class="sub2" href="/match/{esc(b.event_ticker)}">match →</a>'
             f' {_del_form(b.id, csrf)}</td></tr>'
@@ -8313,9 +8338,9 @@ def _cashout_form(b, csrf: str, cur: int | None) -> str:
             f'<input type="hidden" name="id" value="{b.id}">'
             f'<input type="hidden" name="action" value="set">'
             f'<input name="exit_shares" type="number" min="1" max="{b.shares}" '
-            f'step="1" value="{b.shares}" '
+            f'step="1" value="{b.shares}" class="cnum" '
             f'title="shares to sell — fewer than {b.shares} leaves the rest open" '
-            f'style="width:58px;{inp}" required>'
+            f'style="{inp}" required>'
             f'<button type="button" class="sub2" title="sell half" '
             f'onclick="this.form.exit_shares.value={max(1, b.shares // 2)}" '
             f'style="background:none;border:none;color:var(--muted);cursor:pointer;'
@@ -8323,7 +8348,7 @@ def _cashout_form(b, csrf: str, cur: int | None) -> str:
             f'<span class="sub2">@</span>'
             f'<input name="exit_price" type="number" min="0" max="100" step="1" '
             f'value="{cur if cur is not None else ""}" placeholder="¢" '
-            f'style="width:52px;{inp}" required>'
+            f'class="cnum" style="{inp}" required>'
             f'<button type="submit" class="sub2" style="background:var(--surface-2);'
             f'border:1px solid var(--divider-strong);color:var(--text);cursor:pointer;'
             f'padding:4px 8px;border-radius:5px;white-space:nowrap">cash out</button>'
@@ -8356,9 +8381,9 @@ def _edit_form(b, csrf: str, known_tags: list[str] | None = None,
         f'<details style="display:inline-block;vertical-align:middle">'
         f'<summary class="sub2" style="cursor:pointer;list-style:none;padding:0 6px">'
         f'edit</summary>'
-        f'<div style="margin-top:6px;padding:10px;background:var(--surface-2);'
-        f'border:1px solid var(--divider);border-radius:6px;text-align:left;'
-        f'min-width:220px">'
+        f'<div class="editpanel" style="margin-top:6px;padding:10px;'
+        f'background:var(--surface-2);border:1px solid var(--divider);'
+        f'border-radius:6px;text-align:left">'
         f'<form method="post" action="/bet/edit" style="display:flex;gap:6px;'
         f'align-items:center;flex-wrap:wrap;margin-bottom:8px">'
         f'<input type="hidden" name="csrf" value="{csrf}">'
