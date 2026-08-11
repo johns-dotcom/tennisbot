@@ -881,6 +881,32 @@ def _bet_btn(ev_ticker: str, a, b, quotes: dict, csrf: str,
         f'{esc(label)}</span>')
 
 
+def _mybet_badge(bets: list) -> str:
+    """'You already have a position here' badge for a board card.
+
+    Held positions read as active (green ✓). A match where every bet has been
+    cashed out is still shown, quietly and labelled `closed` — otherwise a card
+    you have already traded looks identical to one you have never touched."""
+    if not bets:
+        return ""
+    held = [b for b in bets if b.exit_price_cents is None]
+    shown = held or bets
+    first = shown[0]
+    who = (first.player_name or "?").split()[-1]
+    label = f"{who} {first.entry_price_cents}¢"
+    if len(shown) > 1:
+        label += f" +{len(shown) - 1}"
+    detail = " · ".join(
+        f"{b.player_name} {b.entry_price_cents}¢ × {b.shares}"
+        + ("" if b.exit_price_cents is None else f" → out {b.exit_price_cents}¢")
+        for b in shown)
+    if held:
+        return (f'<span class="tag tag-good" title="Your position — {esc(detail)}">'
+                f'✓ {esc(label)}</span>')
+    return (f'<span class="tag tag-outline" title="Closed — {esc(detail)}" '
+            f'style="opacity:.75">✓ {esc(label)} closed</span>')
+
+
 def _derivative_bet_btn(ev_ticker: str, opts: list[dict], csrf: str,
                         what: str, opp: str) -> str:
     """'＋ bet' for a non-match-winner market. Same client-side modal as the
@@ -1434,7 +1460,8 @@ function applyLiveFilters(){
   var okW=!s.streak||c.dataset.streak==='1';
   var okB=!s.bet||c.dataset.bet==='1';
   var okC=!s.conf||c.dataset.conf==='1';
-  var ok=okQ&&okT&&okP&&okS&&okF&&okG&&okV&&okW&&okB&&okC; c.style.display=ok?'':'none'; if(ok)shown++;});
+  var okM=!s.mybet||c.dataset.mybet==='1';   // your own logged position
+  var ok=okQ&&okT&&okP&&okS&&okF&&okG&&okV&&okW&&okB&&okC&&okM; c.style.display=ok?'':'none'; if(ok)shown++;});
  // an active text search is an explicit intent — honour a genuine "no matches"
  // (show nothing) rather than the stale-chip fallback that reveals everything
  if(shown===0&&total>0&&!q){document.querySelectorAll('.livecard').forEach(function(c){c.style.display='';});shown=total;}
@@ -4682,6 +4709,16 @@ async def live(request: web.Request) -> web.Response:
             if user.get("id") else set()
         fav_ids = _fav_player_ids(db, user)
         bet_tags = _user_bet_tags(db, user.get("id"))
+        # the caller's OWN logged bets on anything on this board, so a card can
+        # say "you're already in". Scoped to the board's events so this stays a
+        # bounded lookup rather than the whole ledger.
+        my_bets: dict[str, list] = {}
+        _board_evs = {m.event_ticker for m in markets if m.event_ticker}
+        if user.get("id") and _board_evs:
+            for _ub in db.execute(select(UserBet).where(
+                    UserBet.user_id == user["id"],
+                    UserBet.event_ticker.in_(_board_evs))).scalars():
+                my_bets.setdefault(_ub.event_ticker, []).append(_ub)
         # current win streaks for players on the board — from the nightly stats
         # cache (form.streak > 0 = consecutive wins), same source as the Database
         # "Heaters". A win-streak token surfaces a hot player on live/upcoming cards.
@@ -5189,6 +5226,11 @@ async def live(request: web.Request) -> web.Response:
         has_streak = any(m.player_a_id in streaks for m in sides[:2] if m.player_a_id)
         has_bet = bool(is_live and _verdict and _verdict.get("kind") == "bet")
         has_conf = bool(conf_flag)
+        # NB: data-bet above is the MODEL's bet verdict. This is the user's own
+        # logged position — a different thing, so it gets its own attribute.
+        _mine = my_bets.get(ev_ticker) or []
+        mybet_flag = _mybet_badge(_mine)
+        has_mine = bool(_mine)
         # 'livecard' class only on the live section — the filter bar counts/filters
         # those, not the "starting soon" cards
         klass = ("card livecard" if is_live else "card") + (" trig-live" if trig_fired else "")
@@ -5212,11 +5254,12 @@ data-tour="{esc(tour)}" data-play="{1 if has_play else 0}" \
 data-scenario="{1 if sc is not None else 0}" \
 data-fav="{1 if has_fav else 0}" data-streak="{1 if has_streak else 0}" \
 data-bet="{1 if has_bet else 0}" data-conf="{1 if has_conf else 0}" \
+data-mybet="{1 if has_mine else 0}" \
 data-trigfired="{1 if trig_fired else 0}" data-trig="{trig}">
 {banner}
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{tour}</span>
-<span>{conf_flag} {st} {dec_flag} {scen_badge} {play} {bet_btn} {pin_btn}</span></div>
+<span>{mybet_flag} {conf_flag} {st} {dec_flag} {scen_badge} {play} {bet_btn} {pin_btn}</span></div>
 {_verdict_html(_verdict) if is_live else ""}
 <a href="/match/{esc(ev_ticker)}" style="text-decoration:none;color:inherit">
 <div>{''.join(rows_html)}</div></a>
@@ -5247,7 +5290,7 @@ data-trigfired="{1 if trig_fired else 0}" data-trig="{trig}">
 data-names="{esc(d_search)}" style="opacity:.75">
 <div style="display:flex;align-items:center;justify-content:space-between">
 <span class="kicker" style="margin:0">{series_label.get(ev['series'], '?')}</span>
-{tag('neutral', '·', 'finished')}</div>
+<span>{_mybet_badge(my_bets.get(ev_ticker) or [])} {tag('neutral', '·', 'finished')}</span></div>
 <div>{''.join(rows_html)}</div>
 <div class="sub2 mono">was scheduled {pt(ev['occ'])} · {esc(ev_ticker)}</div>
 </div>"""
@@ -5374,6 +5417,9 @@ data-names="{esc(d_search)}" style="opacity:.75">
                 if bet_n else "")
     conf_chip = (f'<button class="fchip" data-f="conf">🎯 70%+ ({conf_n})</button>'
                  if conf_n else "")
+    mine_n = sum(1 for t, _ in live_evs if my_bets.get(t))
+    mine_chip = (f'<button class="fchip" data-f="mybet">✓ my bets ({mine_n})</button>'
+                 if mine_n else "")
     # free-text search over player names + tour. Rendered at the TOP of the board
     # (not in this filter bar) and searches EVERY card — scenarios, pinned,
     # confident, value, all-live, upcoming, finished — so any game is one type away.
@@ -5395,7 +5441,7 @@ data-names="{esc(d_search)}" style="opacity:.75">
                   f'{bet_chip}{conf_chip}'
                   f'<button class="fchip" data-f="play">▲ advisory fired</button>'
                   f'<button class="fchip" data-f="trig">near trigger ({near_n})</button>'
-                  f'{fav_chip}{streak_chip}'
+                  f'{fav_chip}{streak_chip}{mine_chip}'
                   f'<span class="sub2" style="margin-left:auto">showing '
                   f'<span id="livecount">{len(live_disp)}</span> of {len(live_disp)}</span>'
                   f'</div>') if live_disp else ""
