@@ -2,7 +2,14 @@
 
 ## Non-negotiable constraints (never violate, never "temporarily" relax)
 1. ADVISORY ONLY. Never call any Kalshi trading/order endpoint. Never scaffold order
-   execution code, even disabled. Read-only market access.
+   execution code, even disabled. Read-only access only.
+   NARROW EXCEPTION (2026-08-13, owner-authorized): the read-only portfolio GETs
+   /portfolio/fills, /portfolio/settlements, /portfolio/positions,
+   /portfolio/balance and — for reconciling account-level P&L —
+   /portfolio/deposits and /portfolio/withdrawals may be called, solely to show
+   the owner their own trading history on /kalshi. They place no orders. This does NOT relax anything else:
+   nothing that creates, amends or cancels an order may ever be added, and the
+   client remains GET-only.
 2. NO CIRCULARITY. The probability engine must not receive market price as input —
    structurally: price must not appear in its function signature or reachable state.
    Market data may only inform discrete match state. A test must assert this isolation.

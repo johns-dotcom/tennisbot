@@ -3,9 +3,13 @@
 Only GET requests are possible through this client; there is no code path that
 creates, amends, or cancels orders, and none may ever be added.
 
-Docs read 2026-07-19 (docs.kalshi.com):
+Docs read 2026-07-19, portfolio section re-read 2026-08-13 (docs.kalshi.com):
 - REST base: https://external-api.kalshi.com/trade-api/v2 (public market data
-  needs no auth; portfolio endpoints are never used here)
+  needs no auth). Portfolio access is limited to the four READ-ONLY GETs
+  permitted by CLAUDE.md rule 1's narrow exception — fills, settlements,
+  positions, balance — which exist only to show the owner their own trading
+  history. No order endpoint is reachable from this client; the order-placement
+  routes are not even in the portfolio section of the API.
 - WS: wss://external-api-ws.kalshi.com/trade-api/ws/v2 — auth REQUIRED at
   handshake; public channels: ticker, trade, market_lifecycle_v2
 - Auth: KALSHI-ACCESS-KEY / -TIMESTAMP (ms) / -SIGNATURE headers; signature =
@@ -160,6 +164,56 @@ class KalshiClient:
         if since_ts:
             params["min_ts"] = since_ts
         return self._get("/markets/trades", **params).get("trades", [])
+
+    # ---------- portfolio (READ-ONLY; CLAUDE.md rule 1 narrow exception) ----------
+    # These four GETs exist only so the owner can see their own trading history.
+    # They place no orders. Do not add anything here that is not a GET.
+
+    def _paged(self, path: str, key: str, limit: int = 1000,
+               max_pages: int = 200, **params) -> list[dict]:
+        """Cursor-paginate a portfolio GET. `max_pages` is a runaway guard, not a
+        cap we expect to hit — the account's full history is ~11 pages at 1000."""
+        out, cursor = [], None
+        for _ in range(max_pages):
+            p = dict(params, limit=limit)
+            if cursor:
+                p["cursor"] = cursor
+            d = self._get(path, **p)
+            rows = d.get(key) or []
+            out.extend(rows)
+            cursor = d.get("cursor")
+            if not cursor or not rows:
+                break
+        return out
+
+    def fills(self, min_ts: int | None = None) -> list[dict]:
+        """Every execution on the account, newest first. `min_ts` (unix seconds)
+        makes a re-sync incremental instead of refetching all ~10.5k."""
+        return self._paged("/portfolio/fills", "fills",
+                           **({"min_ts": min_ts} if min_ts else {}))
+
+    def settlements(self, min_ts: int | None = None) -> list[dict]:
+        """Settled markets with their outcome and revenue."""
+        return self._paged("/portfolio/settlements", "settlements",
+                           **({"min_ts": min_ts} if min_ts else {}))
+
+    def positions(self) -> list[dict]:
+        """Currently-held positions (market_positions)."""
+        return self._paged("/portfolio/positions", "market_positions", limit=1000)
+
+    def balance(self) -> dict:
+        return self._get("/portfolio/balance")
+
+    # Funding movements, used ONLY to reconcile lifetime P&L via
+    # (balance + portfolio_value) - net funded. Kalshi's fills history does not
+    # reach back far enough to derive that from trades.
+    # NB: these two reject limit>500 with a 400 (verified), unlike fills.
+
+    def deposits(self) -> list[dict]:
+        return self._paged("/portfolio/deposits", "deposits", limit=200)
+
+    def withdrawals(self) -> list[dict]:
+        return self._paged("/portfolio/withdrawals", "withdrawals", limit=200)
 
     # ---------- milestones / delayed score (public) ----------
 

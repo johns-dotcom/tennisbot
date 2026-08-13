@@ -202,6 +202,78 @@ class DerivativeMarket(Base):
     raw: Mapped[dict | None] = mapped_column(JSONB)
 
 
+class KalshiFill(Base):
+    """One execution on the owner's real Kalshi account.
+
+    Read-only mirror of GET /portfolio/fills (CLAUDE.md rule 1's narrow
+    exception). Immutable: rows are only ever inserted, keyed on Kalshi's own
+    `fill_id`, which is what makes a re-sync idempotent — note `user_bets` has no
+    unique constraint at all and therefore no such guarantee.
+
+    Distinct from UserBet, which is a hand-typed ledger that hardcodes the YES
+    side. 21% of real fills are NO-side, so that shape cannot represent them."""
+
+    __tablename__ = "kalshi_fills"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fill_id: Mapped[str] = mapped_column(String(64), unique=True)
+    trade_id: Mapped[str | None] = mapped_column(String(64))
+    order_id: Mapped[str | None] = mapped_column(String(64))
+    ticker: Mapped[str] = mapped_column(String(96), index=True)
+    event_ticker: Mapped[str | None] = mapped_column(String(96), index=True)
+    action: Mapped[str] = mapped_column(String(8))        # 'buy' | 'sell'
+    outcome_side: Mapped[str] = mapped_column(String(4))  # 'yes' | 'no'
+    book_side: Mapped[str | None] = mapped_column(String(8))
+    # Kalshi supports FRACTIONAL contracts (count_fp arrives as e.g. "5.57"),
+    # so this must not be an integer.
+    count: Mapped[float] = mapped_column(Float)
+    yes_price_cents: Mapped[int | None] = mapped_column(Integer)
+    no_price_cents: Mapped[int | None] = mapped_column(Integer)
+    # float, not int: a single fee is often sub-cent ("0.017400" = 1.74¢) and
+    # rounding each of ~10k fills would visibly skew the total
+    fee_cents: Mapped[float | None] = mapped_column(Float)
+    is_taker: Mapped[bool | None] = mapped_column(Boolean)
+    ts: Mapped[int | None] = mapped_column(BigInteger, index=True)  # unix seconds
+    created_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class KalshiSettlement(Base):
+    """A settled market on the owner's account — read-only mirror of
+    GET /portfolio/settlements. `revenue` arrives as an INT IN CENTS while
+    `fee_cost` arrives as a DOLLAR STRING; the mixed scale is the single easiest
+    way to skew every P&L on the page, so both are normalized to cents here."""
+
+    __tablename__ = "kalshi_settlements"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    ticker: Mapped[str] = mapped_column(String(96), unique=True)
+    event_ticker: Mapped[str | None] = mapped_column(String(96), index=True)
+    market_result: Mapped[str | None] = mapped_column(String(8))  # 'yes'|'no'|'scalar'
+    yes_count: Mapped[float | None] = mapped_column(Float)
+    no_count: Mapped[float | None] = mapped_column(Float)
+    revenue_cents: Mapped[float | None] = mapped_column(Float)
+    yes_cost_cents: Mapped[float | None] = mapped_column(Float)
+    no_cost_cents: Mapped[float | None] = mapped_column(Float)
+    fee_cents: Mapped[float | None] = mapped_column(Float)
+    settled_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    raw: Mapped[dict | None] = mapped_column(JSONB)
+
+
+class KalshiPositionTag(Base):
+    """A user's tag(s) on one real Kalshi position. Keyed by market ticker — the
+    thing you tag is a POSITION, not an individual fill. Shares its vocabulary
+    and colours with UserTag so per-tag performance can span the manual ledger
+    and real trades."""
+
+    __tablename__ = "kalshi_position_tags"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("app_users.id", ondelete="CASCADE"), index=True)
+    market_ticker: Mapped[str] = mapped_column(String(96), index=True)
+    tag: Mapped[str | None] = mapped_column(String(256))
+    __table_args__ = (UniqueConstraint("user_id", "market_ticker",
+                                       name="uq_kalshi_pos_tag_user_ticker"),)
+
+
 class Advisory(Base):
     __tablename__ = "advisories"
     id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
