@@ -1810,7 +1810,8 @@ research use · advisory only, nothing here is an order.</footer>"""
     nav_groups = (
         (("/live", "live", "Live"),
          ("/today", "today", "Today"), ("/scenarios", "scenarios", "Scenarios")),
-        (("/testrun", "testrun", "Testrun"), ("/mybets", "mybets", "My Bets")),
+        (("/testrun", "testrun", "Testrun"), ("/mybets", "mybets", "My Bets"))
+        + ((("/kalshi", "kalshi", "Kalshi"),) if user and user.get("is_admin") else ()),
         (("/history", "history", "History"), ("/players", "players", "Database")),
         (("/features", "features", "Variables"),
          ("/flags", "flags", "Flags"), ("/system", "system", "System")),
@@ -8265,13 +8266,305 @@ async def mybets(request: web.Request) -> web.Response:
     return respond(request, "My Bets", "mybets", body)
 
 
+# Lifetime P&L needs three live Kalshi GETs. The shell re-fetches every page
+# every 7s via X-Fragment, so without this cache /kalshi would hit the API ~26
+# times a minute. TTL is generous because funding moves rarely; equity drifts
+# with open positions, which is why the figure is stamped with its as-of time.
+_ACCT_CACHE: dict = {"at": None, "data": None, "error": None}
+_ACCT_TTL_S = 120
+
+
+def _account_summary(force: bool = False) -> tuple[dict | None, str]:
+    """(summary, error). Never raises — a Kalshi outage must not take the page
+    down, it just blanks the lifetime figure."""
+    from bot.market.portfolio import account_pnl
+    now = datetime.now(timezone.utc)
+    at = _ACCT_CACHE["at"]
+    if not force and at and (now - at).total_seconds() < _ACCT_TTL_S:
+        return _ACCT_CACHE["data"], _ACCT_CACHE["error"]
+    try:
+        from bot.market.kalshi import KalshiClient
+        cl = KalshiClient()
+        data = account_pnl(cl.balance(), cl.deposits(), cl.withdrawals())
+        _ACCT_CACHE.update(at=now, data=data, error="")
+    except Exception as e:
+        _ACCT_CACHE.update(at=now, error=f"{type(e).__name__}: {e}")
+    return _ACCT_CACHE["data"], _ACCT_CACHE["error"]
+
+
+def _kalshi_names(db, tickers: list[str]) -> dict[str, tuple[str, str | None]]:
+    """ticker -> (label, event_ticker for the match page).
+
+    Tries the tennis market we already track, then the derivative table, then
+    Kalshi's own yes_sub_title. Falls back to the bare ticker — never a guess,
+    and never silently dropped: 15% of this account's trading is not tennis and
+    hiding it would misstate the totals."""
+    from bot.models import DerivativeMarket
+    out: dict[str, tuple[str, str | None]] = {}
+    if not tickers:
+        return out
+    for m in db.execute(select(KalshiMarket).where(
+            KalshiMarket.ticker.in_(tickers))).scalars():
+        nm = (m.raw or {}).get("yes_sub_title") or m.title or m.ticker
+        out[m.ticker] = (nm, m.event_ticker)
+    for d in db.execute(select(DerivativeMarket).where(
+            DerivativeMarket.ticker.in_(tickers))).scalars():
+        if d.ticker not in out:
+            lbl = d.label or d.ticker
+            if d.match_label:
+                lbl = f"{lbl} · {d.match_label}"
+            out[d.ticker] = (lbl, d.match_event_ticker)
+    return out
+
+
+async def kalshi_history(request: web.Request) -> web.Response:
+    """The owner's real Kalshi trading history, with per-position tagging.
+
+    ADMIN ONLY, and not incidentally: the Kalshi credentials are global env
+    vars, so there is exactly one account — the owner's — while the app supports
+    several invited users. Without this gate every account would see the owner's
+    real balance, positions and P&L."""
+    from bot.market.portfolio import aggregate_positions, fills_window, summarize
+    from bot.models import KalshiFill, KalshiPositionTag, KalshiSettlement
+
+    user = request.get("user")
+    if not user or not user.get("is_admin"):
+        return web.Response(status=403, text="forbidden — admin only")
+    sess = request.get("session_cookie") or ""
+    csrf = webauth.csrf_token(sess) if sess else ""
+    uid = user["id"]
+    sel = (request.query.get("tag") or "").strip()
+    show_all = request.query.get("all") == "1"
+
+    with db_session() as db:
+        fills = list(db.execute(select(KalshiFill)).scalars())
+        setts = {s.ticker: s for s in db.execute(select(KalshiSettlement)).scalars()}
+        tags = {t.market_ticker: t.tag for t in db.execute(select(KalshiPositionTag)
+                .where(KalshiPositionTag.user_id == uid)).scalars()}
+        known_tags = _user_bet_tags(db, uid)
+        from bot.models import UserTag
+        tag_colors = {t.tag: t.color for t in db.execute(select(UserTag).where(
+            UserTag.user_id == uid)).scalars() if t.color}
+        positions = aggregate_positions(fills, setts)
+        names = _kalshi_names(db, [p["ticker"] for p in positions[:400]])
+
+    acct, acct_err = _account_summary()
+    lo, hi = fills_window(fills)
+
+    def money(x):
+        return f"${x:,.2f}" if x >= 0 else f"-${abs(x):,.2f}"
+
+    def col(x):
+        return "good" if x > 0 else "accent" if x < 0 else "muted"
+
+    head = pagehead("Account", "Kalshi History",
+                    f"{len(positions):,} positions · real account · read-only")
+
+    # ---- hero: the ONLY trustworthy lifetime number ----
+    if acct:
+        hero_items = [
+            ("Lifetime net P&L",
+             f'<span style="color:var(--{col(acct["net_pnl"])})">'
+             f'{money(acct["net_pnl"])}</span>', "equity − net funding"),
+            ("Equity", money(acct["equity"]),
+             f'{money(acct["cash"])} cash · {money(acct["positions_value"])} positions'),
+            ("Funded in", money(acct["funded"]),
+             f'{money(acct["deposits"])} in · {money(acct["withdrawals"])} out'),
+        ]
+        hero_note = (f'exact — derived from balance and funding, not from trades. '
+                     f'as of {pt(acct["as_of"])}; equity moves with open positions')
+    else:
+        hero_items = [("Lifetime net P&L", "—", "Kalshi unreachable")]
+        hero_note = esc(acct_err or "could not read the account")
+    hero = (f'<section class="block major"><div class="blockhead">'
+            f'<h4>Lifetime</h4><span class="aside">{hero_note}</span></div>'
+            f'<div class="rule"></div>{statstrip(hero_items, cols=3)}</section>')
+
+    # ---- fills-window stats, explicitly scoped ----
+    s = summarize(positions)
+    win = (f'{pt(datetime.fromtimestamp(lo, timezone.utc))} – '
+           f'{pt(datetime.fromtimestamp(hi, timezone.utc))}' if lo and hi else "no fills yet")
+    approx = (f' · {s["n_approx"]} approximate' if s["n_approx"] else "")
+    strip = statstrip([
+        ("Record", f'{s["wins"]}-{s["losses"]}',
+         f'{s["win_rate"]:.0%} win rate' if s["win_rate"] is not None else "—"),
+        ("Realized P&L",
+         f'<span style="color:var(--{col(s["pnl"])})">{money(s["pnl"]/100)}</span>',
+         "net of fees"),
+        ("Fees", money(s["fees"] / 100), "trading fees paid"),
+        ("Staked", money(s["staked"] / 100), f'{s["n_settled"]:,} settled'),
+        ("Open", str(s["n_open"]), "still running"),
+    ])
+    scoped = (
+        f'<section class="block major"><div class="blockhead"><h4>From fills</h4>'
+        f'<span class="aside">{esc(win)}{approx} — Kalshi only serves ~2 months of '
+        f'fills, so this is NOT lifetime; the number above is</span></div>'
+        f'<div class="rule"></div>{strip}</section>')
+
+    # ---- sync ----
+    last = max((f.ts for f in fills if f.ts), default=None)
+    sync = (f'<section class="block"><div class="blockhead"><h4>Sync</h4>'
+            f'<span class="aside">read-only · pulls new fills and settlements</span>'
+            f'</div><div class="rule"></div><div class="swrow" '
+            f'style="align-items:center;gap:12px">'
+            f'<form method="post" action="/kalshi/sync">'
+            f'<input type="hidden" name="csrf" value="{csrf}">'
+            f'<button type="submit" class="tag tag-outline" '
+            f'style="cursor:pointer;padding:7px 14px">Sync now</button></form>'
+            f'<span class="sub2">{len(fills):,} fills stored'
+            + (f' · newest {pt(datetime.fromtimestamp(last, timezone.utc))}'
+               if last else " · none yet — run a sync") + '</span></div></section>')
+
+    # ---- tag filter chips ----
+    used = sorted({t for v in tags.values() for t in _bet_tags(v)})
+    from urllib.parse import quote as _q
+    chips = [f'<a class="fchip{"" if sel else " on"}" href="/kalshi">All</a>']
+    chips += [f'<a class="fchip{" on" if sel == k else ""}" '
+              f'href="/kalshi?tag={_q(k)}">🏷 {esc(k)}</a>' for k in used]
+    chip_bar = f'<div class="filterbar">{"".join(chips)}</div>' if used else ""
+
+    if sel:
+        positions = [p for p in positions if sel in _bet_tags(tags.get(p["ticker"]))]
+    shown = positions if show_all else positions[:250]
+
+    def row(p):
+        tk = p["ticker"]
+        label, ev = names.get(tk, (tk, None))
+        link = (f'<a href="/match/{esc(ev)}" style="color:inherit">{esc(label)}</a>'
+                if ev else esc(label))
+        if p["settled"]:
+            st = tag("good", "✓", "won") if p["pnl"] > 0 else \
+                 tag("accent", "✕", "lost") if p["pnl"] < 0 else tag("neutral", "·", "flat")
+        elif p["open_count"] > 0:
+            st = tag("warn", "●", f'open {p["open_count"]:g}')
+        else:
+            # sold out before the market settled — flat, not "open 0"
+            st = tag("neutral", "·", "closed")
+        warn = ("" if p["pnl_exact"] else
+                ' <span class="tag tag-outline" title="Both sides were bought, so '
+                'the side held cannot be inferred — this P&L is approximate">~</span>')
+        # kept out of the f-string below: a nested f-string reusing the same
+        # quote char is 3.12+ only (PEP 701) and this project targets 3.11+
+        avg = f'{p["avg_price"]:.0f}¢' if p["avg_price"] else "—"
+        return (
+            f'<tr><td class="pick">{link}{_tagchip(tags.get(tk), tag_colors)}'
+            f'<div class="sub2 mono">{esc(tk)}</div></td>'
+            f'<td class="mono" data-label="Side">{esc(p["side"])}</td>'
+            f'<td class="mono" data-label="Bought">{p["bought"]:g}</td>'
+            f'<td class="mono" data-label="Avg">{avg}</td>'
+            f'<td class="mono" data-label="Fees">{money(p["fees"]/100)}</td>'
+            f'<td data-label="Status">{st}</td>'
+            f'<td class="mono" data-label="P&amp;L" '
+            f'style="color:var(--{col(p["pnl"])})">{money(p["pnl"]/100)}{warn}</td>'
+            f'<td data-label="Tag">{_kalshi_tag_form(tk, tags.get(tk), csrf, known_tags, tag_colors)}</td>'
+            f'</tr>')
+
+    if shown:
+        more = ("" if show_all or len(positions) <= 250 else
+                f'<p class="sub2">Showing 250 of {len(positions):,} · '
+                f'<a href="/kalshi?all=1{"&tag=" + _q(sel) if sel else ""}">show all</a></p>')
+        table = (f'<div class="tw"><table class="t rt"><thead><tr>'
+                 f'<th>Market</th><th>Side</th><th>Bought</th><th>Avg</th>'
+                 f'<th>Fees</th><th>Status</th><th>P&amp;L</th><th>Tag</th>'
+                 f'</tr></thead><tbody>{"".join(row(p) for p in shown)}</tbody>'
+                 f'</table></div>{more}')
+    else:
+        table = ('<div class="card"><div class="empty">No positions yet — '
+                 'run a sync.</div></div>')
+    positions_html = (
+        f'<section class="block major"><div class="blockhead"><h4>Positions</h4>'
+        f'<span class="aside">one row per market · newest first</span></div>'
+        f'<div class="rule"></div>{table}</section>')
+
+    body = (head + hero + scoped + chip_bar + positions_html + sync
+            + _tags_datalist(known_tags))
+    return respond(request, "Kalshi", "kalshi", body)
+
+
+def _kalshi_tag_form(ticker: str, current, csrf: str, known: list[str],
+                     colors: dict) -> str:
+    """Per-row tag control. Same picker + input the My Bets edit panel uses, so
+    the chips, autocomplete and keyboard handling all come from the existing
+    bindTagPickers/bindTagInputs — no new JS."""
+    ident = "kt" + "".join(c if c.isalnum() else "_" for c in ticker)[:48]
+    inp = ("background:var(--surface);border:1px solid var(--divider);"
+           "color:var(--text);font:inherit;padding:4px 6px;border-radius:5px")
+    return (
+        f'<details><summary class="sub2" style="cursor:pointer;list-style:none">'
+        f'tag</summary>'
+        f'<form method="post" action="/kalshi/tag" style="margin-top:6px">'
+        f'<input type="hidden" name="csrf" value="{csrf}">'
+        f'<input type="hidden" name="ticker" value="{esc(ticker)}">'
+        f'{_tag_picker(known, current, ident, colors)}'
+        f'<input name="tag" id="{ident}" list="bettags" value="{esc(current or "")}" '
+        f'placeholder="tag(s), comma-sep" maxlength="256" style="width:160px;{inp}">'
+        f'<button type="submit" class="sub2" style="background:var(--surface-2);'
+        f'border:1px solid var(--divider-strong);color:var(--text);cursor:pointer;'
+        f'padding:4px 8px;border-radius:5px;margin-left:4px">set</button>'
+        f'</form></details>')
+
+
+async def kalshi_sync(request: web.Request) -> web.Response:
+    """Pull new fills/settlements. Read-only against Kalshi; admin only."""
+    user = request.get("user")
+    if not user or not user.get("is_admin"):
+        return web.Response(status=403, text="forbidden — admin only")
+    sess = request.get("session_cookie") or ""
+    data = await request.post()
+    if not webauth.csrf_ok(sess, data.get("csrf")):
+        return web.json_response({"error": "csrf"}, status=403)
+    from bot.market.kalshi import KalshiClient
+    from bot.market.portfolio import sync_portfolio
+    try:
+        with db_session() as db:
+            sync_portfolio(db, KalshiClient())
+    except Exception as e:
+        log.error("kalshi sync failed", error=str(e))
+    _ACCT_CACHE["at"] = None       # force the lifetime figure to refresh
+    raise web.HTTPFound("/kalshi")
+
+
+async def kalshi_tag(request: web.Request) -> web.Response:
+    """Set (or clear) the tags on one real Kalshi position."""
+    user = request.get("user")
+    if not user or not user.get("is_admin"):
+        return web.Response(status=403, text="forbidden — admin only")
+    sess = request.get("session_cookie") or ""
+    data = await request.post()
+    if not webauth.csrf_ok(sess, data.get("csrf")):
+        return web.json_response({"error": "csrf"}, status=403)
+    ticker = (data.get("ticker") or "").strip()[:96]
+    if ticker:
+        from bot.models import KalshiPositionTag
+        with db_session() as db:
+            row = db.execute(select(KalshiPositionTag).where(
+                KalshiPositionTag.user_id == user["id"],
+                KalshiPositionTag.market_ticker == ticker)).scalars().first()
+            val = _norm_tags(data.get("tag"))
+            if row is None:
+                db.add(KalshiPositionTag(user_id=user["id"], market_ticker=ticker,
+                                         tag=val))
+            else:
+                row.tag = val
+            db.commit()
+    raise web.HTTPFound(request.headers.get("Referer") or "/kalshi")
+
+
 def _user_bet_tags(db, uid) -> list[str]:
-    """Distinct tags the user has used (for autocomplete), newest-used first."""
+    """Distinct tags the user has used (for autocomplete), newest-used first.
+
+    Spans BOTH ledgers — hand-logged bets and tagged real Kalshi positions —
+    so the same vocabulary autocompletes on either page and per-tag performance
+    can eventually cover both."""
     if not uid:
         return []
-    rows = db.execute(select(UserBet.tag).where(
+    rows = list(db.execute(select(UserBet.tag).where(
         UserBet.user_id == uid, UserBet.tag.is_not(None))
-        .order_by(UserBet.created_at.desc())).scalars().all()
+        .order_by(UserBet.created_at.desc())).scalars().all())
+    from bot.models import KalshiPositionTag
+    rows += list(db.execute(select(KalshiPositionTag.tag).where(
+        KalshiPositionTag.user_id == uid,
+        KalshiPositionTag.tag.is_not(None))).scalars().all())
     seen, out = set(), []
     for raw in rows:
         for t in _bet_tags(raw):   # a bet may carry several tags
@@ -8655,6 +8948,9 @@ def make_app() -> web.Application:
     app.router.add_post("/pin", pin_toggle)
     app.router.add_post("/favorite", favorite_toggle)
     app.router.add_get("/mybets", mybets)
+    app.router.add_get("/kalshi", kalshi_history)
+    app.router.add_post("/kalshi/sync", kalshi_sync)
+    app.router.add_post("/kalshi/tag", kalshi_tag)
     app.router.add_post("/bet", bet_create)
     app.router.add_post("/bet/delete", bet_delete)
     app.router.add_post("/bet/cashout", bet_cashout)
