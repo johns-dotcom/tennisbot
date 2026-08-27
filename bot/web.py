@@ -2937,12 +2937,7 @@ def _leaderboard_body() -> str:
             from sqlalchemy import text as _sq
             tks = list({b.market_ticker for b, _, _ in rows})
             since = min(b.created_at for b, _, _ in rows)
-            for r in db.execute(_sq(
-                "SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb "
-                "FROM market_ticks WHERE market_ticker = ANY(:t) AND kind='quote' "
-                "AND ts >= :since GROUP BY market_ticker"),
-                    {"t": tks, "since": since}).all():
-                touched[r[0]] = (r[1], r[2])
+            touched.update(_peak_bids(db, tks, since))
 
     def _tp_pnl(o, side, price, u, ticker):
         """P&L under the 90¢ take-profit exit: sell at 90 if our side ever bid
@@ -3278,12 +3273,7 @@ async def _testrun_view(request: web.Request, bot: str = "pre") -> web.Response:
                 closes[tk] = cl
             since = min(b.created_at for b, _ in bets)
             from sqlalchemy import text as sqltext
-            for r in db.execute(sqltext("""
-                SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb
-                FROM market_ticks WHERE market_ticker = ANY(:t)
-                  AND kind='quote' AND ts >= :since GROUP BY market_ticker"""),
-                    {"t": tks, "since": since}).all():
-                touched[r[0]] = (r[1], r[2])
+            touched.update(_peak_bids(db, tks, since))
 
     def hold_eff(b):
         return b.status, b.pnl_cents
@@ -3989,12 +3979,7 @@ async def testrun_history(request: web.Request) -> web.Response:
                     .where(KalshiMarket.ticker.in_(tks))).all():
                 results[tk], closes[tk], titles[tk] = res, cl, tt
             since = min(b.created_at for b, _ in bets)
-            for r in db.execute(sqltext(
-                "SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb "
-                "FROM market_ticks WHERE market_ticker = ANY(:t) AND kind='quote' "
-                "AND ts >= :since GROUP BY market_ticker"),
-                    {"t": tks, "since": since}).all():
-                touched[r[0]] = (r[1], r[2])
+            touched.update(_peak_bids(db, tks, since))
             for r in db.execute(sqltext(
                 "SELECT DISTINCT ON (market_ticker) market_ticker, scoreline, "
                 "sets_a, sets_b FROM match_score_log WHERE market_ticker = ANY(:t) "
@@ -4648,6 +4633,42 @@ def _odds_cents(m, quotes: dict) -> tuple[int | None, bool]:
         return round((yb + ya) / 2), False
     lp = _raw_cents(raw, "last_price_dollars")
     return (lp, False) if lp is not None else (None, False)
+
+
+def _peak_bids(db, tickers: list[str], since) -> dict[str, tuple]:
+    """ticker -> (max yes_bid, max no_bid) at any point at/after `since`.
+
+    Reads live ticks where they still exist, and falls back to the durable
+    summaries on kalshi_markets for markets whose ticks have been pruned.
+
+    The fallback is exact for the question these callers actually ask — "did
+    this side ever reach the take-profit limit after the bet?" — because
+    tp_*_at records the LAST moment each side was at/above that limit. If that
+    moment is at/after `since` the answer is yes, and the stored peak is the
+    value to report; if it is before `since`, the side did not qualify and the
+    peak is deliberately withheld rather than reported as if it had.
+
+    A peak alone would be wrong here: it may predate the bet."""
+    if not tickers:
+        return {}
+    from sqlalchemy import text as _sqt
+    out: dict[str, tuple] = {}
+    for r in db.execute(_sqt(
+            "SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb "
+            "FROM market_ticks WHERE market_ticker = ANY(:t) AND kind='quote' "
+            "AND ts >= :since GROUP BY market_ticker"),
+            {"t": list(tickers), "since": since}).all():
+        out[r[0]] = (r[1], r[2])
+    missing = [t for t in tickers if t not in out]
+    if missing:
+        for m in db.execute(select(KalshiMarket).where(
+                KalshiMarket.ticker.in_(missing),
+                KalshiMarket.ticks_pruned_at.is_not(None))).scalars():
+            yb = m.peak_yes_bid if (m.tp_yes_at and m.tp_yes_at >= since) else None
+            nb = m.peak_no_bid if (m.tp_no_at and m.tp_no_at >= since) else None
+            if yb is not None or nb is not None:
+                out[m.ticker] = (yb, nb)
+    return out
 
 
 def _latest_quotes(db, tickers: list[str]) -> dict[str, tuple]:
@@ -7728,12 +7749,8 @@ async def mybets(request: web.Request) -> web.Response:
             from sqlalchemy import text as _sq
             _tks = list({b.market_ticker for b, _ in settled_rows})
             _since = min(b.created_at for b, _ in settled_rows)
-            for r in db.execute(_sq(
-                    "SELECT market_ticker, max(yes_bid) yb, max(no_bid) nb "
-                    "FROM market_ticks WHERE market_ticker = ANY(:t) AND kind='quote' "
-                    "AND ts >= :since GROUP BY market_ticker"),
-                    {"t": _tks, "since": _since}).all():
-                max_bid[r[0]] = r[1]  # yes_bid — our bets are always the YES side
+            max_bid.update({t: v[0] for t, v in
+                            _peak_bids(db, _tks, _since).items()})
         hold_p = tp_p = th_cost = 0.0
         hold_w = hold_l = tp_w = tp_l = 0
         for b, mk in settled_rows:

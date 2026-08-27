@@ -160,6 +160,21 @@ class KalshiMarket(Base):
     # closing line: YES-side mid (cents) of the last quote at/before match start —
     # the reference for closing-line value (CLV) on our picks
     close_yes_cents: Mapped[int | None] = mapped_column(Integer)
+    # Durable summaries of this market's tick history, so raw ticks can be
+    # pruned. market_ticks has no retention and reached ~120M rows / ~39 GB,
+    # which is what a memory-billed Postgres was holding in RAM.
+    #
+    # peak_* is the all-time best bid seen. tp_*_at is the LAST moment that side
+    # was at or above the take-profit limit — which is exactly what answers
+    # "did it reach 90¢ at any point AFTER I bet?": true iff tp_*_at is later
+    # than the bet. A peak alone cannot answer that, because the peak may
+    # predate the bet while a later qualifying moment still exists.
+    peak_yes_bid: Mapped[int | None] = mapped_column(Integer)
+    peak_no_bid: Mapped[int | None] = mapped_column(Integer)
+    tp_yes_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    tp_no_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # set once the raw ticks for this market have been deleted
+    ticks_pruned_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class DerivativeMarket(Base):

@@ -28,6 +28,11 @@ class Settings(BaseSettings):
     kalshi_ws_url: str = "wss://external-api-ws.kalshi.com/trade-api/ws/v2"
     kalshi_discovery_interval_s: int = 900
     kalshi_score_poll_interval_s: int = 25
+    # how long raw market_ticks are kept. Only SETTLED markets are pruned,
+    # and only after their durable summaries are stored. Ticks had no
+    # retention at all and reached ~39 GB, which dominated a memory-billed
+    # Postgres. Live pricing only ever reads a 30-minute window.
+    tick_retention_days: int = 30
 
     # --- advisory rendering (delivery is DB + structured logs only) ---
     anthropic_api_key: str = ""

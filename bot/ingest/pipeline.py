@@ -106,6 +106,18 @@ def run_ingest(db: Session, *, full: bool = False, skip_live: bool = False,
         generate_scenarios(db)
     except Exception as e:
         log.error("scenario generation failed", error=str(e))
+    # market_ticks retention. The recorder writes a row per websocket quote and
+    # nothing used to delete them: ~120M rows / ~39 GB after eight weeks, which
+    # on a memory-billed host was the single largest line on the bill. Only
+    # settled markets are pruned, and only after their durable summaries (peak
+    # bids, last time each side hit the take-profit limit) are committed.
+    try:
+        from bot.config import settings as _cfg
+        from bot.market.retention import prune_market_ticks
+        prune_market_ticks(db, keep_days=_cfg().tick_retention_days)
+    except Exception as e:
+        db.rollback()
+        log.error("tick prune failed", error=str(e))
     # variable-strength monitor: one expanding-window snapshot per ingest so we
     # can watch each candidate variable's lift stabilize as the sample grows
     try:
