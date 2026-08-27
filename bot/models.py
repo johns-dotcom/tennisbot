@@ -202,6 +202,35 @@ class DerivativeMarket(Base):
     raw: Mapped[dict | None] = mapped_column(JSONB)
 
 
+class EloSnapshot(Base):
+    """The fitted Elo ratings, persisted so they need only be computed once.
+
+    fit_from_db replays ~875k matches and materialises every row plus a dict of
+    per-match set results — ~330 MB peak, measured. Recomputing that inside the
+    web process to render two spotlight bands is what made the web service
+    expensive on a memory-billed host: CPython rarely returns a freed heap to
+    the OS, so one fit permanently raises the process floor.
+
+    The daily ingest already performs this fit (via generate_scenarios), so it
+    writes the result here and the web service just loads it. Ratings only
+    change on that ingest, so a snapshot is never stale in a way that matters.
+
+    One row per fit; the newest wins. Older rows are kept as a short audit trail
+    and pruned on write."""
+
+    __tablename__ = "elo_snapshots"
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True, autoincrement=True)
+    fitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), index=True)
+    trained_through: Mapped[date | None] = mapped_column(Date)
+    n_matches: Mapped[int | None] = mapped_column(Integer)
+    n_players: Mapped[int | None] = mapped_column(Integer)
+    # {player_id: [overall, sets_seen, recent, last_day|null, {surface: rating}]}
+    # — a compact list per player rather than named keys; at tens of thousands
+    # of players the key repetition would dominate the payload.
+    ratings: Mapped[dict] = mapped_column(JSONB)
+
+
 class KalshiFill(Base):
     """One execution on the owner's real Kalshi account.
 
@@ -234,7 +263,11 @@ class KalshiFill(Base):
     is_taker: Mapped[bool | None] = mapped_column(Boolean)
     ts: Mapped[int | None] = mapped_column(BigInteger, index=True)  # unix seconds
     created_time: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
-    raw: Mapped[dict | None] = mapped_column(JSONB)
+    # deliberately NO raw payload. Every field Kalshi returns is columnised
+    # above except market_ticker (always == ticker), side (always ==
+    # outcome_side), subaccount_number (always 0) and exchange_index. Keeping
+    # the JSONB cost ~2.3 kB per fill — ~24 MB of Python objects across this
+    # account's 10.5k fills, on every load. Railway bills memory.
 
 
 class KalshiSettlement(Base):

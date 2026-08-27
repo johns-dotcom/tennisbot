@@ -194,3 +194,52 @@ def bootstrap_admin(db) -> None:
 
 def normalize_username(name: str) -> str:
     return (name or "").strip().lower()
+
+# --------------------------------------------------------------------------- #
+# single-owner access key (replaces the username/password login)
+# --------------------------------------------------------------------------- #
+ACCESS_COOKIE = "tb_key"
+
+
+def access_key() -> str:
+    """The shared secret that admits the owner. ACCESS_KEY, falling back to the
+    pre-existing WEB_TOKEN so a deploy that already sets it keeps working.
+
+    Empty means NO key is configured. Callers must treat that as 'refuse
+    everyone' rather than 'let everyone in' — an unset env var must never be the
+    thing that opens a page showing a real Kalshi balance to the internet."""
+    return (os.environ.get("ACCESS_KEY") or os.environ.get("WEB_TOKEN") or "").strip()
+
+
+def access_key_ok(supplied: str | None) -> bool:
+    """Constant-time compare. False whenever no key is configured."""
+    key = access_key()
+    if not key or not supplied:
+        return False
+    return hmac.compare_digest(supplied.strip(), key)
+
+
+def owner_user(db):
+    """The single account everything is attributed to.
+
+    Prefers the lowest-id admin, then the lowest-id active user; creates one if
+    the table is empty so a fresh database works without a bootstrap password.
+    A real AppUser row must exist because user_bets.user_id and friends are
+    foreign keys into it."""
+    from sqlalchemy import select
+
+    from bot.models import AppUser
+    u = db.execute(select(AppUser).where(AppUser.is_active.is_(True),
+                                         AppUser.is_admin.is_(True))
+                   .order_by(AppUser.id)).scalars().first()
+    if u is None:
+        u = db.execute(select(AppUser).where(AppUser.is_active.is_(True))
+                       .order_by(AppUser.id)).scalars().first()
+    if u is None:
+        u = AppUser(username=(os.environ.get("OWNER_USERNAME") or "owner").strip().lower(),
+                    password_hash="", is_admin=True, is_active=True,
+                    created_by="access-key")
+        db.add(u)
+        db.commit()
+        log.info("created the owner account", username=u.username)
+    return u

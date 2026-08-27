@@ -102,13 +102,24 @@ def sync_portfolio(db: Session, client: KalshiClient, full: bool = False) -> dic
     stats["fills_seen"], stats["setts_seen"] = len(fills), len(setts)
 
     # ---- pass 3 (DB, short) ----
+    # Core bulk inserts in chunks rather than ~10.5k ORM objects held un-flushed
+    # until a single commit. The ORM path peaked around 50 MB on the initial
+    # backfill; this stays flat because each chunk is released after its commit.
+    from sqlalchemy import insert
+
+    def _flush(table, rows):
+        for i in range(0, len(rows), 500):
+            db.execute(insert(table), rows[i:i + 500])
+            db.commit()
+
+    frows = []
     for f in fills:
         fid = f.get("fill_id")
         if not fid or fid in known_fills:
             continue
         known_fills.add(fid)
         tk = f.get("ticker") or f.get("market_ticker") or ""
-        db.add(KalshiFill(
+        frows.append(dict(
             fill_id=fid, trade_id=f.get("trade_id"), order_id=f.get("order_id"),
             ticker=tk, event_ticker=_event_of(tk),
             action=(f.get("action") or "").lower() or "buy",
@@ -117,28 +128,34 @@ def sync_portfolio(db: Session, client: KalshiClient, full: bool = False) -> dic
             yes_price_cents=dollars_to_cents(f.get("yes_price_dollars")),
             no_price_cents=dollars_to_cents(f.get("no_price_dollars")),
             fee_cents=_fee_cents(f.get("fee_cost")), is_taker=f.get("is_taker"),
-            ts=f.get("ts"), created_time=_ts(f.get("created_time")), raw=f))
-        stats["fills_new"] += 1
+            ts=f.get("ts"), created_time=_ts(f.get("created_time"))))
+    stats["fills_new"] = len(frows)
+    _flush(KalshiFill.__table__, frows)
+    frows.clear()
+    fills.clear()          # release the API payload before the next stage
 
-    for s in setts:
-        tk = s.get("ticker")
+    srows = []
+    for s_ in setts:
+        tk = s_.get("ticker")
         if not tk or tk in known_setts:
             continue
         known_setts.add(tk)
-        db.add(KalshiSettlement(
-            ticker=tk, event_ticker=s.get("event_ticker"),
-            market_result=(s.get("market_result") or "").lower() or None,
-            yes_count=_f(s.get("yes_count_fp")), no_count=_f(s.get("no_count_fp")),
+        srows.append(dict(
+            ticker=tk, event_ticker=s_.get("event_ticker"),
+            market_result=(s_.get("market_result") or "").lower() or None,
+            yes_count=_f(s_.get("yes_count_fp")), no_count=_f(s_.get("no_count_fp")),
             # revenue is already an int in CENTS — do not scale it like the
             # dollar-string fields around it
-            revenue_cents=float(s.get("revenue") or 0),
-            yes_cost_cents=(_f(s.get("yes_total_cost_dollars")) or 0) * 100.0,
-            no_cost_cents=(_f(s.get("no_total_cost_dollars")) or 0) * 100.0,
-            fee_cents=_fee_cents(s.get("fee_cost")),
-            settled_time=_ts(s.get("settled_time")), raw=s))
-        stats["setts_new"] += 1
+            revenue_cents=float(s_.get("revenue") or 0),
+            yes_cost_cents=(_f(s_.get("yes_total_cost_dollars")) or 0) * 100.0,
+            no_cost_cents=(_f(s_.get("no_total_cost_dollars")) or 0) * 100.0,
+            fee_cents=_fee_cents(s_.get("fee_cost")),
+            settled_time=_ts(s_.get("settled_time")), raw=s_))
+    stats["setts_new"] = len(srows)
+    _flush(KalshiSettlement.__table__, srows)
+    srows.clear()
+    setts.clear()
 
-    db.commit()
     log.info("portfolio sync", **stats)
     return stats
 

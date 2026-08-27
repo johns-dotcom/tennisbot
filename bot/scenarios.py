@@ -599,7 +599,15 @@ def generate_scenarios(db: Session, for_day: date | None = None) -> int:
 
     log.info("fitting model for scenario generation")
     model = SetElo()
-    model.fit_from_db(db)
+    n_fit = model.fit_from_db(db)
+    # This runs on the daily ingest, which is the only time ratings change.
+    # Persist the result so the web service never has to replay ~875k matches
+    # itself — that replay peaks around 330 MB, and on a memory-billed host a
+    # freed CPython heap largely stays resident, permanently raising the floor.
+    try:
+        model.save_snapshot(db, n_matches=n_fit)
+    except Exception as e:
+        log.error("elo snapshot save failed", error=str(e))
     fatigue = _yesterday_played(db, now)
     distributions = load_tour_distributions(db)  # percentile-within-field context
 

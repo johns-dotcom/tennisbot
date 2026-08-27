@@ -204,6 +204,77 @@ class SetElo(WinProbabilityModel):
                 val *= 0.5 ** (dd / RECENCY_HALFLIFE_DAYS)
         return val
 
+    # ---------- persistence ----------
+    # Ratings only change on the daily ingest, so the fit is done once there and
+    # every other process loads the result. This is what keeps the web service
+    # off the ~330 MB replay path.
+
+    def to_snapshot(self) -> dict:
+        """Compact, JSON-safe form of the fitted state.
+
+        Floats are stored at full precision, NOT rounded. Rounding ratings to
+        4dp shifted predictions in the 8th decimal — invisible on screen, but it
+        would mean the web service and the ingest disagree about the same match
+        for no reason anyone could later explain. Python's float repr is
+        shortest-round-trip, so this is exact and costs only a few hundred kB
+        across the whole player pool."""
+        return {str(pid): [r.overall, r.sets_seen, r.recent,
+                           r.last_day.isoformat() if r.last_day else None,
+                           dict(r.by_surface)]
+                for pid, r in self.ratings.items()}
+
+    def load_snapshot(self, payload: dict, through: date | None = None) -> int:
+        """Restore fitted state. Returns the number of players loaded."""
+        self.ratings = {}
+        for pid, v in (payload or {}).items():
+            r = _Rating()
+            r.overall, r.sets_seen, r.recent = float(v[0]), int(v[1]), float(v[2])
+            r.last_day = date.fromisoformat(v[3]) if v[3] else None
+            r.by_surface = {k: float(x) for k, x in (v[4] or {}).items()}
+            self.ratings[int(pid)] = r
+        self.trained_through = through
+        return len(self.ratings)
+
+    def save_snapshot(self, db: Session, n_matches: int | None = None,
+                      keep: int = 3) -> None:
+        """Persist the fit and prune older rows."""
+        from sqlalchemy import select as _select
+
+        from bot.models import EloSnapshot
+        payload = self.to_snapshot()
+        db.add(EloSnapshot(trained_through=self.trained_through,
+                           n_matches=n_matches, n_players=len(payload),
+                           ratings=payload))
+        db.commit()
+        old = list(db.execute(_select(EloSnapshot.id)
+                              .order_by(EloSnapshot.fitted_at.desc())
+                              .offset(keep)).scalars())
+        if old:
+            for oid in old:
+                db.delete(db.get(EloSnapshot, oid))
+            db.commit()
+        log.info("elo snapshot saved", players=len(payload),
+                 through=str(self.trained_through))
+
+    @classmethod
+    def from_snapshot_db(cls, db: Session):
+        """The newest persisted fit, or None if there is none yet."""
+        from sqlalchemy import select as _select
+
+        from bot.models import EloSnapshot
+        row = db.execute(_select(EloSnapshot)
+                         .order_by(EloSnapshot.fitted_at.desc())
+                         .limit(1)).scalars().first()
+        if row is None:
+            return None
+        m = cls()
+        m.load_snapshot(row.ratings, row.trained_through)
+        from bot.prob.state_adjust import load_state_calibration
+        load_state_calibration(db)
+        log.info("elo loaded from snapshot", players=len(m.ratings),
+                 through=str(m.trained_through))
+        return m
+
     def predict(self, player_a: int, player_b: int, surface: str | None,
                 tier: str | None, match_state: MatchState,
                 as_of: date | None = None) -> Prediction:

@@ -739,11 +739,23 @@ class WatchService:
         await runner.cleanup()
 
     def _fit_model(self):
+        """Prefer the ratings the daily ingest already fitted.
+
+        Replaying the history costs ~330 MB peak and CPython keeps most of that
+        heap resident for the life of the process, so the worker would carry it
+        permanently. Falls back to a real fit only when no snapshot exists yet
+        (first boot after deploy, before the first ingest) — the worker cannot
+        run without a model, unlike the web service, which just omits a
+        spotlight."""
         from bot.prob.elo import SetElo
 
-        model = SetElo()
         with db_session() as db:
-            model.fit_from_db(db)
+            model = SetElo.from_snapshot_db(db)
+            if model is None:
+                log.warning("no elo snapshot yet — fitting from history this "
+                            "once; the next ingest will persist one")
+                model = SetElo()
+                model.fit_from_db(db)
         return model
 
     def _handle_sigterm(self) -> None:

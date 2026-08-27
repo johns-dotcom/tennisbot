@@ -14,8 +14,8 @@ import base64
 import html
 import json
 import os
+import types
 from datetime import date, datetime, timedelta, timezone
-from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
 from aiohttp import web
@@ -1742,6 +1742,7 @@ function reconcile(tmp, main){
 async function refreshMain(){
  if(document.hidden) return;  // don't burn battery/data while backgrounded
  if(typing()) return;  // don't clobber a field mid-keystroke
+ if(document.querySelector('main[data-nopoll]')) return;  // nothing live here
  try{var r=await fetch(location.pathname+location.search,{headers:{'X-Fragment':'1'}});
   if(r.ok){var h=await r.text(); var m=document.querySelector('main');
    if(!typing() && h && h.length>50 && h!==m.innerHTML){
@@ -1800,6 +1801,9 @@ FAVICON = ("data:image/svg+xml;base64,"
 _FAVICON_LINK = f'<link rel="icon" href="{FAVICON}">'
 
 
+_NOPOLL_PAGES = {"kalshi"}   # data changes only on a manual sync
+
+
 def page(title: str, active: str, body: str, fragment: bool = False,
          user: dict | None = None) -> str:
     footer = """<footer>All times relative · updates in place every 7s ·
@@ -1807,6 +1811,11 @@ historical data © Jeff Sackmann / Tennis Abstract (CC BY-NC-SA 4.0), personal
 research use · advisory only, nothing here is an order.</footer>"""
     if fragment:
         return body + footer
+    # Pages whose content only changes on an explicit action have nothing to
+    # poll for. /kalshi re-reads ~12.5k fill+settlement rows and re-aggregates
+    # ~1.3k positions per render; at the 7s cadence that is ~500 needless
+    # full scans an hour against a metered database.
+    nopoll = ' data-nopoll="1"' if active in _NOPOLL_PAGES else ""
     nav_groups = (
         (("/live", "live", "Live"),
          ("/today", "today", "Today"), ("/scenarios", "scenarios", "Scenarios")),
@@ -1821,16 +1830,13 @@ research use · advisory only, nothing here is an order.</footer>"""
             f'<a href="{href}" class="{"active" if key == active else ""}">{label}</a>'
             for href, key, label in group) + "</span>"
         for group in nav_groups)
-    # account group: admins get the user-management link; everyone gets sign-out
-    if user:
-        acct = '<span class="navgroup">'
-        if user.get("is_admin"):
-            acct += (f'<a href="/admin/users" class="'
-                     f'{"active" if active == "users" else ""}">Users</a>')
-        acct += '<a href="/logout">Sign out</a></span>'
-        navs += acct
+    # account group: admins get the user-management link. There is no sign-out —
+    # access is a shared key, not a login, so there is no session to end.
+    if user and user.get("is_admin"):
+        navs += (f'<span class="navgroup"><a href="/admin/users" class="'
+                 f'{"active" if active == "users" else ""}">Users</a></span>')
     who = (f'<span class="conn mono" style="color:var(--muted)" '
-           f'title="signed in">{esc(user["username"])}</span>' if user else "")
+           f'title="owner">{esc(user["username"])}</span>' if user else "")
     # mobile bottom tab bar — primary destinations in the thumb zone
     _tabs = (("/live", "live", "◉", "Live"), ("/scenarios", "scenarios", "◆", "Plays"),
              ("/mybets", "mybets", "▤", "Bets"), ("/players", "players", "◍", "Players"))
@@ -1851,7 +1857,7 @@ research use · advisory only, nothing here is an order.</footer>"""
   <span class="conn mono"><span class="dot" style="background:{dot}"></span>{conn}
   <span id="refreshdot" title="live · refreshes every 7s"></span></span>
 </header>
-<main>
+<main{nopoll}>
 {page(title, active, body, fragment=True)}
 </main>
 <nav class="tabbar">{tabbar}</nav>
@@ -4663,15 +4669,34 @@ def _latest_quotes(db, tickers: list[str]) -> dict[str, tuple]:
 # ingest — so the fitted model is cached for a long TTL and rebuilt off the event
 # loop. The board never blocks on it: until the first build lands the spotlight
 # is simply omitted; thereafter a stale model is served while a refresh runs.
+#
+# The TTL is 6h, not the 30min it used to be, because the fit is the single
+# largest memory event in the web service: _load_matches materialises every
+# match row plus a dict of per-match set results, ~330 MB measured at 875k
+# matches (more with real Row objects). At 30min — and the live board's 7s
+# auto-refresh keeps a tab polling all day — that spike fired ~48 times a day
+# for ratings that only move once, on the daily ingest. Railway bills memory.
 _MODEL_CACHE: dict = {"at": None, "model": None, "building": False}
-_MODEL_TTL_S = 1800
+_MODEL_TTL_S = 6 * 3600
 
 
 def _fit_live_model():
+    """Load the ratings the daily ingest already fitted.
+
+    The web service must NOT replay the match history: fit_from_db materialises
+    every match plus per-match set results, ~330 MB measured, and CPython keeps
+    most of that heap resident afterwards — which is precisely what made this
+    process expensive on a memory-billed host.
+
+    If no snapshot exists yet (first deploy, or an ingest that has not run since
+    the table was added) the spotlight is simply omitted rather than paid for.
+    generate_scenarios writes one on every ingest."""
     from bot.prob.elo import SetElo
     with db_session() as db:
-        m = SetElo()
-        m.fit_from_db(db)
+        m = SetElo.from_snapshot_db(db)
+    if m is None:
+        log.warning("no elo snapshot yet — model spotlights omitted until the "
+                    "next ingest writes one (deliberately not refitting here)")
     return m
 
 
@@ -4686,7 +4711,12 @@ async def _live_model():
         async def _build():
             try:
                 mdl = await asyncio.to_thread(_fit_live_model)
-                _MODEL_CACHE.update(at=datetime.now(timezone.utc), model=mdl)
+                # Only stamp the cache when a snapshot actually loaded. Caching
+                # None for the full TTL would hide the spotlights for 6h after
+                # the first ingest finally writes one; a miss is one indexed
+                # SELECT returning nothing, so retrying is cheap.
+                if mdl is not None:
+                    _MODEL_CACHE.update(at=datetime.now(timezone.utc), model=mdl)
             except Exception as e:
                 log.error("live model fit failed", error=str(e))
             finally:
@@ -7158,26 +7188,63 @@ async def healthz(request: web.Request) -> web.Response:
 
 @web.middleware
 async def auth_guard(request: web.Request, handler):
-    """Gate every route on a valid session. Unauthenticated visitors get the
-    login page (browser) or a 401 (API). /healthz and the login/logout routes
-    themselves are the only open paths."""
+    """Gate every route on the single owner account.
+
+    There is no login page and no password. Access is by shared secret: present
+    ACCESS_KEY once as ?k=... and a signed session cookie is issued, so every
+    later request is automatic. That is the whole point — no prompt, but the app
+    is NOT public. /kalshi renders a real Kalshi cash balance, deposits,
+    withdrawals and P&L, so an unknown visitor must never be admitted.
+
+    With no key configured, nothing but /healthz is served. An unset env var
+    must fail closed, never open."""
     path = request.path
     if path == "/healthz":
         return await handler(request)
-    # resolve current user → a plain dict for handlers + nav (session closed here)
+
     with db_session() as db:
         u = webauth.current_user(request, db)
+        if u is None:
+            # first visit with the key in hand → adopt the owner and remember it
+            supplied = (request.query.get("k")
+                        or request.cookies.get(webauth.ACCESS_COOKIE))
+            if webauth.access_key_ok(supplied):
+                u = webauth.owner_user(db)
         if u is not None:
             request["user"] = {"id": u.id, "username": u.username,
                                "is_admin": bool(u.is_admin)}
             request["session_cookie"] = request.cookies.get(webauth.SESSION_COOKIE)
-    if path in ("/login", "/logout"):
-        return await handler(request)
+            request["_issue_session_for"] = (
+                u.id if request.cookies.get(webauth.SESSION_COOKIE) is None else None)
+
     if request.get("user") is None:
+        # deliberately a bare 404: do not advertise that anything is here
         if path.startswith("/api/"):
-            return web.json_response({"error": "unauthorized"}, status=401)
-        raise web.HTTPFound("/login?next=" + quote(request.path_qs, safe=""))
-    return await handler(request)
+            return web.json_response({"error": "not found"}, status=404)
+        return web.Response(status=404, text="not found")
+
+    def _stamp(resp):
+        """Issue the session + key cookies on whichever response goes back."""
+        uid = request.get("_issue_session_for")
+        if not uid or not hasattr(resp, "set_cookie"):
+            return resp
+        secure = _secure_cookie(request)
+        resp.set_cookie(webauth.SESSION_COOKIE, webauth.make_session_token(uid),
+                        max_age=webauth.SESSION_TTL, httponly=True,
+                        samesite="Lax", secure=secure, path="/")
+        # remember the key too, so a bookmark without ?k= still works once the
+        # session eventually expires
+        resp.set_cookie(webauth.ACCESS_COOKIE, webauth.access_key(),
+                        max_age=webauth.SESSION_TTL, httponly=True,
+                        samesite="Lax", secure=secure, path="/")
+        return resp
+
+    try:
+        return _stamp(await handler(request))
+    except web.HTTPException as e:
+        # most POST handlers signal success by RAISING HTTPFound; without this
+        # the cookies would be dropped and the redirect target would 404
+        raise _stamp(e) from None
 
 
 def _secure_cookie(request: web.Request) -> bool:
@@ -7191,29 +7258,6 @@ _AUTH_INP = ("width:100%;box-sizing:border-box;background:var(--surface);"
 _AUTH_BTN = ("width:100%;margin-top:16px;background:var(--accent);color:#fff;"
              "border:none;font:inherit;font-weight:700;padding:11px;"
              "border-radius:6px;cursor:pointer")
-
-
-def _login_html(next_url: str, error: str = "") -> str:
-    err = (f'<p style="color:var(--accent);margin:0 0 12px;font-size:13px">'
-           f'{esc(error)}</p>' if error else "")
-    return f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign in · DEUCE</title>{_FAVICON_LINK}<style>{CSS}</style></head><body>
-<main style="max-width:380px;margin:12vh auto;padding:0 20px">
-<div class="brand" style="font-size:22px;margin-bottom:18px">{_LOGO_MARK}DEUCE<span class="tag">advisory only</span></div>
-<section class="block"><div class="blockhead"><h4>Sign in</h4></div>
-<div class="rule"></div>{err}
-<form method="post" action="/login">
-<input type="hidden" name="next" value="{esc(next_url)}">
-<label class="sub2">Username</label>
-<input name="username" autocomplete="username" autofocus required style="{_AUTH_INP}">
-<label class="sub2" style="margin-top:10px;display:block">Password</label>
-<input name="password" type="password" autocomplete="current-password" required style="{_AUTH_INP}">
-<button type="submit" style="{_AUTH_BTN}">Sign in</button>
-</form></section>
-<p class="sub2" style="text-align:center;margin-top:14px">Access is restricted —
-contact an admin for an account.</p>
-</main></body></html>"""
 
 
 async def pin_toggle(request: web.Request) -> web.Response:
@@ -8337,8 +8381,24 @@ async def kalshi_history(request: web.Request) -> web.Response:
     show_all = request.query.get("all") == "1"
 
     with db_session() as db:
-        fills = list(db.execute(select(KalshiFill)).scalars())
-        setts = {s.ticker: s for s in db.execute(select(KalshiSettlement)).scalars()}
+        # Only the ten columns aggregate_positions actually reads. Loading whole
+        # ORM rows pulls .raw — the entire Kalshi payload — for every fill:
+        # ~2.3 kB each, ~24 MB across this account's 10.5k fills, on EVERY
+        # render. Railway bills memory, so this is the expensive line.
+        fills = [types.SimpleNamespace(
+            fill_id=r[0], ticker=r[1], event_ticker=r[2], action=r[3],
+            outcome_side=r[4], count=r[5], yes_price_cents=r[6],
+            no_price_cents=r[7], fee_cents=r[8], ts=r[9])
+            for r in db.execute(select(
+                KalshiFill.fill_id, KalshiFill.ticker, KalshiFill.event_ticker,
+                KalshiFill.action, KalshiFill.outcome_side, KalshiFill.count,
+                KalshiFill.yes_price_cents, KalshiFill.no_price_cents,
+                KalshiFill.fee_cents, KalshiFill.ts)).all()]
+        setts = {r[0]: types.SimpleNamespace(
+            market_result=r[1], revenue_cents=r[2], fee_cents=r[3])
+            for r in db.execute(select(
+                KalshiSettlement.ticker, KalshiSettlement.market_result,
+                KalshiSettlement.revenue_cents, KalshiSettlement.fee_cents)).all()}
         tags = {t.market_ticker: t.tag for t in db.execute(select(KalshiPositionTag)
                 .where(KalshiPositionTag.user_id == uid)).scalars()}
         known_tags = _user_bet_tags(db, uid)
@@ -8762,48 +8822,6 @@ def _edit_form(b, csrf: str, known_tags: list[str] | None = None,
         f'</div></details>')
 
 
-async def login(request: web.Request) -> web.Response:
-    if request.get("user"):
-        raise web.HTTPFound("/")
-    if request.method == "GET":
-        return web.Response(text=_login_html(request.query.get("next") or "/"),
-                            content_type="text/html")
-    from bot.models import AppUser
-    data = await request.post()
-    nxt = data.get("next") or "/"
-    if not nxt.startswith("/") or nxt.startswith("//"):
-        nxt = "/"  # only ever redirect to a local path
-    ip = (request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
-          or (request.remote or ""))
-    if webauth.throttled(ip):
-        return web.Response(status=429, content_type="text/html",
-                            text=_login_html(nxt, "Too many attempts — wait a few minutes."))
-    username = webauth.normalize_username(data.get("username", ""))
-    pw = data.get("password", "") or ""
-    uid = None
-    with db_session() as db:
-        u = db.execute(select(AppUser).where(AppUser.username == username)).scalars().first()
-        if u is not None and u.is_active and webauth.verify_password(pw, u.password_hash):
-            u.last_login_at = datetime.now(timezone.utc)
-            uid = u.id
-            db.commit()
-    if uid is None:
-        webauth.record_failure(ip)
-        return web.Response(status=401, content_type="text/html",
-                            text=_login_html(nxt, "Invalid username or password."))
-    webauth.clear_failures(ip)
-    resp = web.HTTPFound(nxt)
-    resp.set_cookie(webauth.SESSION_COOKIE, webauth.make_session_token(uid),
-                    max_age=webauth.SESSION_TTL, httponly=True,
-                    secure=_secure_cookie(request), samesite="Lax", path="/")
-    return resp
-
-
-async def logout(request: web.Request) -> web.Response:
-    resp = web.HTTPFound("/login")
-    resp.del_cookie(webauth.SESSION_COOKIE, path="/")
-    return resp
-
 
 async def admin_users(request: web.Request) -> web.Response:
     """Admin-only: list accounts and add/enable/disable/promote them. All
@@ -8940,9 +8958,6 @@ def make_app() -> web.Application:
     app.router.add_get("/queue", legacy_redirect)
     app.router.add_get("/healthz", healthz)
     # auth
-    app.router.add_get("/login", login)
-    app.router.add_post("/login", login)
-    app.router.add_get("/logout", logout)
     app.router.add_get("/admin/users", admin_users)
     app.router.add_post("/admin/users", admin_users)
     app.router.add_post("/pin", pin_toggle)
