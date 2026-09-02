@@ -163,3 +163,38 @@ def test_an_unset_key_refuses_even_a_plausible_value(monkeypatch):
     assert webauth.access_key_ok("anything") is False
     assert webauth.access_key_ok("") is False
     assert webauth.access_key_ok(None) is False
+
+
+# --- lockout diagnostics ------------------------------------------------
+
+def test_healthz_reports_whether_a_key_is_configured(monkeypatch):
+    """Every other route 404s silently, which is right for a stranger but left
+    the owner unable to tell "the env var never reached this service" from "I
+    typed it wrong". This reports only WHETHER, never the value, and offers no
+    way to test a candidate key."""
+    import asyncio
+    import json
+
+    monkeypatch.delenv("ACCESS_KEY", raising=False)
+    monkeypatch.delenv("WEB_TOKEN", raising=False)
+    r = asyncio.run(W.healthz(Req("/healthz")))
+    assert json.loads(r.text) == {"ok": True, "auth": "unconfigured"}
+
+    monkeypatch.setenv("ACCESS_KEY", "correct-horse")
+    r = asyncio.run(W.healthz(Req("/healthz")))
+    body = json.loads(r.text)
+    assert body["auth"] == "configured"
+    # the key itself must never appear
+    assert "correct-horse" not in r.text
+
+
+def test_healthz_never_becomes_a_key_oracle(monkeypatch):
+    """It must not accept a candidate key and say whether it matched — that
+    would turn liveness into a brute-force endpoint."""
+    import asyncio
+    import json
+
+    monkeypatch.setenv("ACCESS_KEY", "correct-horse")
+    right = json.loads(asyncio.run(W.healthz(Req("/healthz", query={"k": "correct-horse"}))).text)
+    wrong = json.loads(asyncio.run(W.healthz(Req("/healthz", query={"k": "nope"}))).text)
+    assert right == wrong          # indistinguishable

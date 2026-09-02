@@ -7199,7 +7199,17 @@ async def api_events(request: web.Request) -> web.Response:
 
 
 async def healthz(request: web.Request) -> web.Response:
-    return web.json_response({"ok": True})
+    """Liveness, plus the one fact needed to debug a lockout.
+
+    Every other route answers a bare 404 when unauthenticated, which is right
+    for a stranger but leaves the owner unable to tell "the env var never
+    reached this service" from "I typed the key wrong". This reports only
+    WHETHER a key is configured — never the key, never a way to test one — so
+    it gives an attacker nothing they did not already have."""
+    return web.json_response({
+        "ok": True,
+        "auth": "configured" if webauth.access_key() else "unconfigured",
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -7231,6 +7241,13 @@ async def auth_guard(request: web.Request, handler):
                         or request.cookies.get(webauth.ACCESS_COOKIE))
             if webauth.access_key_ok(supplied):
                 u = webauth.owner_user(db)
+            elif supplied:
+                # a key WAS presented and did not match. Logged (never the value)
+                # so a lockout is diagnosable from the Railway logs: this line
+                # means "wrong value", its absence means "nothing was sent".
+                log.warning("access key rejected", path=path,
+                            configured=bool(webauth.access_key()),
+                            supplied_len=len(supplied))
         if u is not None:
             request["user"] = {"id": u.id, "username": u.username,
                                "is_admin": bool(u.is_admin)}
